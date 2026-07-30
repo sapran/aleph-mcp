@@ -14,6 +14,12 @@ from .errors import raise_for_status
 # is told to narrow by facet rather than believing it paged to the end.
 MAX_PAGE = 9999
 
+# /api/2/entities requires a schema scope; the Aleph UI's general search uses `Thing`,
+# which covers Person, Company, Address, Document, Email and the rest of the noun-like
+# schemata. Relationship schemata (Ownership, Payment, …) descend from `Interval`, not
+# `Thing`, so they must be asked for explicitly.
+DEFAULT_SCHEMATA = "Thing"
+
 # Separate, much lower cap on graph traversal (SETTINGS.MAX_EXPAND_ENTITIES default).
 MAX_EXPAND = 200
 
@@ -52,7 +58,54 @@ def _truncate(value: str) -> str:
     return value[:_MAX_VALUE_CHARS] + f"… [+{len(value) - _MAX_VALUE_CHARS} chars]"
 
 
-def slim_entity(entity: dict[str, Any]) -> dict[str, Any]:
+# Aleph does not always serialise a `caption`; on the instances tested it is null on both
+# search hits and single-entity GETs. FollowTheMoney derives it from an ordered per-schema
+# property list, so we do the same, using the instance's own model when it has been loaded
+# and this ordering otherwise.
+_CAPTION_FALLBACK = (
+    "name",
+    "fileName",
+    "title",
+    "subject",
+    "email",
+    "phone",
+    "registrationNumber",
+    "full",
+)
+
+
+def derive_caption(entity: dict[str, Any], schemata: dict[str, Any] | None = None) -> str | None:
+    existing = entity.get("caption")
+    if isinstance(existing, str) and existing:
+        return existing
+    props = entity.get("properties") or {}
+    order: tuple[str, ...] = _CAPTION_FALLBACK
+    if schemata:
+        schema = schemata.get(str(entity.get("schema")))
+        declared = (schema or {}).get("caption") or []
+        if declared:
+            order = (*declared, *_CAPTION_FALLBACK)
+    for name in order:
+        values = props.get(name)
+        if isinstance(values, list) and values and isinstance(values[0], str):
+            return values[0]
+        if isinstance(values, str) and values:
+            return values
+    return None
+
+
+def _collection_id(entity: dict[str, Any]) -> str | None:
+    """Aleph nests the collection object in search hits and omits `collection_id`."""
+    direct = entity.get("collection_id")
+    if direct is not None:
+        return str(direct)
+    collection = entity.get("collection")
+    if isinstance(collection, dict) and collection.get("id") is not None:
+        return str(collection["id"])
+    return None
+
+
+def slim_entity(entity: dict[str, Any], schemata: dict[str, Any] | None = None) -> dict[str, Any]:
     """Strip an entity down to what is worth putting in a model's context.
 
     Drops document-sized text properties and truncates long values, keeping the
@@ -73,8 +126,8 @@ def slim_entity(entity: dict[str, Any]) -> dict[str, Any]:
     slim: dict[str, Any] = {
         "id": entity.get("id"),
         "schema": entity.get("schema"),
-        "caption": entity.get("caption"),
-        "collection_id": entity.get("collection_id"),
+        "caption": derive_caption(entity, schemata),
+        "collection_id": _collection_id(entity),
         "properties": props,
     }
     for optional in ("highlight", "score", "profile_id", "first_seen", "last_seen"):
@@ -85,12 +138,13 @@ def slim_entity(entity: dict[str, Any]) -> dict[str, Any]:
     return slim
 
 
-def _slim_result(payload: dict[str, Any]) -> dict[str, Any]:
+def _slim_result(payload: dict[str, Any], schemata: dict[str, Any] | None = None) -> dict[str, Any]:
+    total = payload.get("total")
     out: dict[str, Any] = {
-        "total": (payload.get("total") or {}),
+        "total": total,
         "limit": payload.get("limit"),
         "offset": payload.get("offset"),
-        "results": [slim_entity(e) for e in payload.get("results") or []],
+        "results": [slim_entity(e, schemata) for e in payload.get("results") or []],
     }
     if payload.get("facets"):
         out["facets"] = payload["facets"]
@@ -138,6 +192,15 @@ class AlephClient:
             )
             self._model = payload.get("model") or {}
         return self._model
+
+    async def _schemata(self) -> dict[str, Any] | None:
+        """Cached FtM schemata, used only to derive captions. Never fatal."""
+        try:
+            model = await self.get_model()
+        except Exception:
+            return None
+        schemata = model.get("schemata")
+        return schemata if isinstance(schemata, dict) else None
 
     async def list_schemata(self) -> dict[str, Any]:
         model = await self.get_model()
@@ -296,13 +359,19 @@ class AlephClient:
                 "limit=0 to see how the result set breaks down, then query each slice."
             )
 
+        # /api/2/entities picks its Elasticsearch index from filter:schema or
+        # filter:schemata and rejects a query carrying neither with a bare 400
+        # ("No schema is specified for the query.", aleph/search/__init__.py:77).
+        # Default to the same value the Aleph UI uses for a general search.
+        effective_schemata = None if schema else (schemata or DEFAULT_SCHEMATA)
+
         params: Query = [("limit", str(limit)), ("offset", str(offset))]
         if q:
             params.append(("q", q))
         if schema:
             params.append(("filter:schema", schema))
-        if schemata:
-            params.append(("filter:schemata", schemata))
+        if effective_schemata:
+            params.append(("filter:schemata", effective_schemata))
         for key, value in (filters or {}).items():
             for item in value if isinstance(value, list) else [value]:
                 params.append((f"filter:{key}", str(item)))
@@ -317,20 +386,23 @@ class AlephClient:
         payload = await self._request(
             "GET", "/api/2/entities", context="search_entities", params=params
         )
-        result = _slim_result(payload)
+        result = _slim_result(payload, await self._schemata())
+        result["searched"] = {"schema": schema} if schema else {"schemata": effective_schemata}
         total = result.get("total") or 0
         total_count = total.get("value") if isinstance(total, dict) else total
         if isinstance(total_count, int) and total_count > MAX_PAGE:
             result["_note"] = (
-                f"{total_count} matches exceed the {MAX_PAGE} pagination ceiling; only the "
-                "first results are reachable. Narrow with filters or facet first."
+                f"At least {total_count} matches — Aleph caps the reported total, so treat "
+                f"this as a lower bound. Only the first {MAX_PAGE} are reachable at all, so "
+                "this result set is UNENUMERATED, not merely long. Narrow it with filters, "
+                "or facet on schema/collection_id/countries/dates and query each slice."
             )
         return result
 
     async def get_entity(self, *, entity_id: str) -> dict[str, Any]:
         _check_entity_id(entity_id)
         payload = await self._request("GET", f"/api/2/entities/{entity_id}", context="get_entity")
-        return slim_entity(payload)
+        return slim_entity(payload, await self._schemata())
 
     async def expand_entity(
         self, *, entity_id: str, properties: list[str] | None = None, limit: int = 50
@@ -350,13 +422,14 @@ class AlephClient:
             context="expand_entity",
             params=params,
         )
+        schemata = await self._schemata()
         return {
             "total": payload.get("total"),
             "results": [
                 {
                     "property": group.get("property"),
                     "count": group.get("count"),
-                    "entities": [slim_entity(e) for e in group.get("entities") or []],
+                    "entities": [slim_entity(e, schemata) for e in group.get("entities") or []],
                 }
                 for group in payload.get("results") or []
             ],
@@ -370,13 +443,14 @@ class AlephClient:
             context="similar_entities",
             params=_page_params(limit, 0, cap=100),
         )
+        schemata = await self._schemata()
         return {
             "total": payload.get("total"),
             "results": [
                 {
                     "score": item.get("score"),
                     "judgement": item.get("judgement"),
-                    "entity": slim_entity(item.get("entity") or {}),
+                    "entity": slim_entity(item.get("entity") or {}, schemata),
                 }
                 for item in payload.get("results") or []
             ],
@@ -406,7 +480,7 @@ class AlephClient:
         payload = await self._request(
             "POST", "/api/2/match", context="match_entity", params=params, json=sample
         )
-        return _slim_result(payload)
+        return _slim_result(payload, await self._schemata())
 
     # -- curated sets and cross-referencing ------------------------------------
 
@@ -449,7 +523,7 @@ class AlephClient:
             context="entityset_items",
             params=_page_params(limit, offset, cap=200),
         )
-        return _slim_result(payload)
+        return _slim_result(payload, await self._schemata())
 
     async def xref_results(
         self, *, collection_id: str, limit: int = 30, offset: int = 0
@@ -461,6 +535,7 @@ class AlephClient:
             context="xref_results",
             params=_page_params(limit, offset, cap=100),
         )
+        schemata = await self._schemata()
         return {
             "total": payload.get("total"),
             "limit": payload.get("limit"),
@@ -469,8 +544,8 @@ class AlephClient:
                 {
                     "score": m.get("score"),
                     "judgement": m.get("judgement"),
-                    "entity": slim_entity(m.get("entity") or {}),
-                    "match": slim_entity(m.get("match") or {}),
+                    "entity": slim_entity(m.get("entity") or {}, schemata),
+                    "match": slim_entity(m.get("match") or {}, schemata),
                     "match_collection_id": m.get("match_collection_id"),
                 }
                 for m in payload.get("results") or []

@@ -23,6 +23,9 @@ Working method that fits Aleph's limits:
    languages, mime_type, dates.
 3. Narrow with `filters` (exact-match, AND across keys, OR within a list) and only then
    raise `limit`.
+   Search is always scoped to a schema branch: `schemata="Thing"` is applied by default
+   (people, companies, addresses, documents). Relationships — Ownership, Directorship,
+   Payment, UnknownLink — descend from `Interval` and must be asked for by name.
 4. Pivot on a specific entity with `expand_entity` (graph neighbours), `entity_tags`
    (other entities sharing an email/phone/address), `similar_entities` and
    `xref_results` (candidate duplicates across collections).
@@ -94,6 +97,12 @@ def build_server(settings: Settings) -> tuple[FastMCP, AlephClient]:
           languages, emails, phones, names, addresses, mime_type, dates, file_name.
         - `schema`: match one exact FtM schema ("Person"). `schemata`: match a schema and
           everything below it ("LegalEntity" also returns Company and Person).
+          Aleph *requires* one of these — it selects the search index — so when you give
+          neither, `schemata="Thing"` is applied, matching the Aleph UI's general search.
+          `Thing` covers Person, Company, Address, Document, Email and similar. It does
+          NOT cover relationships: Ownership, Directorship, Payment and UnknownLink
+          descend from `Interval`, so ask for `schemata="Interval"` or name the schema.
+          Every result reports the scope it actually searched under `searched`.
         - `facets`: request bucket counts, e.g. ["schema", "collection_id", "countries"].
           Combine with limit=0 to survey a result set for free before pulling rows.
         - `highlight`: return matching snippets; only meaningful together with `q`.

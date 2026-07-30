@@ -6,7 +6,13 @@ import pytest
 import respx
 from fastmcp.exceptions import ToolError
 
-from aleph_mcp.client import MAX_EXPAND, MAX_PAGE, AlephClient, slim_entity
+from aleph_mcp.client import (
+    MAX_EXPAND,
+    MAX_PAGE,
+    AlephClient,
+    derive_caption,
+    slim_entity,
+)
 
 
 def _query(request: httpx.Request) -> list[tuple[str, str]]:
@@ -178,7 +184,7 @@ async def test_search_notes_unreachable_tail(
         return_value=httpx.Response(200, json={"results": [], "total": {"value": 50000}})
     )
     out = await client.search_entities(q="a")
-    assert "pagination ceiling" in out["_note"]
+    assert "UNENUMERATED" in out["_note"]
 
 
 async def test_search_strips_text_from_hits(
@@ -363,3 +369,105 @@ async def test_unknown_schema_suggests_alternatives(
     )
     with pytest.raises(ValueError, match="Did you mean"):
         await client.get_schema(name="Persson")
+
+
+# -- mandatory schema scope (regression: live 400 "No schema is specified") -----
+
+
+async def test_search_applies_default_schemata_when_none_given(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    route = respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json={"results": [], "total": {"value": 0}})
+    )
+    out = await client.search_entities(q="acme")
+    assert ("filter:schemata", "Thing") in _query(route.calls.last.request)
+    assert out["searched"] == {"schemata": "Thing"}
+
+
+async def test_explicit_schemata_wins_over_the_default(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    route = respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json={"results": [], "total": {"value": 0}})
+    )
+    out = await client.search_entities(schemata="Interval")
+    q = _query(route.calls.last.request)
+    assert ("filter:schemata", "Interval") in q
+    assert ("filter:schemata", "Thing") not in q
+    assert out["searched"] == {"schemata": "Interval"}
+
+
+async def test_exact_schema_suppresses_the_schemata_default(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    route = respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json={"results": [], "total": {"value": 0}})
+    )
+    out = await client.search_entities(schema="Ownership")
+    q = _query(route.calls.last.request)
+    assert ("filter:schema", "Ownership") in q
+    assert not [v for k, v in q if k == "filter:schemata"]
+    assert out["searched"] == {"schema": "Ownership"}
+
+
+# -- caption / provenance (regression: live Aleph returns caption=null) ---------
+
+
+def test_derive_caption_uses_fallback_order_when_no_model() -> None:
+    assert derive_caption({"schema": "Person", "properties": {"name": ["Jane"]}}) == "Jane"
+    assert derive_caption({"schema": "Document", "properties": {"fileName": ["a.pdf"]}}) == "a.pdf"
+
+
+def test_derive_caption_prefers_the_schema_declared_order() -> None:
+    schemata = {"LegalEntity": {"caption": ["registrationNumber", "name"]}}
+    entity = {
+        "schema": "LegalEntity",
+        "properties": {"name": ["Acme"], "registrationNumber": ["RU-1"]},
+    }
+    assert derive_caption(entity, schemata) == "RU-1"
+    assert derive_caption(entity) == "Acme"  # fallback order prefers name
+
+
+def test_derive_caption_keeps_a_server_supplied_caption() -> None:
+    assert derive_caption({"caption": "Given", "properties": {"name": ["Other"]}}) == "Given"
+
+
+def test_derive_caption_returns_none_when_nothing_matches() -> None:
+    assert derive_caption({"schema": "Page", "properties": {"index": [3]}}) is None
+
+
+def test_slim_entity_reads_the_nested_collection_object() -> None:
+    out = slim_entity({"id": "e1", "schema": "Person", "collection": {"id": 583, "label": "x"}})
+    assert out["collection_id"] == "583"
+
+
+async def test_search_derives_captions_from_the_instance_model(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.get("/api/2/metadata").mock(
+        return_value=httpx.Response(
+            200, json={"model": {"schemata": {"Person": {"caption": ["name"]}}}}
+        )
+    )
+    respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "total": 1,
+                "results": [
+                    {
+                        "id": "p1",
+                        "schema": "Person",
+                        "caption": None,
+                        "collection": {"id": 583},
+                        "properties": {"name": ["Jane Doe"]},
+                    }
+                ],
+            },
+        )
+    )
+    out = await client.search_entities(schema="Person")
+    hit = out["results"][0]
+    assert hit["caption"] == "Jane Doe"
+    assert hit["collection_id"] == "583"

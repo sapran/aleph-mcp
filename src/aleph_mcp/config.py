@@ -20,12 +20,12 @@ class Settings(BaseSettings):
 
     host: str = Field(
         ...,
-        validation_alias=AliasChoices("ALEPHCLIENT_HOST", "ALEPH_MCP_HOST"),
+        validation_alias=AliasChoices("ALEPHCLIENT_HOST", "ALEPH_HOST", "ALEPH_MCP_HOST"),
         description="Base URL of the Aleph instance, e.g. https://aleph.occrp.org",
     )
     api_key: str = Field(
         ...,
-        validation_alias=AliasChoices("ALEPHCLIENT_API_KEY", "ALEPH_MCP_API_KEY"),
+        validation_alias=AliasChoices("ALEPHCLIENT_API_KEY", "ALEPH_API_KEY", "ALEPH_MCP_API_KEY"),
         description="Aleph API key. Use a role with READ-only collection access.",
     )
     timeout_secs: float = Field(60, ge=1, description="Per-request HTTP timeout.")
