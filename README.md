@@ -116,6 +116,17 @@ always matches the schema version that instance indexes with — no pinned clien
 - **Text blobs are stripped from search hits.** `bodyText`, `bodyHtml`, `safeHtml`,
   `indexText` and `translatedText` never enter the model's context by accident; every
   result names what was omitted, and `get_entity_text` reads them deliberately in slices.
+- **Search is always scoped to a schema branch.** `/api/2/entities` picks its
+  Elasticsearch index from `filter:schema` or `filter:schemata` and returns a bare 400
+  when given neither. `schemata="Thing"` is applied by default — the same value the Aleph
+  UI uses — and every result reports the scope it searched under `searched`. Relationship
+  schemata (`Ownership`, `Directorship`, `Payment`, `UnknownLink`) descend from `Interval`,
+  not `Thing`, so they must be asked for by name.
+- **Captions are derived client-side.** The instances tested serialise `caption` as `null`
+  on both search hits and single-entity GETs, so the server derives it the way
+  followthemoney does — from the instance's own per-schema caption ordering, with a static
+  fallback. Provenance is likewise recovered from the nested `collection` object when
+  `collection_id` is absent.
 
 ## Develop
 
@@ -126,8 +137,17 @@ uv run ruff check .
 uv run mypy
 ```
 
-Unit tests mock all HTTP with `respx`. Tests marked `live` hit a real instance and are
-skipped unless `ALEPH_MCP_LIVE_TESTS=1`.
+67 unit tests mock all HTTP with `respx`. The 8 tests under `tests/live/` hit a real
+instance and are skipped unless `ALEPH_MCP_LIVE_TESTS=1`:
+
+```bash
+ALEPH_MCP_LIVE_TESTS=1 uv run pytest tests/live -q
+```
+
+They assert shape and contract only — never any instance's content — so they are portable
+to any Aleph deployment. Three of them exist because the corresponding bug survived a
+fully green mocked suite: the mandatory schema scope, the null `caption`, and the nested
+`collection` object. Run them once against a new instance before trusting the server there.
 
 ## License
 
