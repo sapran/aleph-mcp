@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from typing import NoReturn
+
 import httpx
 from fastmcp.exceptions import ResourceError, ToolError
+
+from .readonly import ReadOnlyViolation
 
 
 def raise_for_status(resp: httpx.Response, *, context: str, resource: bool = False) -> None:
@@ -42,6 +46,12 @@ def raise_for_status(resp: httpx.Response, *, context: str, resource: bool = Fal
             "each query instead of issuing many narrow ones."
         )
     raise err_cls(f"{context}: unexpected HTTP {resp.status_code}. {body}")
+
+
+def raise_read_only(exc: ReadOnlyViolation, *, context: str, resource: bool = False) -> NoReturn:
+    """Surface a client-side read-only refusal as the MCP error for this call site."""
+    err_cls = ResourceError if resource else ToolError
+    raise err_cls(f"{context}: {exc}. Refused locally — no request was sent to Aleph.") from exc
 
 
 def _truncate(s: str, n: int) -> str:

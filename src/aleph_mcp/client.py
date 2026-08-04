@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
 from .config import Settings
-from .errors import raise_for_status
+from .errors import raise_for_status, raise_read_only
+from .readonly import ReadOnlyViolation, enforce_read_only
 
 # Elasticsearch `from + size` window enforced by Aleph (aleph/index/util.py MAX_PAGE).
 # SearchQueryParser silently clamps beyond this; we fail loudly instead so the model
@@ -156,8 +157,10 @@ class AlephClient:
 
     Owns one httpx.AsyncClient; the caller closes it with aclose(). Only GET requests
     are issued, with the single exception of POST /api/2/match, which is a read
-    operation that takes a JSON body. No endpoint that creates, mutates or deletes
-    Aleph state is reachable through this class.
+    operation that takes a JSON body. Every outgoing request is checked against the
+    allowlist in `readonly.py` before it is sent, so no endpoint that creates, mutates
+    or deletes Aleph state is reachable through this class regardless of what the API
+    key is permitted to do.
     """
 
     def __init__(self, settings: Settings):
@@ -173,6 +176,7 @@ class AlephClient:
             timeout=settings.timeout_secs,
             verify=settings.verify_tls,
             follow_redirects=True,
+            event_hooks={"request": [enforce_read_only]},
         )
 
     async def aclose(self) -> None:
@@ -265,7 +269,7 @@ class AlephClient:
 
     async def _request(
         self,
-        method: str,
+        method: Literal["GET", "POST"],
         path: str,
         *,
         context: str,
@@ -276,11 +280,14 @@ class AlephClient:
         attempts = self._settings.max_retries
         query = httpx.QueryParams(params) if params else None
         resp: httpx.Response | None = None
-        for attempt in range(1, attempts + 1):
-            resp = await self._http.request(method, path, params=query, json=json)
-            if resp.status_code not in self._RETRY_STATUS or attempt == attempts:
-                break
-            await asyncio.sleep(_retry_delay(resp, attempt))
+        try:
+            for attempt in range(1, attempts + 1):
+                resp = await self._http.request(method, path, params=query, json=json)
+                if resp.status_code not in self._RETRY_STATUS or attempt == attempts:
+                    break
+                await asyncio.sleep(_retry_delay(resp, attempt))
+        except ReadOnlyViolation as e:
+            raise_read_only(e, context=context, resource=resource)
         assert resp is not None
         raise_for_status(resp, context=context, resource=resource)
         data: Any = resp.json()

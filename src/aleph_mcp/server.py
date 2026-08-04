@@ -38,7 +38,9 @@ Hard limits, which are Aleph's and cannot be worked around by paging:
 - Search text (`q`) is an Elasticsearch query_string — `"exact phrase"`, AND/OR/NOT,
   field:value and wildcards all work — plus a fuzzy boost Aleph adds on top.
 
-This server exposes no way to create, modify, ingest or delete anything. For bulk export
+This server exposes no way to create, modify, ingest or delete anything: every outgoing
+request is checked against a fixed allowlist of Aleph read endpoints and refused before it
+is sent, whatever the API key is allowed to do. For bulk export
 of a whole collection, use the separate `aleph-coldbackup` tool, which needs a
 write-scoped key that this server intentionally does not require.
 """.strip()
