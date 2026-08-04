@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Awaitable, Callable
 
 import httpx
 
-# Every request this server may issue, as (method, path) pairs. Enforced on every
-# outgoing httpx request, redirect hops included, so a mutating call cannot reach Aleph
-# even when the API key would permit it. Extending this tuple is the only way to widen
-# the surface; no argument, tool or redirect can.
+# Every request this server may issue, as (method, path) pairs, where path is relative to
+# the Aleph API root. Enforced on every outgoing httpx request, redirect hops included, so
+# a mutating call cannot reach Aleph even when the API key would permit it. Extending this
+# tuple is the only way to widen the surface; no argument, tool or redirect can.
 _ENTITY_ID = r"[A-Za-z0-9._:-]+"
 _COLLECTION_ID = r"[0-9]+"
 
@@ -35,18 +36,48 @@ class ReadOnlyViolation(RuntimeError):
 
 
 def is_read_only(method: str, path: str) -> bool:
-    """True when (method, path) is one of the Aleph read endpoints this server may call."""
+    """True when (method, path) is one of the Aleph read endpoints this server may call.
+
+    `path` is relative to the API root, i.e. with any base-URL prefix already removed.
+    """
     return any(m == method and p.fullmatch(path) for m, p in _ALLOWED)
 
 
-async def enforce_read_only(request: httpx.Request) -> None:
-    """httpx request hook: refuse anything not on the read-only allowlist.
+def read_only_hook(host: str) -> Callable[[httpx.Request], Awaitable[None]]:
+    """Build the httpx request hook that pins every request to `host` and the allowlist.
 
-    Runs for every request the client sends, redirect hops included, so the guarantee
-    holds regardless of what the API key is permitted to do server-side.
+    The returned hook runs for every request the client sends, redirect hops included, so
+    the guarantee holds regardless of what the API key is permitted to do server-side. It
+    refuses a request that leaves the configured host — an Aleph instance can redirect,
+    and a POST /api/2/match body would otherwise be re-sent to the redirect target — and
+    it strips the host's own path prefix before matching, so an Aleph mounted under
+    https://example.org/aleph is checked on /api/2/... like any other.
     """
-    if not is_read_only(request.method, request.url.path):
-        raise ReadOnlyViolation(
-            f"blocked {request.method} {request.url.path}: aleph-mcp is read-only and only "
-            "calls a fixed allowlist of Aleph read endpoints"
-        )
+    base = httpx.URL(host)
+    expected_host = base.host
+    prefix = base.path.rstrip("/")
+
+    async def enforce_read_only(request: httpx.Request) -> None:
+        if request.url.host != expected_host:
+            raise ReadOnlyViolation(
+                f"blocked {request.method} {request.url}: this request leaves the configured "
+                f"Aleph host {expected_host}"
+            )
+        path = request.url.path
+        if prefix:
+            if path == prefix:
+                path = "/"
+            elif path.startswith(f"{prefix}/"):
+                path = path[len(prefix) :]
+            else:
+                raise ReadOnlyViolation(
+                    f"blocked {request.method} {request.url}: this request leaves the "
+                    f"configured Aleph base path {prefix}"
+                )
+        if not is_read_only(request.method, path):
+            raise ReadOnlyViolation(
+                f"blocked {request.method} {request.url}: aleph-mcp is read-only and only "
+                "calls a fixed allowlist of Aleph read endpoints"
+            )
+
+    return enforce_read_only

@@ -8,7 +8,7 @@ import httpx
 
 from .config import Settings
 from .errors import raise_for_status, raise_read_only
-from .readonly import ReadOnlyViolation, enforce_read_only
+from .readonly import ReadOnlyViolation, read_only_hook
 
 # Elasticsearch `from + size` window enforced by Aleph (aleph/index/util.py MAX_PAGE).
 # SearchQueryParser silently clamps beyond this; we fail loudly instead so the model
@@ -176,7 +176,7 @@ class AlephClient:
             timeout=settings.timeout_secs,
             verify=settings.verify_tls,
             follow_redirects=True,
-            event_hooks={"request": [enforce_read_only]},
+            event_hooks={"request": [read_only_hook(settings.host)]},
         )
 
     async def aclose(self) -> None:

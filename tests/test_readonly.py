@@ -4,7 +4,7 @@ import respx
 from fastmcp.exceptions import ToolError
 
 from aleph_mcp.client import AlephClient
-from aleph_mcp.readonly import ReadOnlyViolation, is_read_only
+from aleph_mcp.readonly import ReadOnlyViolation, is_read_only, read_only_hook
 
 
 @pytest.mark.parametrize(
@@ -81,3 +81,30 @@ async def test_redirect_into_a_write_endpoint_is_blocked(
     with pytest.raises(ToolError, match="read-only"):
         await client.get_entity(entity_id="e1")
     assert blocked.call_count == 0
+
+
+async def test_base_path_prefix_is_stripped_before_matching() -> None:
+    hook = read_only_hook("https://aleph.test/aleph")
+    await hook(httpx.Request("GET", "https://aleph.test/aleph/api/2/entities"))
+    with pytest.raises(ReadOnlyViolation, match="read-only"):
+        await hook(httpx.Request("POST", "https://aleph.test/aleph/api/2/entities"))
+    with pytest.raises(ReadOnlyViolation, match="base path"):
+        await hook(httpx.Request("GET", "https://aleph.test/api/2/entities"))
+
+
+async def test_request_leaving_the_configured_host_is_blocked() -> None:
+    hook = read_only_hook("https://aleph.test")
+    with pytest.raises(ReadOnlyViolation, match="configured Aleph host"):
+        await hook(httpx.Request("GET", "https://evil.example/api/2/entities"))
+
+
+async def test_cross_host_redirect_is_blocked(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.get("/api/2/entities/e1").mock(
+        return_value=httpx.Response(
+            302, headers={"Location": "https://evil.example/api/2/entities"}
+        )
+    )
+    with pytest.raises(ToolError, match="configured Aleph host"):
+        await client.get_entity(entity_id="e1")
