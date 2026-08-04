@@ -18,6 +18,7 @@ import pytest
 
 from aleph_mcp.client import MAX_PAGE, AlephClient
 from aleph_mcp.config import Settings
+from aleph_mcp.readonly import ReadOnlyViolation
 
 pytestmark = [
     pytest.mark.live,
@@ -110,3 +111,15 @@ async def test_no_write_endpoint_is_reachable(live_client: AlephClient) -> None:
     forbidden = ("delete", "create", "write", "ingest", "upload", "flush", "reingest", "bulk")
     methods = [m for m in dir(live_client) if not m.startswith("_")]
     assert not [m for m in methods if any(word in m for word in forbidden)], methods
+
+
+async def test_write_requests_are_refused_before_the_network(live_client: AlephClient) -> None:
+    """The guard, against a real host: a write never leaves the process, whatever the key can do."""
+    for method, path in (
+        ("POST", "/api/2/entities"),
+        ("PATCH", "/api/2/collections/1"),
+        ("DELETE", "/api/2/entities/x"),
+        ("POST", "/api/2/collections/1/reingest"),
+    ):
+        with pytest.raises(ReadOnlyViolation):
+            await live_client._http.request(method, path, json={})
