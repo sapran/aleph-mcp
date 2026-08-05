@@ -33,19 +33,27 @@ _MAX_VALUE_CHARS = 500
 # httpx types query values permissively; match it so no cast is needed at the call site.
 Query = list[tuple[str, str | int | float | bool | None]]
 
-_ENTITY_ID = re.compile(r"^[A-Za-z0-9._:-]+$")
-_COLLECTION_ID = re.compile(r"^[0-9]+$")
+# Matched with `fullmatch`, as in readonly.py — no anchors, so the two agree by
+# construction. An anchored `$` here is what previously let a trailing newline through.
+_ENTITY_ID = re.compile(r"[A-Za-z0-9._:-]+")
+_COLLECTION_ID = re.compile(r"[0-9]+")
 
 
 def _check_entity_id(value: str, *, field: str = "entity_id") -> str:
-    if not isinstance(value, str) or not _ENTITY_ID.match(value):
+    if not isinstance(value, str) or not _ENTITY_ID.fullmatch(value):
         raise ValueError(f"invalid {field}: must match [A-Za-z0-9._:-]+ (got {value!r})")
+    # The charset permits `.`, so an id of only dot segments passes the pattern and is then
+    # normalised away at URL construction — `/api/2/entitysets/../entities` becomes
+    # `/api/2/entities`, answering a different question than the caller asked. Refuse on
+    # content rather than by banning `.`, which legitimate Aleph ids contain.
+    if not value.strip("."):
+        raise ValueError(f"invalid {field}: addresses nothing (got {value!r})")
     return value
 
 
 def _check_collection_id(value: str | int) -> str:
     text = str(value)
-    if not _COLLECTION_ID.match(text):
+    if not _COLLECTION_ID.fullmatch(text):
         raise ValueError(
             f"invalid collection_id: expected the numeric id (got {text!r}). "
             "If you have a foreign_id such as 'my-case', call get_collection first."
@@ -314,11 +322,19 @@ class AlephClient:
         }
 
     async def get_collection(self, *, collection: str) -> dict[str, Any]:
-        """Fetch one collection by numeric id or by foreign_id."""
-        if _COLLECTION_ID.match(str(collection)):
+        """Fetch one collection by numeric id or by foreign_id.
+
+        The numeric branch interpolates into the path, so it goes through the shared
+        validator rather than trusting the branch test. The foreign_id branch is left
+        free-form on purpose: it becomes a url-encoded query parameter and cannot escape
+        the path, and foreign ids are not constrained to any charset.
+        """
+        text = str(collection)
+        if text and not text.strip("0123456789 \t\r\n"):
+            collection_id = _check_collection_id(text)
             payload = await self._request(
                 "GET",
-                f"/api/2/collections/{collection}",
+                f"/api/2/collections/{collection_id}",
                 context="get_collection",
                 params=[("refresh", "true")],
             )
