@@ -1,0 +1,59 @@
+schema: spec-driven
+
+# Project context (shown to AI when creating artifacts)
+context: |
+  aleph-mcp is a read-only FastMCP server over the Aleph HTTP API (OCCRP's
+  investigative data platform). Python 3.12+, managed with uv; httpx for
+  transport, pydantic-settings for configuration, fastmcp for the MCP surface.
+  Lint and format with ruff, type-check with mypy. Entry point is
+  `aleph-mcp = aleph_mcp.__main__:main`.
+
+  Layout: `src/aleph_mcp/` holds `server.py` (tool and resource registration),
+  `client.py` (the async Aleph wrapper, slimming and limit enforcement),
+  `readonly.py` (the outgoing-request allowlist), `config.py` (environment
+  settings) and `errors.py`. Tests are split: `tests/` runs fully mocked and is
+  the default suite, `tests/live/` requires a real Aleph instance and a real
+  API key and is not part of an ordinary run.
+
+  The load-bearing invariant is read-only. Every outgoing request, redirect
+  hops included, is matched against a fixed allowlist of Aleph read endpoints
+  in `readonly.py` and refused before it is sent, regardless of what the API
+  key would permit server-side. Widening that tuple is the only way to widen
+  the surface — no tool argument, no redirect, no configuration can. Treat any
+  change touching `readonly.py` as a security change.
+
+  The second theme is context discipline. Aleph's ceilings are real and are
+  surfaced rather than papered over: search refuses `limit + offset > 9999`
+  instead of silently clamping the way Aleph does, graph expansion is capped at
+  200 per property but still reports the true `count`, and document-sized text
+  properties are stripped from every entity and named in `_omitted_properties`,
+  so `get_entity_text` is the only path to a document body and it is bounded.
+  A tool that returns a confidently incomplete answer is a bug here.
+
+  External consumer, out of repo: the `aleph-entity-graph` skill in the
+  `acordia-analysts` plugin names this server's tools and restates its limits.
+  That repository is markdown-only by contract and this package is deliberately
+  not vendored into it; see `docs/implementation-notes.md`.
+
+# Per-artifact rules
+rules:
+  proposal:
+    - State plainly when a change is a baseline of already-shipped behaviour
+      rather than new work, and name the commit or file that shipped it.
+  specs:
+    - Prefer requirements that pin observable contract — tool names, response
+      keys, refusal behaviour — over requirements restating implementation.
+    - A requirement about the read-only guarantee must be expressed as what is
+      refused, not as what is permitted.
+    - When a requirement exists because an out-of-repo consumer depends on it,
+      name that consumer in the requirement text.
+  tasks:
+    - Keep mocked-suite work and live-suite work in separate tasks; the live
+      suite needs credentials a contributor may not have.
+
+# Per-operation guidance
+operations:
+  apply:
+    guidance:
+      - Never widen the `readonly.py` allowlist as an incidental step of
+        another task. It gets its own change.
