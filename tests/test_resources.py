@@ -46,6 +46,15 @@ def _payload(result: list) -> dict:
     return json.loads(result[0].text)
 
 
+async def test_resource_surface_is_exactly_the_read_set(server: FastMCP) -> None:
+    async with MCPClient(server) as mcp:
+        static = {str(r.uri): r.mimeType for r in await mcp.list_resources()}
+        templates = {t.uriTemplate: t.mimeType for t in await mcp.list_resource_templates()}
+    assert set(static) == {"aleph://collections", "aleph://schemata"}
+    assert set(templates) == {"aleph://schema/{name}"}
+    assert set(static.values()) | set(templates.values()) == {"application/json"}
+
+
 async def test_collections_resource(server: FastMCP, respx_mock: respx.MockRouter) -> None:
     respx_mock.get("/api/2/collections").mock(
         return_value=httpx.Response(200, json={"total": 1, "results": [{"id": "42"}]})

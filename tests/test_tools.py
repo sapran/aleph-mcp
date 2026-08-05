@@ -47,6 +47,18 @@ async def test_no_tool_advertises_a_mutation(server: FastMCP) -> None:
     assert not [n for n in names if any(word in n for word in forbidden)]
 
 
+async def test_tool_names_carry_no_namespace_prefix(server: FastMCP) -> None:
+    """The `aleph_` prefix the acordia `aleph-entity-graph` skill hardcodes is applied by
+    whatever mounts this server. Adding one here would break every mount that already
+    applies its own."""
+    async with MCPClient(server) as mcp:
+        names = {t.name for t in await mcp.list_tools()}
+    assert not [n for n in names if n.startswith("aleph_")]
+    # Guards the general case too: a prefix would leave every name sharing one leading
+    # segment, which the bare read set does not.
+    assert len({n.split("_", 1)[0] for n in names}) > 1
+
+
 async def test_instructions_state_the_limits(server: FastMCP) -> None:
     async with MCPClient(server) as mcp:
         result = mcp.initialize_result
@@ -116,3 +128,222 @@ async def test_bad_entity_id_surfaces_as_tool_error(server: FastMCP) -> None:
     async with MCPClient(server) as mcp:
         with pytest.raises(Exception, match="invalid entity_id"):
             await mcp.call_tool("get_entity", {"entity_id": "../etc/passwd"})
+
+
+# -- response-shape guarantees ------------------------------------------------
+#
+# These duplicate assertions that tests/test_client.py already makes against
+# AlephClient, deliberately. The contract is published at the MCP layer: a refactor
+# that registered a tool bypassing the slimming path would leave the client tests
+# green while breaking every consumer.
+
+BLOB_PROPS = ["bodyText", "bodyHtml", "safeHtml", "indexText", "translatedText"]
+
+
+def _doc_entity(**extra: object) -> dict[str, object]:
+    props: dict[str, object] = {"name": ["Memo"], "fileName": ["memo.pdf"]}
+    props.update({p: [f"<{p} body>"] for p in BLOB_PROPS})
+    return {"id": "d1", "schema": "Document", "properties": props, **extra}
+
+
+async def test_search_hits_never_carry_document_text(
+    server: FastMCP, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json={"total": 1, "results": [_doc_entity()]})
+    )
+    async with MCPClient(server) as mcp:
+        hit = (await mcp.call_tool("search_entities", {"q": "memo"})).data["results"][0]
+    assert not [p for p in BLOB_PROPS if p in hit["properties"]]
+    assert hit["_omitted_properties"] == sorted(BLOB_PROPS)
+    assert hit["properties"]["fileName"] == ["memo.pdf"]
+
+
+async def test_get_entity_never_carries_document_text(
+    server: FastMCP, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.get("/api/2/entities/d1").mock(return_value=httpx.Response(200, json=_doc_entity()))
+    async with MCPClient(server) as mcp:
+        out = (await mcp.call_tool("get_entity", {"entity_id": "d1"})).data
+    assert not [p for p in BLOB_PROPS if p in out["properties"]]
+    assert out["_omitted_properties"] == sorted(BLOB_PROPS)
+
+
+async def test_nothing_dropped_means_no_omitted_marker(
+    server: FastMCP, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.get("/api/2/entities/e1").mock(
+        return_value=httpx.Response(
+            200, json={"id": "e1", "schema": "Person", "properties": {"name": ["Jane"]}}
+        )
+    )
+    async with MCPClient(server) as mcp:
+        out = (await mcp.call_tool("get_entity", {"entity_id": "e1"})).data
+    assert "_omitted_properties" not in out
+
+
+async def test_search_reports_the_scope_it_used(
+    server: FastMCP, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json={"total": 0, "results": []})
+    )
+    async with MCPClient(server) as mcp:
+        default = (await mcp.call_tool("search_entities", {"q": "x"})).data
+        explicit = (await mcp.call_tool("search_entities", {"schema": "Ownership"})).data
+    assert default["searched"] == {"schemata": "Thing"}
+    assert explicit["searched"] == {"schema": "Ownership"}
+
+
+async def test_unreachable_total_is_marked_unenumerated(
+    server: FastMCP, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json={"total": {"value": 50_000}, "results": []})
+    )
+    async with MCPClient(server) as mcp:
+        out = (await mcp.call_tool("search_entities", {"q": "x"})).data
+    assert "UNENUMERATED" in out["_note"]
+
+
+async def test_reachable_total_carries_no_note(
+    server: FastMCP, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json={"total": {"value": 12}, "results": []})
+    )
+    async with MCPClient(server) as mcp:
+        out = (await mcp.call_tool("search_entities", {"q": "x"})).data
+    assert "_note" not in out
+
+
+async def test_truncated_expansion_reports_true_degree(
+    server: FastMCP, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.get("/api/2/entities/e1/expand").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "total": 1,
+                "results": [
+                    {
+                        "property": "ownershipOwner",
+                        "count": 4137,
+                        "entities": [{"id": "o1", "schema": "Ownership", "properties": {}}],
+                    }
+                ],
+            },
+        )
+    )
+    async with MCPClient(server) as mcp:
+        group = (await mcp.call_tool("expand_entity", {"entity_id": "e1"})).data["results"][0]
+    assert len(group["entities"]) == 1
+    assert group["count"] == 4137
+
+
+# -- refusal and error translation --------------------------------------------
+
+
+async def test_deep_pagination_never_reaches_the_wire(
+    server: FastMCP, respx_mock: respx.MockRouter
+) -> None:
+    route = respx_mock.get("/api/2/entities").mock(return_value=httpx.Response(200, json={}))
+    async with MCPClient(server) as mcp:
+        with pytest.raises(Exception, match="9999"):
+            await mcp.call_tool("search_entities", {"limit": 100, "offset": 9999})
+    assert route.call_count == 0
+
+
+@pytest.mark.parametrize("args", [{"limit": -1}, {"offset": -1}])
+async def test_negative_paging_surfaces_as_tool_error(
+    server: FastMCP, respx_mock: respx.MockRouter, args: dict[str, int]
+) -> None:
+    route = respx_mock.get("/api/2/entities").mock(return_value=httpx.Response(200, json={}))
+    async with MCPClient(server) as mcp:
+        with pytest.raises(Exception, match=">= 0"):
+            await mcp.call_tool("search_entities", args)
+    assert route.call_count == 0
+
+
+@pytest.mark.parametrize(
+    ("args", "match"),
+    [
+        ({"offset": -1}, "offset must be >= 0"),
+        ({"limit": 0}, "between 1 and 200000"),
+        ({"limit": 200_001}, "between 1 and 200000"),
+    ],
+)
+async def test_text_slice_bounds_surface_as_tool_error(
+    server: FastMCP, respx_mock: respx.MockRouter, args: dict[str, int], match: str
+) -> None:
+    route = respx_mock.get("/api/2/entities/d1").mock(return_value=httpx.Response(200, json={}))
+    async with MCPClient(server) as mcp:
+        with pytest.raises(Exception, match=match):
+            await mcp.call_tool("get_entity_text", {"entity_id": "d1", **args})
+    assert route.call_count == 0
+
+
+@pytest.mark.parametrize("entity_id", ["e1\n", "e1\r", "e1\n\n", "e1 "])
+async def test_trailing_whitespace_id_surfaces_as_tool_error(
+    server: FastMCP, respx_mock: respx.MockRouter, entity_id: str
+) -> None:
+    """Regression: the validators used `$`, which matches before a trailing newline, so
+    `"e1\\n"` reached httpx and surfaced its `InvalidURL` message instead of ours."""
+    route = respx_mock.get(url__startswith="/api/2/entities").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    async with MCPClient(server) as mcp:
+        with pytest.raises(Exception, match="invalid entity_id"):
+            await mcp.call_tool("get_entity", {"entity_id": entity_id})
+    assert route.call_count == 0
+
+
+@pytest.mark.parametrize("entity_id", ["..", ".", "...", "./."])
+async def test_id_that_addresses_nothing_is_refused(
+    server: FastMCP, respx_mock: respx.MockRouter, entity_id: str
+) -> None:
+    """`entityset_id=".."` used to normalise `/api/2/entitysets/../entities` down to
+    `/api/2/entities` — an allowlisted read that answers a different question."""
+    route = respx_mock.get(url__startswith="/api/2/entit").mock(
+        return_value=httpx.Response(200, json={"total": 0, "results": []})
+    )
+    async with MCPClient(server) as mcp:
+        with pytest.raises(Exception, match="invalid entityset_id"):
+            await mcp.call_tool("entityset_items", {"entityset_id": entity_id})
+    assert route.call_count == 0
+
+
+async def test_dotted_ids_are_still_accepted(server: FastMCP, respx_mock: respx.MockRouter) -> None:
+    """The dot-only refusal must not become a ban on dots — real Aleph ids contain them."""
+    respx_mock.get("/api/2/entities/a.b.c").mock(
+        return_value=httpx.Response(200, json={"id": "a.b.c", "schema": "Person"})
+    )
+    async with MCPClient(server) as mcp:
+        out = (await mcp.call_tool("get_entity", {"entity_id": "a.b.c"})).data
+    assert out["id"] == "a.b.c"
+
+
+async def test_numeric_collection_id_is_validated_before_interpolation(
+    server: FastMCP, respx_mock: respx.MockRouter
+) -> None:
+    route = respx_mock.get(url__startswith="/api/2/collections").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    async with MCPClient(server) as mcp:
+        with pytest.raises(Exception, match="invalid collection_id"):
+            await mcp.call_tool("get_collection", {"collection": "42\n"})
+    assert route.call_count == 0
+
+
+async def test_foreign_id_collection_lookup_still_accepts_free_form(
+    server: FastMCP, respx_mock: respx.MockRouter
+) -> None:
+    route = respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(
+            200, json={"results": [{"id": "42", "foreign_id": "my-case", "label": "Case"}]}
+        )
+    )
+    async with MCPClient(server) as mcp:
+        out = (await mcp.call_tool("get_collection", {"collection": "my-case"})).data
+    assert out["foreign_id"] == "my-case"
+    assert route.call_count == 1
