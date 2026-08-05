@@ -1,30 +1,47 @@
 # Implementation notes
 
-Findings recorded during other work, kept out of the change that surfaced them.
+Findings recorded during other work, kept out of the change that surfaced them. An entry leaves
+this file when it becomes a spec requirement or is fixed — not when someone remembers to tidy up.
 
-## Id validation is looser than the read-only allowlist (from the read-only guard review)
+Retired since the last prune:
 
-The read-only allowlist in `src/aleph_mcp/readonly.py` matches with `re.fullmatch`; the id
-validators in `src/aleph_mcp/client.py` (`_check_entity_id`, `_check_collection_id`) still use
-`re.match` with a `$` anchor. None of the differences below can widen the allowlist — every one
-of them fails closed — but they produce confusing errors:
+- The `$` anchor letting `entity_id="e1\n"` through, and `entityset_id=".."` normalising away to
+  a different endpoint. **Fixed** by `fix-id-validation-anchors`; the validators now use
+  `re.fullmatch`, as the allowlist always has.
+- The guard matching a decoded path while the transport sends the encoded one. **Specified** by
+  `baseline-read-only-guard` as a requirement that carries its own invalidating condition, with
+  `test_id_charset_excludes_percent` as the tripwire: if `%` is ever added to the accepted id
+  charset, that test fails and the guard must move to `raw_path`.
+- `GET /api/2/collections/{id}?refresh=true` asking Aleph to recompute statistics. **Specified**
+  by `baseline-read-only-guard` as the single named exception to "asks the server only to
+  answer", with `test_refresh_is_emitted_by_exactly_one_request` as the tripwire so the exception
+  list cannot grow quietly.
 
-- `$` matches before a trailing newline, so `entity_id="e1\n"` passes validation and then dies
-  inside httpx with an opaque `InvalidURL` that no tool translates (each `@mcp.tool` catches only
-  `ValueError`). Fix: `re.fullmatch`, or `\Z` instead of `$`.
-- The id charset allows `.`, so `entityset_id=".."` is accepted and httpx normalises the dot
-  segment away at URL construction: `/api/2/entitysets/../entities` becomes `/api/2/entities`,
-  which is an allowlisted read. The caller learns nothing `search_entities` does not already
-  expose, but a nonsense id should fail with a clear `ValueError`.
-- The guard inspects `httpx.URL.path` (percent-decoded) while the transport sends
-  `raw_path` (encoded). Safe today only because the id charset excludes `%`: decoding can add
-  `/` separators, which makes `fullmatch` stricter, never looser. If that charset is ever
-  widened to include `%`, the hook must match `request.url.raw_path` instead.
+## Deferred: declare the acordia ↔ aleph-mcp seam as an OpenSpec reference
 
-## `GET /api/2/collections/{id}?refresh=true` is a side-effecting read
+Not implemented. Recorded here so the decision is not re-derived from scratch.
 
-`AlephClient.get_collection` always passes `refresh=true` on the numeric-id branch, which asks
-Aleph to recompute the collection's statistics. It creates, changes and deletes nothing, so it
-does not contradict the read-only guarantee, but it is the only request in the package that asks
-the server to do work beyond answering. Worth naming explicitly if the guarantee is ever audited
-externally.
+This server has an external consumer that is not in this repository: the `aleph-entity-graph`
+skill in the `acordia-analysts` plugin (`acordia` marketplace, pinned at 2.0.0). Its SKILL.md
+names our tools (`aleph_search_entities`, `aleph_expand_entity`, `aleph_get_entity_text`), and
+asserts on our behalf that the server "enforce[s] Aleph's real limits and strip[s] document text
+out of search hits". Nothing checks either claim.
+
+The two repositories deliberately do not merge. acordia is markdown-only by contract — stated in
+its `CLAUDE.md`, its `README.md`, and normatively in
+`openspec/specs/operator-skill-library/spec.md` ("the repository remains markdown-only") — and
+its archived change `2026-07-31-aleph-data-access`, the one that created the skill, already ruled
+that `aleph-mcp` "is not and must not be vendored here". Folding this package in would falsify a
+deployed requirement there, and would drag a live-Aleph integration suite into a repo whose
+stated test count is zero. The boundary stays.
+
+What is missing is not a merge but a declared edge. `openspec doctor` in this repo reports
+`References: (none declared)`, and `openspec store list` is empty, so the coupling exists only as
+prose in an archived proposal in someone else's plugin cache. Registering acordia as an OpenSpec
+store and declaring the dependency would make the seam machine-checkable from this side without
+touching acordia at all.
+
+Deferred rather than done because it changes how this repo resolves its OpenSpec root, which is
+worth settling on its own rather than as a rider on the first baseline. Do it after
+`baseline-mcp-tool-surface` lands, so there is something on this side for the reference to point
+at.
