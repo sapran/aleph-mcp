@@ -88,6 +88,16 @@ why it carries no `env` block at all.
   export ALEPHCLIENT_API_KEY=<key>
   ```
 
+  On macOS, keep the key out of every file by reading it from the login Keychain. This
+  works with all harnesses, and omp passes it down to the MCP child like any other
+  inherited variable:
+
+  ```bash
+  # security add-generic-password -s aleph-mcp -a "$USER" -w '<api-key>' -U
+  export ALEPHCLIENT_HOST="https://aleph.example.org"
+  export ALEPHCLIENT_API_KEY="$(security find-generic-password -s aleph-mcp -a "$USER" -w 2>/dev/null)"
+  ```
+
   Alternatively add an `env` block to that client's own MCP entry — but then the literal
   value sits in that client's config file.
 
