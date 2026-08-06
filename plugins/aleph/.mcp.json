@@ -9,7 +9,7 @@
         "aleph-mcp"
       ],
       "env": {
-        "ALEPHCLIENT_HOST": "!printf %s \"${ALEPHCLIENT_HOST:-http://localhost:8080}\"",
+        "ALEPHCLIENT_HOST": "!printf %s \"$ALEPHCLIENT_HOST\"",
         "ALEPHCLIENT_API_KEY": "!security find-generic-password -s aleph-mcp -a \"$USER\" -w 2>/dev/null || printf %s \"$ALEPHCLIENT_API_KEY\""
       }
     }
