@@ -8,17 +8,26 @@ portable to any Aleph deployment.
 Two of these exist because a mocked suite could not have caught the corresponding bug:
 - `/api/2/entities` rejects a query that names no schema or schemata.
 - Aleph serialises `caption` as null and nests the collection object in search hits.
+
+The bottom half drives every registered tool through the MCP boundary against the real
+instance. A mocked test proves a tool matches our belief about Aleph; only this proves
+the belief. Where the instance holds no data of the required kind the case skips, and
+says which data would make it run — an empty instance must not read as coverage.
 """
 
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import pytest
+from fastmcp import Client as MCPClient
+from fastmcp import FastMCP
 
 from aleph_mcp.client import MAX_PAGE, AlephClient
 from aleph_mcp.config import Settings
 from aleph_mcp.readonly import ReadOnlyViolation
+from aleph_mcp.server import build_server
 
 pytestmark = [
     pytest.mark.live,
@@ -75,6 +84,37 @@ async def test_expand_and_tags_accept_a_real_entity_id(live_client: AlephClient)
     assert isinstance(similar["results"], list)
 
 
+async def test_profile_tools_accept_a_real_profile_id(live_client: AlephClient) -> None:
+    """Profiles are opt-in per instance: an Aleph with no cross-referencing judged has
+    none at all, so skip rather than fail. `profile_id` arrives on the search hit itself,
+    which is the discovery path the tools rely on."""
+    out = await live_client.search_entities(schemata="LegalEntity", limit=50)
+    profile_id = next((hit["profile_id"] for hit in out["results"] if hit.get("profile_id")), None)
+    if not profile_id:
+        pytest.skip("no profile on the sampled entities; instance has no judged xref")
+
+    profile = await live_client.get_profile(profile_id=profile_id)
+    assert profile["type"] == "profile"
+    assert isinstance(profile["entities"], list)
+    assert "bodyText" not in profile["merged"].get("properties", {})
+
+    expanded = await live_client.expand_profile(profile_id=profile_id, limit=5)
+    assert isinstance(expanded["results"], list)
+
+    tags = await live_client.profile_tags(profile_id=profile_id)
+    assert "results" in tags
+
+    similar = await live_client.profile_similar(profile_id=profile_id, limit=3)
+    assert isinstance(similar["results"], list)
+
+    # A profile IS an entityset, so this route 302s to the profile view. Aleph builds that
+    # Location from its public UI url, which is a different host:port from the API, so the
+    # hop must be reported rather than followed — this is the assertion that caught it.
+    as_set = await live_client.get_entityset(entityset_id=profile_id)
+    assert as_set["type"] == "profile"
+    assert "get_profile" in as_set["_note"]
+
+
 async def test_deep_pagination_is_refused_before_the_request(live_client: AlephClient) -> None:
     with pytest.raises(ValueError, match=str(MAX_PAGE)):
         await live_client.search_entities(limit=100, offset=MAX_PAGE - 1)
@@ -123,3 +163,174 @@ async def test_write_requests_are_refused_before_the_network(live_client: AlephC
     ):
         with pytest.raises(ReadOnlyViolation):
             await live_client._http.request(method, path, json={})
+
+
+# -- every tool, over MCP, against the real instance ---------------------------
+
+
+@pytest.fixture
+async def live_server():
+    mcp, client = build_server(Settings())  # type: ignore[call-arg]
+    try:
+        yield mcp
+    finally:
+        await client.aclose()
+
+
+@pytest.fixture
+async def ids(live_client: AlephClient) -> dict[str, str | None]:
+    """Real ids for the tools that need one, discovered the way a caller would.
+
+    None means the instance holds nothing of that kind; the cases that need it skip.
+    """
+    collections = await live_client.list_collections(limit=1)
+    collection_id = collections["results"][0]["id"] if collections["results"] else None
+
+    entities = await live_client.search_entities(schemata="Thing", limit=50)
+    hits = entities["results"]
+    entity_id = hits[0]["id"] if hits else None
+    profile_id = next((h["profile_id"] for h in hits if h.get("profile_id")), None)
+    document_id = next(
+        (h["id"] for h in hits if h.get("_omitted_properties") or h["schema"] == "Pages"), None
+    )
+
+    entityset_id = None
+    if collection_id:
+        sets = await live_client.list_entitysets(collection_id=collection_id)
+        entityset_id = sets["results"][0]["id"] if sets["results"] else None
+
+    return {
+        "collection_id": collection_id,
+        "entity_id": entity_id,
+        "profile_id": profile_id,
+        "document_id": document_id,
+        "entityset_id": entityset_id,
+    }
+
+
+def _tool_arguments(name: str, ids: dict[str, str | None]) -> dict[str, Any]:
+    """Arguments for one tool, or a skip naming the data the instance is missing.
+
+    Keeping this a single mapping is what lets the tripwire below prove the live suite
+    reaches every registered tool: a new tool has to appear here or the suite fails.
+    """
+
+    def need(key: str) -> str:
+        value = ids[key]
+        if not value:
+            pytest.skip(f"instance has no {key} to exercise {name} against")
+        return value
+
+    match name:
+        case "list_collections":
+            return {"limit": 5}
+        case "get_collection":
+            return {"collection": need("collection_id")}
+        case "search_entities":
+            return {"schemata": "Thing", "facets": ["schema"], "limit": 1}
+        case "get_entity" | "entity_tags":
+            return {"entity_id": need("entity_id")}
+        case "expand_entity":
+            return {"entity_id": need("entity_id"), "limit": 5}
+        case "similar_entities":
+            return {"entity_id": need("entity_id"), "limit": 3}
+        case "match_entity":
+            return {
+                "sample": {"schema": "Person", "properties": {"name": ["Jane Doe"]}},
+                "limit": 3,
+            }
+        case "get_profile" | "profile_tags":
+            return {"profile_id": need("profile_id")}
+        case "profile_similar":
+            return {"profile_id": need("profile_id"), "limit": 3}
+        case "expand_profile":
+            return {"profile_id": need("profile_id"), "limit": 5}
+        case "list_entitysets":
+            return {"collection_id": need("collection_id")}
+        case "get_entityset" | "entityset_items":
+            return {"entityset_id": need("entityset_id")}
+        case "xref_results":
+            return {"collection_id": need("collection_id")}
+        case "get_entity_text":
+            return {"entity_id": need("document_id"), "limit": 500}
+    raise AssertionError(f"no live arguments defined for tool {name!r}")
+
+
+LIVE_TOOL_ARGUMENTS = (
+    "list_collections",
+    "get_collection",
+    "search_entities",
+    "get_entity",
+    "expand_entity",
+    "entity_tags",
+    "similar_entities",
+    "match_entity",
+    "get_profile",
+    "profile_tags",
+    "profile_similar",
+    "expand_profile",
+    "list_entitysets",
+    "get_entityset",
+    "entityset_items",
+    "xref_results",
+    "get_entity_text",
+)
+
+
+@pytest.mark.parametrize("tool", LIVE_TOOL_ARGUMENTS)
+async def test_tool_answers_against_the_real_instance(
+    live_server: FastMCP, ids: dict[str, str | None], tool: str
+) -> None:
+    """Aleph must accept the request we build and we must accept the response it sends.
+
+    Asserted loosely on purpose: content varies per deployment, but a tool that 400s,
+    404s or returns something the slimming path cannot walk fails here.
+    """
+    async with MCPClient(live_server) as mcp:
+        result = await mcp.call_tool(tool, _tool_arguments(tool, ids))
+    assert isinstance(result.data, dict), f"{tool} returned {type(result.data).__name__}"
+
+
+async def test_live_coverage_reaches_every_registered_tool(live_server: FastMCP) -> None:
+    """Tripwire: a tool added without a live case would otherwise be proven only against
+    our own mocks, which is where every Aleph surprise so far has slipped through."""
+    async with MCPClient(live_server) as mcp:
+        registered = {t.name for t in await mcp.list_tools()}
+    assert registered == set(LIVE_TOOL_ARGUMENTS)
+
+
+async def test_resources_answer_against_the_real_instance(live_server: FastMCP) -> None:
+    async with MCPClient(live_server) as mcp:
+        listed = {str(r.uri) for r in await mcp.list_resources()}
+        assert listed == {"aleph://collections", "aleph://schemata"}
+
+        collections = await mcp.read_resource("aleph://collections")
+        assert '"results"' in collections[0].text
+
+        schemata = await mcp.read_resource("aleph://schemata")
+        assert '"Ownership"' in schemata[0].text
+
+        # Templated, so it is not in list_resources; read it directly.
+        person = await mcp.read_resource("aleph://schema/Person")
+        assert '"Person"' in person[0].text
+
+
+async def test_get_collection_returns_statistics_from_either_branch(
+    live_client: AlephClient, ids: dict[str, str | None]
+) -> None:
+    """Regression: the foreign_id branch answered from the collections listing, which
+    carries no `statistics`, so the same collection came back with stats by id and
+    without them by foreign_id — the one thing get_collection adds over list_collections.
+    """
+    collection_id = ids["collection_id"]
+    if not collection_id:
+        pytest.skip("instance has no readable collection")
+    by_id = await live_client.get_collection(collection=collection_id)
+    foreign_id = by_id.get("foreign_id")
+    if not foreign_id:
+        pytest.skip("collection has no foreign_id")
+
+    by_foreign_id = await live_client.get_collection(collection=foreign_id)
+    assert by_foreign_id["id"] == by_id["id"]
+    assert by_foreign_id["statistics"] is not None
+    assert set(by_foreign_id["statistics"]) == set(by_id["statistics"])

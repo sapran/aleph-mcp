@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Callable
 from typing import Any, Literal
 
 import httpx
@@ -284,13 +285,20 @@ class AlephClient:
         params: Query | None = None,
         json: Any | None = None,
         resource: bool = False,
+        follow_redirects: bool | None = None,
+        on_redirect: Callable[[httpx.Response], dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         attempts = self._settings.max_retries
         query = httpx.QueryParams(params) if params else None
         resp: httpx.Response | None = None
+        follow = self._http.follow_redirects if follow_redirects is None else follow_redirects
         try:
             for attempt in range(1, attempts + 1):
-                resp = await self._http.request(method, path, params=query, json=json)
+                resp = await self._http.request(
+                    method, path, params=query, json=json, follow_redirects=follow
+                )
+                if on_redirect is not None and resp.is_redirect:
+                    return on_redirect(resp)
                 if resp.status_code not in self._RETRY_STATUS or attempt == attempts:
                     break
                 await asyncio.sleep(_retry_delay(resp, attempt))
@@ -328,17 +336,15 @@ class AlephClient:
         validator rather than trusting the branch test. The foreign_id branch is left
         free-form on purpose: it becomes a url-encoded query parameter and cannot escape
         the path, and foreign ids are not constrained to any charset.
+
+        The foreign_id branch resolves to the numeric id and then takes the same route as
+        the numeric one. The listing endpoint carries no `statistics` block, so answering
+        straight from the listing hit would return `statistics: null` and silently break
+        the one promise this tool makes over list_collections.
         """
         text = str(collection)
         if text and not text.strip("0123456789 \t\r\n"):
-            collection_id = _check_collection_id(text)
-            payload = await self._request(
-                "GET",
-                f"/api/2/collections/{collection_id}",
-                context="get_collection",
-                params=[("refresh", "true")],
-            )
-            return _slim_collection(payload, full=True)
+            return await self._get_collection_by_id(_check_collection_id(text))
 
         listing = await self._request(
             "GET",
@@ -352,7 +358,16 @@ class AlephClient:
                 f"no collection with foreign_id {collection!r} is readable with this API key; "
                 "call list_collections to see what is available"
             )
-        return _slim_collection(results[0], full=True)
+        return await self._get_collection_by_id(_check_collection_id(results[0].get("id")))
+
+    async def _get_collection_by_id(self, collection_id: str) -> dict[str, Any]:
+        payload = await self._request(
+            "GET",
+            f"/api/2/collections/{collection_id}",
+            context="get_collection",
+            params=[("refresh", "true")],
+        )
+        return _slim_collection(payload, full=True)
 
     # -- entity search ---------------------------------------------------------
 
@@ -505,6 +520,86 @@ class AlephClient:
         )
         return _slim_result(payload, await self._schemata())
 
+    # -- profiles --------------------------------------------------------------
+
+    async def get_profile(self, *, profile_id: str) -> dict[str, Any]:
+        _check_entity_id(profile_id, field="profile_id")
+        payload = await self._request("GET", f"/api/2/profiles/{profile_id}", context="get_profile")
+        # `merged` is a merged FollowTheMoney proxy, so it can carry a constituent
+        # Document's bodyText; slim_entity is what keeps that out of context. It also
+        # drops ProfileSerializer's `latinized` block by construction, which is a
+        # transliteration of names already present here.
+        return {
+            "id": payload.get("id"),
+            "type": payload.get("type"),
+            "label": payload.get("label"),
+            "summary": payload.get("summary"),
+            "collection_id": _collection_id(payload),
+            "updated_at": payload.get("updated_at"),
+            "entities": payload.get("entities"),
+            "merged": slim_entity(payload.get("merged") or {}, await self._schemata()),
+        }
+
+    async def profile_tags(self, *, profile_id: str) -> dict[str, Any]:
+        _check_entity_id(profile_id, field="profile_id")
+        return await self._request(
+            "GET", f"/api/2/profiles/{profile_id}/tags", context="profile_tags"
+        )
+
+    async def profile_similar(self, *, profile_id: str, limit: int = 20) -> dict[str, Any]:
+        _check_entity_id(profile_id, field="profile_id")
+        payload = await self._request(
+            "GET",
+            f"/api/2/profiles/{profile_id}/similar",
+            context="profile_similar",
+            params=_page_params(limit, 0, cap=100),
+        )
+        schemata = await self._schemata()
+        return {
+            "total": payload.get("total"),
+            "results": [
+                {
+                    "score": item.get("score"),
+                    "judgement": item.get("judgement"),
+                    "entity": slim_entity(item.get("entity") or {}, schemata),
+                }
+                for item in payload.get("results") or []
+            ],
+        }
+
+    async def expand_profile(
+        self, *, profile_id: str, properties: list[str] | None = None, limit: int = 50
+    ) -> dict[str, Any]:
+        _check_entity_id(profile_id, field="profile_id")
+        # Aleph clamps here rather than erroring (QueryParser max_limit); refusing is
+        # deliberately stricter, so a truncated expansion is never mistaken for a whole one.
+        if limit < 1 or limit > MAX_EXPAND:
+            raise ValueError(
+                f"limit must be between 1 and {MAX_EXPAND}: graph expansion has its own, much "
+                f"lower ceiling than search (ALEPH_MAX_EXPAND_ENTITIES, default {MAX_EXPAND})."
+            )
+        params: Query = [("limit", str(limit))]
+        for prop in properties or []:
+            params.append(("filter:property", prop))
+        payload = await self._request(
+            "GET",
+            f"/api/2/profiles/{profile_id}/expand",
+            context="expand_profile",
+            params=params,
+        )
+        schemata = await self._schemata()
+        return {
+            "total": payload.get("total"),
+            "results": [
+                {
+                    "property": group.get("property"),
+                    "count": group.get("count"),
+                    "entities": [slim_entity(e, schemata) for e in group.get("entities") or []],
+                }
+                for group in payload.get("results") or []
+            ],
+        }
+
     # -- curated sets and cross-referencing ------------------------------------
 
     async def list_entitysets(
@@ -523,18 +618,40 @@ class AlephClient:
         )
         return {
             "total": payload.get("total"),
-            "results": [
-                {
-                    "id": s.get("id"),
-                    "type": s.get("type"),
-                    "label": s.get("label"),
-                    "summary": s.get("summary"),
-                    "entities": s.get("entities"),
-                    "updated_at": s.get("updated_at"),
-                }
-                for s in payload.get("results") or []
-            ],
+            "results": [_slim_entityset(s) for s in payload.get("results") or []],
         }
+
+    async def get_entityset(self, *, entityset_id: str) -> dict[str, Any]:
+        _check_entity_id(entityset_id, field="entityset_id")
+
+        # Aleph 302s this route to the profile view for profile-type sets
+        # (entitysets_api.py:137-138) — but it builds that Location from its configured
+        # PUBLIC UI url, which on a real deployment is a different host:port from the API
+        # we are talking to. Following it lands on the UI, not the API, and httpx strips
+        # the Authorization header across the origin change, so the hop 403s. Verified
+        # against a live instance: Location was http://localhost:8080/... for an API on
+        # :5000. So do NOT follow it. The redirect itself is the answer.
+        def _profile(resp: httpx.Response) -> dict[str, Any]:
+            return {
+                "id": entityset_id,
+                "type": "profile",
+                "_note": (
+                    "This entityset is a profile, so Aleph redirects this route to the "
+                    "profile view. Call get_profile for the merged identity and its "
+                    "constituent entities; the profile id is the same id."
+                ),
+            }
+
+        payload = await self._request(
+            "GET",
+            f"/api/2/entitysets/{entityset_id}",
+            context="get_entityset",
+            follow_redirects=False,
+            on_redirect=_profile,
+        )
+        if payload.get("_note"):
+            return payload
+        return _slim_entityset(payload, full=True)
 
     async def entityset_items(
         self, *, entityset_id: str, limit: int = 50, offset: int = 0
@@ -647,6 +764,23 @@ def _slim_collection(c: dict[str, Any], *, full: bool = False) -> dict[str, Any]
         out["languages"] = c.get("languages")
         out["statistics"] = c.get("statistics")
         out["count"] = c.get("count")
+    return out
+
+
+def _slim_entityset(s: dict[str, Any], *, full: bool = False) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "id": s.get("id"),
+        "type": s.get("type"),
+        "label": s.get("label"),
+        "summary": s.get("summary"),
+        "entities": s.get("entities"),
+        "updated_at": s.get("updated_at"),
+    }
+    if full:
+        out["layout"] = s.get("layout")
+        out["created_at"] = s.get("created_at")
+        out["role_id"] = s.get("role_id")
+        out["collection_id"] = _collection_id(s)
     return out
 
 

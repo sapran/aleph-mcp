@@ -19,7 +19,12 @@ from aleph_mcp.readonly import ReadOnlyViolation, is_read_only, read_only_hook
         ("GET", "/api/2/entities/e1/expand"),
         ("GET", "/api/2/entities/e1/similar"),
         ("GET", "/api/2/entities/e1/tags"),
+        ("GET", "/api/2/profiles/p1"),
+        ("GET", "/api/2/profiles/p1/expand"),
+        ("GET", "/api/2/profiles/p1/similar"),
+        ("GET", "/api/2/profiles/p1/tags"),
         ("GET", "/api/2/entitysets"),
+        ("GET", "/api/2/entitysets/es1"),
         ("GET", "/api/2/entitysets/es1/entities"),
         ("POST", "/api/2/match"),
     ],
@@ -56,6 +61,31 @@ def test_write_requests_are_blocked(method: str, path: str) -> None:
 def test_id_cannot_widen_the_path() -> None:
     assert not is_read_only("GET", "/api/2/entities/e1/delete")
     assert not is_read_only("GET", "/api/2/collections/case/xref")
+
+
+def test_pairwise_judgement_is_blocked() -> None:
+    """POST /api/2/profiles/_pairwise records a judgement and can create or merge a
+    profile — an Aleph write. Its path matches the GET rule for /api/2/profiles/<id>,
+    because the accepted id charset includes `_`. Nothing but the method pin refuses it,
+    so assert that directly: this is the one allowlist entry where pairing a method with
+    the path is load-bearing rather than belt-and-braces.
+    """
+    assert is_read_only("GET", "/api/2/profiles/_pairwise")
+    assert not is_read_only("POST", "/api/2/profiles/_pairwise")
+    assert not is_read_only("POST", "/api/2/profiles/p1")
+
+
+@pytest.mark.parametrize("method", ["DELETE", "POST", "PUT"])
+def test_entityset_detail_writes_are_blocked_on_method_alone(method: str) -> None:
+    """`/api/2/entitysets/<id>` is allowlisted for GET, and upstream Aleph registers
+    DELETE, POST and PUT on that exact same path (entitysets_api.py:144,181) — verified
+    against a live instance, which answers 405 for a method it does not route and 404
+    here. Nothing but the missing (method, path) pair refuses these, so assert it: this
+    is the case where reading the path rule alone would suggest the surface is safe."""
+    path = "/api/2/entitysets/es1"
+    assert is_read_only("GET", path)
+    assert not is_read_only(method, path)
+    assert not is_read_only(method, f"{path}/entities")
 
 
 async def test_direct_write_through_the_client_never_reaches_the_wire(
@@ -304,11 +334,13 @@ async def test_hostile_value_adds_no_extra_query_parameter(
         assert "sync" not in params
 
 
-async def test_refresh_is_emitted_by_exactly_one_request(
+async def test_refresh_is_emitted_only_by_get_collection(
     client: AlephClient, respx_mock: respx.MockRouter
 ) -> None:
     """`refresh=true` asks Aleph to recompute statistics — the only request that asks
-    the server to do work. Tripwire so the exception list cannot grow quietly."""
+    the server to do work. Tripwire so the exception list cannot grow quietly. Both
+    get_collection branches end on the same numeric route, so both refresh; nothing
+    else may."""
     from urllib.parse import parse_qsl, urlsplit
 
     refreshing: list[str] = []
@@ -335,4 +367,4 @@ async def test_refresh_is_emitted_by_exactly_one_request(
     await client.entityset_items(entityset_id="es1")
     await client.xref_results(collection_id="42")
 
-    assert refreshing == ["/api/2/collections/42"]
+    assert refreshing == ["/api/2/collections/42", "/api/2/collections/42"]

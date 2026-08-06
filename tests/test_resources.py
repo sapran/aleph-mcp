@@ -1,5 +1,7 @@
 import json
+import re
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import httpx
 import pytest
@@ -92,3 +94,22 @@ async def test_unknown_schema_resource_errors(
     async with MCPClient(server) as mcp:
         with pytest.raises(Exception, match="unknown followthemoney schema"):
             await mcp.read_resource("aleph://schema/Nonsense")
+
+
+# -- coverage tripwire ---------------------------------------------------------
+
+# Read at import: a blocking file read inside an async test is a lint error.
+URIS_READ_HERE = set(re.findall(r'read_resource\("([^"{}]+)"\)', Path(__file__).read_text()))
+
+
+async def test_every_registered_resource_is_read_here(server: FastMCP) -> None:
+    """Templates are matched by the concrete uri a test actually reads, so a template
+    whose only proof is that it appears in list_resource_templates fails this."""
+    async with MCPClient(server) as mcp:
+        static = {str(r.uri) for r in await mcp.list_resources()}
+        templates = [t.uriTemplate for t in await mcp.list_resource_templates()]
+
+    assert not static - URIS_READ_HERE, "registered but never read"
+    for template in templates:
+        prefix = template.split("{", 1)[0]
+        assert any(uri.startswith(prefix) for uri in URIS_READ_HERE), f"{template} never read"

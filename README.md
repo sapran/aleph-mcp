@@ -79,7 +79,7 @@ the same command in `.mcp.json`.
 
 ## Surface
 
-Twelve tools, all reads:
+Seventeen tools, all reads:
 
 | Tool | Aleph endpoint | Purpose |
 | --- | --- | --- |
@@ -91,7 +91,12 @@ Twelve tools, all reads:
 | `entity_tags` | `.../tags` | who else shares this phone / email / address |
 | `similar_entities` | `.../similar` | probable duplicates, scored |
 | `match_entity` | `POST /api/2/match` | look up a name you supply, not one already indexed |
+| `get_profile` | `GET /api/2/profiles/<id>` | a resolved identity: constituent entities + the merged pseudo-entity |
+| `profile_tags` | `.../tags` | shared values across the merged identity, not one fragment |
+| `profile_similar` | `.../similar` | candidates the existing merge did not absorb |
+| `expand_profile` | `.../expand` | graph neighbours of the merged identity |
 | `list_entitysets` | `GET /api/2/entitysets` | curated lists, diagrams, timelines |
+| `get_entityset` | `GET /api/2/entitysets/<id>` | the set's own record: type, label, curator |
 | `entityset_items` | `.../entities` | members of a curated set |
 | `xref_results` | `GET /api/2/collections/<id>/xref` | existing cross-reference matches (read, never trigger) |
 | `get_entity_text` | entity `bodyText` / child `Page`s | bounded slice of extracted text |
@@ -102,9 +107,14 @@ always matches the schema version that instance indexes with — no pinned clien
 
 ### Design choices worth knowing
 
-- **No raw Elasticsearch DSL.** Aleph's `q` is not raw ES: it is a lenient `query_string`
-  *plus* a fuzzy `multi_match` boost, with structured constraints arriving as repeated
-  `filter:<field>` arguments. The tools expose Aleph's own grammar instead.
+- **No raw Elasticsearch DSL.** Aleph's `q` is not raw ES: it is a lenient `query_string`,
+  with structured constraints arriving as repeated `filter:<field>` arguments. The tools
+  expose Aleph's own grammar instead.
+- **Entity search is not fuzzy.** A misspelt or transliterated name will not match by `q`.
+  The fuzzy `multi_match` overlay belongs to `CollectionsQuery`, so it applies to
+  `/api/2/collections?q=` and never to `/api/2/entities?q=`. `match_entity` is the tolerant
+  name-lookup path. Multi-term `q` also matches on only 66% of its terms
+  (`minimum_should_match`), so precision comes from `filter:`, not from adding words.
 - **Facet-first.** `search_entities(facets=[...], limit=0)` surveys a result set for
   almost no context. This matters because of the next point.
 - **The 9999 ceiling is a hard error, not a silent clamp.** Aleph's `SearchQueryParser`
@@ -137,7 +147,7 @@ uv run ruff check .
 uv run mypy
 ```
 
-67 unit tests mock all HTTP with `respx`. The 8 tests under `tests/live/` hit a real
+158 unit tests mock all HTTP with `respx`. The 30 tests under `tests/live/` hit a real
 instance and are skipped unless `ALEPH_MCP_LIVE_TESTS=1`:
 
 ```bash
@@ -145,9 +155,19 @@ ALEPH_MCP_LIVE_TESTS=1 uv run pytest tests/live -q
 ```
 
 They assert shape and contract only — never any instance's content — so they are portable
-to any Aleph deployment. Three of them exist because the corresponding bug survived a
-fully green mocked suite: the mandatory schema scope, the null `caption`, and the nested
-`collection` object. Run them once against a new instance before trusting the server there.
+to any Aleph deployment. Four of them exist because the corresponding bug survived a
+fully green mocked suite: the mandatory schema scope, the null `caption`, the nested
+`collection` object, and `get_collection` answering a `foreign_id` from the collections
+listing, which carries no `statistics`. Run them once against a new instance before
+trusting the server there.
+
+Both suites carry a coverage tripwire, because a registered-but-untested tool is the
+failure this repo keeps hitting. `test_every_registered_tool_is_exercised_through_mcp`
+fails unless every tool is called through MCP with mocks; its live twin fails unless
+every tool is also driven against a real instance; `test_every_registered_resource_is_read_here`
+does the same for resources. A live case skips — loudly, naming the missing data — when
+the instance holds nothing of the kind it needs, so an empty instance cannot pass for
+coverage.
 
 ## License
 

@@ -28,7 +28,11 @@ Working method that fits Aleph's limits:
    Payment, UnknownLink — descend from `Interval` and must be asked for by name.
 4. Pivot on a specific entity with `expand_entity` (graph neighbours), `entity_tags`
    (other entities sharing an email/phone/address), `similar_entities` and
-   `xref_results` (candidate duplicates across collections).
+   `xref_results` (candidate duplicates across collections). When a result carries a
+   `profile_id`, the identity question is already answered for it: an investigator
+   recorded that several entities are one actor, so use `get_profile`, `profile_tags`,
+   `profile_similar` and `expand_profile` to work the merged identity rather than the
+   one fragment you happened to find.
 5. Read document text last, with `get_entity_text`, in bounded slices.
 
 Hard limits, which are Aleph's and cannot be worked around by paging:
@@ -36,7 +40,9 @@ Hard limits, which are Aleph's and cannot be worked around by paging:
   read a whole collection; narrow the query or facet instead.
 - `expand_entity` has a separate, much lower ceiling of {MAX_EXPAND} per property.
 - Search text (`q`) is an Elasticsearch query_string — `"exact phrase"`, AND/OR/NOT,
-  field:value and wildcards all work — plus a fuzzy boost Aleph adds on top.
+  field:value and wildcards all work. It is NOT fuzzy: a misspelt or transliterated name
+  will not match. Use `match_entity` for name lookup. Multi-term `q` requires only 66% of
+  terms to match, so narrow with `filters`, not by adding words.
 
 This server exposes no way to create, modify, ingest or delete anything: every outgoing
 request is checked against a fixed allowlist of Aleph read endpoints and refused before it
@@ -202,6 +208,68 @@ def build_server(settings: Settings) -> tuple[FastMCP, AlephClient]:
             raise ToolError(str(e)) from e
 
     @mcp.tool
+    async def get_profile(profile_id: str) -> dict[str, Any]:
+        """Read a resolved identity: the entities an investigator decided are one actor.
+
+        A profile is Aleph's *recorded* identity decision, not a scored guess — several
+        entities, possibly held in different collections, asserted to be the same
+        real-world person or company. `entities` lists the constituents; `merged` is the
+        synthesised pseudo-entity combining their properties, so it is the fullest single
+        view of the actor that Aleph holds.
+
+        You do not need a lookup tool to find one: search hits and expansion results
+        carry a `profile_id` field whenever the entity belongs to a profile. When they
+        do, prefer the profile-scoped tools — an entity is one fragment of the actor.
+        """
+        try:
+            return await client.get_profile(profile_id=profile_id)
+        except ValueError as e:
+            raise ToolError(str(e)) from e
+
+    @mcp.tool
+    async def profile_tags(profile_id: str) -> dict[str, Any]:
+        """Count other entities sharing a resolved identity's property values.
+
+        `entity_tags` against the merged identity rather than one of its fragments, so a
+        phone or address contributed by any constituent entity is pivoted on here.
+        """
+        try:
+            return await client.profile_tags(profile_id=profile_id)
+        except ValueError as e:
+            raise ToolError(str(e)) from e
+
+    @mcp.tool
+    async def profile_similar(profile_id: str, limit: int = 20) -> dict[str, Any]:
+        """Find entities still unresolved against this identity, scored.
+
+        These are the candidates the existing merge did not absorb — the remaining
+        identity question after a human already answered part of it.
+        """
+        try:
+            return await client.profile_similar(profile_id=profile_id, limit=limit)
+        except ValueError as e:
+            raise ToolError(str(e)) from e
+
+    @mcp.tool
+    async def expand_profile(
+        profile_id: str, properties: list[str] | None = None, limit: int = 50
+    ) -> dict[str, Any]:
+        """Traverse the graph from a resolved identity, grouped by property.
+
+        `expand_entity` against the merged identity: it returns neighbours reached
+        through any constituent entity, so an ownership edge recorded on only one of the
+        duplicates still shows up here.
+
+        Ceiling is 200 entities per property (client.MAX_EXPAND), as for expand_entity.
+        """
+        try:
+            return await client.expand_profile(
+                profile_id=profile_id, properties=properties, limit=limit
+            )
+        except ValueError as e:
+            raise ToolError(str(e)) from e
+
+    @mcp.tool
     async def list_entitysets(
         collection_id: str, set_type: str | None = None, limit: int = 30
     ) -> dict[str, Any]:
@@ -215,6 +283,20 @@ def build_server(settings: Settings) -> tuple[FastMCP, AlephClient]:
             return await client.list_entitysets(
                 collection_id=collection_id, set_type=set_type, limit=limit
             )
+        except ValueError as e:
+            raise ToolError(str(e)) from e
+
+    @mcp.tool
+    async def get_entityset(entityset_id: str) -> dict[str, Any]:
+        """Fetch one curated set's own record: what it is, who made it, when.
+
+        `entityset_items` returns a set's contents; this returns the set itself, which is
+        where the curator's intent lives — its type, label and summary. Profiles are a
+        kind of entityset, so a profile id passed here comes back as a profile, flagged
+        in `_note`; call get_profile for those instead.
+        """
+        try:
+            return await client.get_entityset(entityset_id=entityset_id)
         except ValueError as e:
             raise ToolError(str(e)) from e
 

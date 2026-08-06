@@ -9,6 +9,22 @@ import httpx
 # the Aleph API root. Enforced on every outgoing httpx request, redirect hops included, so
 # a mutating call cannot reach Aleph even when the API key would permit it. Extending this
 # tuple is the only way to widen the surface; no argument, tool or redirect can.
+#
+# The method pin is load-bearing, not decorative. Two allowlisted GET paths are also live
+# Aleph write routes, and only the absence of a matching (method, path) pair refuses them:
+#
+#   /api/2/entitysets/<id>     also registers DELETE, POST and PUT upstream
+#                              (aleph/views/entitysets_api.py:144,181) — same path, verified
+#                              against a live instance, which answers 405 for an unregistered
+#                              method and 404 here.
+#   /api/2/profiles/_pairwise  matches the GET rule for /api/2/profiles/<id>, because
+#                              _ENTITY_ID admits `_`. It records a judgement and can create
+#                              or merge a profile (aleph/views/profiles_api.py:207).
+#
+# So never drop the method from a pair, and never assume a path rule is safe because its
+# read is. Do not narrow _ENTITY_ID to hex to exclude _pairwise by path either: Aleph ids are
+# only conventionally uuid4().hex and the column is a 128-char string, so a narrowed pattern
+# would refuse legitimate ids on an instance that ever minted one differently.
 _ENTITY_ID = r"[A-Za-z0-9._:-]+"
 _COLLECTION_ID = r"[0-9]+"
 
@@ -24,7 +40,12 @@ _ALLOWED: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("GET", rf"/api/2/entities/{_ENTITY_ID}/expand"),
         ("GET", rf"/api/2/entities/{_ENTITY_ID}/similar"),
         ("GET", rf"/api/2/entities/{_ENTITY_ID}/tags"),
+        ("GET", rf"/api/2/profiles/{_ENTITY_ID}"),
+        ("GET", rf"/api/2/profiles/{_ENTITY_ID}/expand"),
+        ("GET", rf"/api/2/profiles/{_ENTITY_ID}/similar"),
+        ("GET", rf"/api/2/profiles/{_ENTITY_ID}/tags"),
         ("GET", r"/api/2/entitysets"),
+        ("GET", rf"/api/2/entitysets/{_ENTITY_ID}"),
         ("GET", rf"/api/2/entitysets/{_ENTITY_ID}/entities"),
         ("POST", r"/api/2/match"),
     )

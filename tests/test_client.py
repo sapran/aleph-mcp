@@ -116,14 +116,46 @@ async def test_get_collection_by_numeric_id(
 async def test_get_collection_by_foreign_id(
     client: AlephClient, respx_mock: respx.MockRouter
 ) -> None:
-    route = respx_mock.get("/api/2/collections").mock(
+    lookup = respx_mock.get("/api/2/collections").mock(
         return_value=httpx.Response(
             200, json={"results": [{"id": "42", "foreign_id": "case", "label": "Case"}]}
         )
     )
+    fetch = respx_mock.get("/api/2/collections/42").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "42",
+                "foreign_id": "case",
+                "label": "Case",
+                "statistics": {"schema": {"values": {"Person": 3}}},
+            },
+        )
+    )
     out = await client.get_collection(collection="case")
     assert out["id"] == "42"
-    assert ("filter:foreign_id", "case") in _query(route.calls.last.request)
+    assert ("filter:foreign_id", "case") in _query(lookup.calls.last.request)
+    assert fetch.call_count == 1
+
+
+async def test_foreign_id_lookup_still_returns_statistics(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """Regression: the listing endpoint carries no `statistics`, so answering the
+    foreign_id branch straight from the listing hit returned `statistics: null` while
+    the numeric branch returned the real block. Same tool, same promise, both branches."""
+    respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(200, json={"results": [{"id": "42", "foreign_id": "case"}]})
+    )
+    respx_mock.get("/api/2/collections/42").mock(
+        return_value=httpx.Response(
+            200, json={"id": "42", "statistics": {"schema": {"values": {"Person": 3}}}}
+        )
+    )
+    by_fid = await client.get_collection(collection="case")
+    by_id = await client.get_collection(collection="42")
+    assert by_fid["statistics"] == by_id["statistics"]
+    assert by_fid["statistics"]["schema"]["values"]["Person"] == 3
 
 
 async def test_get_collection_unknown_foreign_id_is_actionable(
@@ -272,6 +304,156 @@ async def test_match_posts_sample(client: AlephClient, respx_mock: respx.MockRou
 async def test_collection_id_validation_rejects_foreign_id(client: AlephClient) -> None:
     with pytest.raises(ValueError, match="get_collection"):
         await client.xref_results(collection_id="my-case")
+
+
+# -- profiles ------------------------------------------------------------------
+
+
+async def test_expand_profile_rejects_limit_above_cap(client: AlephClient) -> None:
+    with pytest.raises(ValueError, match=str(MAX_EXPAND)):
+        await client.expand_profile(profile_id="p1", limit=MAX_EXPAND + 1)
+
+
+async def test_expand_profile_passes_property_filters_and_slims(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    route = respx_mock.get("/api/2/profiles/p1/expand").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "total": 1,
+                "results": [
+                    {
+                        "property": "ownershipOwner",
+                        "count": 7,
+                        "entities": [_entity(properties={"bodyText": ["x"], "name": ["A"]})],
+                    }
+                ],
+            },
+        )
+    )
+    out = await client.expand_profile(profile_id="p1", properties=["ownershipOwner"], limit=10)
+    assert ("filter:property", "ownershipOwner") in _query(route.calls.last.request)
+    assert out["results"][0]["count"] == 7
+    assert "bodyText" not in out["results"][0]["entities"][0]["properties"]
+
+
+async def test_get_profile_slims_the_merged_entity(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """`merged` combines the profile's constituents, so a merged-in Document drags its
+    bodyText along. It has to go through slim_entity like any other entity."""
+    respx_mock.get("/api/2/profiles/p1").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "p1",
+                "type": "profile",
+                "label": "Jane Doe",
+                "collection": {"id": "42"},
+                "entities": ["e1", "e2"],
+                "merged": _entity(properties={"bodyText": ["x" * 50], "name": ["Jane Doe"]}),
+            },
+        )
+    )
+    out = await client.get_profile(profile_id="p1")
+    assert out["entities"] == ["e1", "e2"]
+    assert out["collection_id"] == "42"
+    assert "bodyText" not in out["merged"]["properties"]
+    assert out["merged"]["_omitted_properties"] == ["bodyText"]
+
+
+async def test_get_profile_drops_the_latinized_block(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """ProfileSerializer adds a transliteration of every name already in `properties`."""
+    respx_mock.get("/api/2/profiles/p1").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "p1",
+                "type": "profile",
+                "merged": _entity(),
+                "latinized": {"name": ["Zhanna Doe"]},
+            },
+        )
+    )
+    out = await client.get_profile(profile_id="p1")
+    assert "latinized" not in out
+    assert "latinized" not in out["merged"]
+
+
+async def test_profile_tags_passes_the_envelope_through(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    payload = {"status": "ok", "total": 1, "results": [{"field": "phones", "count": 3}]}
+    respx_mock.get("/api/2/profiles/p1/tags").mock(return_value=httpx.Response(200, json=payload))
+    assert await client.profile_tags(profile_id="p1") == payload
+
+
+async def test_profile_similar_reports_score_and_judgement(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.get("/api/2/profiles/p1/similar").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "total": 1,
+                "results": [{"score": 4.5, "judgement": None, "entity": _entity()}],
+            },
+        )
+    )
+    out = await client.profile_similar(profile_id="p1")
+    assert out["results"][0]["score"] == 4.5
+    assert out["results"][0]["judgement"] is None
+    assert out["results"][0]["entity"]["id"] == "e1"
+
+
+async def test_get_entityset_reports_a_profile_without_following_the_redirect(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """Aleph 302s this route to the profile view, but builds the Location from its
+    configured PUBLIC UI url — a different host:port from the API on a real deployment,
+    which strips auth and 403s. Verified live: Location was localhost:8080 for an API on
+    :5000. So the redirect must be read, not followed."""
+    route = respx_mock.get("/api/2/entitysets/p1").mock(
+        return_value=httpx.Response(
+            302, headers={"Location": "http://ui.example:8080/api/2/profiles/p1"}
+        )
+    )
+    followed = respx_mock.get("http://ui.example:8080/api/2/profiles/p1").mock(
+        return_value=httpx.Response(200, json={"id": "p1", "type": "profile"})
+    )
+    out = await client.get_entityset(entityset_id="p1")
+    assert out["type"] == "profile"
+    assert out["id"] == "p1"
+    assert "get_profile" in out["_note"]
+    assert route.call_count == 1
+    assert followed.call_count == 0, "the redirect must not be followed off the API host"
+
+
+async def test_get_entityset_adds_detail_fields_a_listing_omits(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.get("/api/2/entitysets/es1").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "es1",
+                "type": "diagram",
+                "label": "Network",
+                "layout": {"vertices": []},
+                "created_at": "2024-01-01",
+                "role_id": "9",
+                "collection": {"id": "42"},
+            },
+        )
+    )
+    out = await client.get_entityset(entityset_id="es1")
+    assert out["collection_id"] == "42"
+    assert out["role_id"] == "9"
+    assert out["layout"] == {"vertices": []}
+    assert "_note" not in out
 
 
 # -- document text -------------------------------------------------------------
@@ -471,3 +653,238 @@ async def test_search_derives_captions_from_the_instance_model(
     hit = out["results"][0]
     assert hit["caption"] == "Jane Doe"
     assert hit["collection_id"] == "583"
+
+
+# -- listing, pivots and cross-referencing -------------------------------------
+#
+# These six methods were reached only incidentally, by the read-only tripwires that
+# drive every endpoint to prove none of them writes. Nothing asserted what they give
+# back, so any reshaping regression in them was invisible.
+
+
+async def test_list_collections_slims_and_passes_the_label_filter(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    route = respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "total": 1,
+                "limit": 30,
+                "offset": 0,
+                "results": [
+                    {
+                        "id": "42",
+                        "foreign_id": "case",
+                        "label": "Case files",
+                        "category": "casefile",
+                        "casefile": True,
+                        "countries": ["ua"],
+                        "updated_at": "2024-01-01T00:00:00",
+                        "writeable": False,
+                        "links": {"ui": "https://aleph.test/datasets/42"},
+                        "secret": True,
+                    }
+                ],
+            },
+        )
+    )
+    out = await client.list_collections(q="case")
+    assert ("q", "case") in _query(route.calls.last.request)
+    assert (out["total"], out["limit"], out["offset"]) == (1, 30, 0)
+    hit = out["results"][0]
+    assert hit["id"] == "42"
+    assert hit["countries"] == ["ua"]
+    # The listing view carries no statistics, so it must not claim one, and the
+    # server's own bookkeeping is not worth a model's context.
+    assert "statistics" not in hit
+    assert "links" not in hit
+
+
+async def test_list_collections_omits_the_query_when_none_given(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    route = respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    await client.list_collections()
+    assert [k for k, _ in _query(route.calls.last.request)] == ["limit", "offset"]
+
+
+async def test_list_collections_rejects_a_limit_above_the_listing_cap(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    route = respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    with pytest.raises(ValueError, match="100"):
+        await client.list_collections(limit=101)
+    assert route.call_count == 0
+
+
+async def test_entity_tags_passes_the_pivot_envelope_through(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The tags payload is already minimal and its `id` values are the queries to run
+    next, so it is deliberately not slimmed. Guard that it stays untouched."""
+    payload = {
+        "status": "ok",
+        "total": 2,
+        "results": [
+            {"id": "name:jane-doe", "field": "names", "value": "Jane Doe", "count": 3},
+            {"id": "mailto:j@x.test", "field": "emails", "value": "j@x.test", "count": 7},
+        ],
+    }
+    route = respx_mock.get("/api/2/entities/e1/tags").mock(
+        return_value=httpx.Response(200, json=payload)
+    )
+    assert await client.entity_tags(entity_id="e1") == payload
+    assert route.call_count == 1
+
+
+async def test_similar_entities_reports_score_judgement_and_a_slim_entity(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    route = respx_mock.get("/api/2/entities/e1/similar").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "total": 1,
+                "results": [
+                    {
+                        "score": 4.5,
+                        "judgement": "positive",
+                        "entity": _entity(
+                            id="e2", properties={"name": ["Jane Doe"], "indexText": ["huge"]}
+                        ),
+                    }
+                ],
+            },
+        )
+    )
+    out = await client.similar_entities(entity_id="e1", limit=5)
+    assert ("limit", "5") in _query(route.calls.last.request)
+    hit = out["results"][0]
+    assert (hit["score"], hit["judgement"]) == (4.5, "positive")
+    assert hit["entity"]["id"] == "e2"
+    assert "indexText" not in hit["entity"]["properties"]
+
+
+async def test_similar_entities_survives_a_result_with_no_entity(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.get("/api/2/entities/e1/similar").mock(
+        return_value=httpx.Response(200, json={"total": 1, "results": [{"score": 1.0}]})
+    )
+    out = await client.similar_entities(entity_id="e1")
+    hit = out["results"][0]
+    assert hit["score"] == 1.0
+    assert hit["judgement"] is None
+    assert hit["entity"]["id"] is None
+    assert hit["entity"]["properties"] == {}
+
+
+async def test_list_entitysets_filters_by_collection_and_type(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    route = respx_mock.get("/api/2/entitysets").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "total": 1,
+                "results": [
+                    {
+                        "id": "es1",
+                        "type": "diagram",
+                        "label": "Network",
+                        "summary": "who pays whom",
+                        "entities": ["e1", "e2"],
+                        "updated_at": "2024-01-01T00:00:00",
+                        "role": {"name": "Curator"},
+                    }
+                ],
+            },
+        )
+    )
+    out = await client.list_entitysets(collection_id="42", set_type="diagram")
+    q = _query(route.calls.last.request)
+    assert ("filter:collection_id", "42") in q
+    assert ("filter:type", "diagram") in q
+    hit = out["results"][0]
+    assert (hit["id"], hit["type"], hit["label"]) == ("es1", "diagram", "Network")
+    assert hit["summary"] == "who pays whom"
+
+
+async def test_list_entitysets_rejects_a_foreign_id(client: AlephClient) -> None:
+    with pytest.raises(ValueError, match="numeric id"):
+        await client.list_entitysets(collection_id="my-case")
+
+
+async def test_entityset_items_slims_and_pages(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    route = respx_mock.get("/api/2/entitysets/es1/entities").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "total": 1,
+                "results": [_entity(properties={"name": ["Jane"], "bodyText": ["huge"]})],
+            },
+        )
+    )
+    out = await client.entityset_items(entityset_id="es1", limit=10, offset=5)
+    q = _query(route.calls.last.request)
+    assert ("limit", "10") in q and ("offset", "5") in q
+    assert out["total"] == 1
+    assert out["results"][0]["_omitted_properties"] == ["bodyText"]
+
+
+async def test_entityset_items_refuses_a_limit_above_the_cap(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    route = respx_mock.get("/api/2/entitysets/es1/entities").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    with pytest.raises(ValueError, match="200"):
+        await client.entityset_items(entityset_id="es1", limit=201)
+    assert route.call_count == 0
+
+
+async def test_xref_results_pairs_both_sides_of_the_match(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    route = respx_mock.get("/api/2/collections/42/xref").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "total": 1,
+                "limit": 30,
+                "offset": 0,
+                "results": [
+                    {
+                        "score": 3.25,
+                        "judgement": "unsure",
+                        "entity": _entity(id="e1"),
+                        "match": _entity(
+                            id="m1", properties={"name": ["Jane Doe"], "bodyText": ["huge"]}
+                        ),
+                        "match_collection_id": "77",
+                    }
+                ],
+            },
+        )
+    )
+    out = await client.xref_results(collection_id="42", limit=30)
+    assert ("limit", "30") in _query(route.calls.last.request)
+    hit = out["results"][0]
+    assert (hit["score"], hit["judgement"]) == (3.25, "unsure")
+    # Provenance is the whole point of an xref hit: which collection the match is from.
+    assert hit["match_collection_id"] == "77"
+    assert hit["entity"]["id"] == "e1"
+    assert hit["match"]["id"] == "m1"
+    assert "bodyText" not in hit["match"]["properties"]
+
+
+async def test_xref_results_rejects_a_foreign_id(client: AlephClient) -> None:
+    with pytest.raises(ValueError, match="numeric id"):
+        await client.xref_results(collection_id="my-case")
