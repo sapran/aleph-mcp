@@ -1,0 +1,25 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "aleph-mcp",
+  "owner": {
+    "name": "Vlad Styran",
+    "email": "sapran@gmail.com"
+  },
+  "metadata": {
+    "description": "Read-only MCP access to an Aleph (OCCRP) instance for LLM agents."
+  },
+  "plugins": [
+    {
+      "name": "aleph",
+      "source": "./plugins/aleph",
+      "version": "0.1.0",
+      "description": "Read-only MCP server over the OCCRP Aleph HTTP API: 17 search/pivot/read tools, 3 resources, and the aleph-entity-graph method skill.",
+      "category": "security",
+      "keywords": ["aleph", "occrp", "osint", "followthemoney", "mcp", "investigation"],
+      "author": { "name": "Vlad Styran", "email": "sapran@gmail.com" },
+      "homepage": "https://github.com/sapran/aleph-mcp",
+      "repository": "https://github.com/sapran/aleph-mcp",
+      "license": "MIT"
+    }
+  ]
+}

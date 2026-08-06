@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "mcp": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/sapran/aleph-mcp.git",
+        "aleph-mcp"
+      ]
+    }
+  }
+}

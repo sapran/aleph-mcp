@@ -32,7 +32,7 @@ write-scoped key, run by a human.
 Requires Python ≥ 3.12 and [`uv`](https://github.com/astral-sh/uv).
 
 ```bash
-uv tool install aleph-mcp        # or, from a checkout:
+uv tool install git+https://github.com/sapran/aleph-mcp.git   # or, from a checkout:
 uv sync --all-extras
 ```
 
@@ -52,9 +52,61 @@ uv sync --all-extras
 Missing required variables cause exit code 2 with a message on stderr, visible in the MCP
 client's logs.
 
+### Where to put them
+
+Both variables must reach the server's process environment; the server reads nothing else.
+
+- **omp** autoloads `.env` into its own environment at startup, and an stdio MCP child
+  inherits it. Precedence, highest first: inherited process environment → `<cwd>/.env` →
+  `~/.omp/agent/.env` → `~/.omp/.env` → `~/.env`; a variable already set is never
+  overwritten by a later file. Put the two lines in `~/.omp/.env` for every project, or
+  `<project>/.env` for one, then `chmod 600` the file.
+- **Every other harness** — Claude Code, opencode, anything spawning the server over stdio
+  — needs them exported from your shell rc (`~/.zshrc`), or set in an `env` block on that
+  client's own MCP entry, accepting that the literal value then lives in that config file.
+
+Never commit the key: `.gitignore` already lists `.env`.
+
 ## Wire it up
 
-opencode — `~/.config/opencode/opencode.json`:
+### omp and Claude Code (plugin)
+
+This repository is itself a plugin marketplace, so one install delivers the server and the
+`aleph-entity-graph` method skill together:
+
+```bash
+omp plugin marketplace add sapran/aleph-mcp
+omp plugin install aleph@aleph-mcp
+```
+
+Claude Code: `/plugin marketplace add sapran/aleph-mcp`, then
+`/plugin install aleph@aleph-mcp`.
+
+The plugin namespaces its server as `aleph:mcp`, so tools reach the model as
+`mcp__aleph_mcp_<tool>` — e.g. `mcp__aleph_mcp_search_entities`. Credentials, pinning,
+several Aleph instances and running from a checkout:
+[`plugins/aleph/README.md`](plugins/aleph/README.md).
+
+### Any stdio MCP client (`mcp.json`)
+
+```json
+{
+  "mcpServers": {
+    "aleph": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/sapran/aleph-mcp.git", "aleph-mcp"]
+    }
+  }
+}
+```
+
+No `env` block — credentials come from the environment the client itself runs in. Under omp
+this form is not plugin-namespaced, so its tools are `mcp__aleph_<tool>`.
+
+### opencode
+
+`~/.config/opencode/opencode.json`:
 
 ```json
 {
@@ -62,7 +114,7 @@ opencode — `~/.config/opencode/opencode.json`:
   "mcp": {
     "aleph": {
       "type": "local",
-      "command": ["uvx", "aleph-mcp"],
+      "command": ["uvx", "--from", "git+https://github.com/sapran/aleph-mcp.git", "aleph-mcp"],
       "enabled": true,
       "environment": {
         "ALEPHCLIENT_HOST": "https://aleph.example.org",
@@ -73,9 +125,11 @@ opencode — `~/.config/opencode/opencode.json`:
 }
 ```
 
-Tools then appear to the model as `aleph_search_entities`, `aleph_expand_entity`, and so
-on (`sanitize(server) + "_" + sanitize(tool)`). Claude Code / any stdio MCP client:
-the same command in `.mcp.json`.
+Tools then appear to the model as `aleph_search_entities`, `aleph_expand_entity`, and so on
+(`sanitize(server) + "_" + sanitize(tool)`).
+
+The `--from git+…` spec is required on every path above: `aleph-mcp` is not published to
+PyPI, so a bare `uvx aleph-mcp` resolves nothing.
 
 ## Surface
 

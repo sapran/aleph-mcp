@@ -3,6 +3,13 @@
 Findings recorded during other work, kept out of the change that surfaced them. An entry leaves
 this file when it becomes a spec requirement or is fixed — not when someone remembers to tidy up.
 
+- **`0.1.0` is now written in three places**: `src/aleph_mcp/__init__.py`,
+  `plugins/aleph/.claude-plugin/plugin.json`, and `plugins[0].version` in
+  `.claude-plugin/marketplace.json`. A release bumps all three together. The *catalog*
+  version is what drives change detection in `omp plugin upgrade`, so a stale
+  `.claude-plugin/marketplace.json` makes an upgrade silently no-op even when the plugin
+  manifest moved.
+
 Retired since the last prune:
 
 - The `$` anchor letting `entity_id="e1\n"` through, and `entityset_id=".."` normalising away to
