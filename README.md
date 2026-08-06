@@ -147,7 +147,7 @@ uv run ruff check .
 uv run mypy
 ```
 
-158 unit tests mock all HTTP with `respx`. The 30 tests under `tests/live/` hit a real
+250 unit tests mock all HTTP with `respx`. The 31 tests under `tests/live/` hit a real
 instance and are skipped unless `ALEPH_MCP_LIVE_TESTS=1`:
 
 ```bash
@@ -162,12 +162,16 @@ listing, which carries no `statistics`. Run them once against a new instance bef
 trusting the server there.
 
 Both suites carry a coverage tripwire, because a registered-but-untested tool is the
-failure this repo keeps hitting. `test_every_registered_tool_is_exercised_through_mcp`
-fails unless every tool is called through MCP with mocks; its live twin fails unless
-every tool is also driven against a real instance; `test_every_registered_resource_is_read_here`
-does the same for resources. A live case skips — loudly, naming the missing data — when
-the instance holds nothing of the kind it needs, so an empty instance cannot pass for
-coverage.
+failure this repo keeps hitting. `tests/test_tools.py` drives every tool through MCP
+twice — once asserting it forwards every argument to the right client method and returns
+that method's payload unmodified, once asserting a refusal reaches the caller as a
+`ToolError` — and a tool missing from either table fails
+`test_every_tool_has_a_forwarding_case` / `test_every_tool_has_a_refusal_case`. Its live
+twin fails unless every tool is also driven against a real instance, and
+`test_every_registered_resource_is_read_here` does the same for resources. A live case
+skips — loudly, naming the missing data — when the instance holds nothing of the kind it
+needs, so an empty instance cannot pass for coverage; set `ALEPH_MCP_LIVE_STRICT=1`
+against an instance you know is seeded and those skips become failures instead.
 
 ## License
 

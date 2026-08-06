@@ -1,4 +1,3 @@
-from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 import httpx
@@ -13,22 +12,29 @@ from aleph_mcp.client import (
     derive_caption,
     slim_entity,
 )
+from tests.shapes import (
+    BLOB_PROPS,
+    assert_search_envelope,
+    assert_slim_entity,
+    raw_document,
+    raw_entity,
+    raw_model,
+    raw_search_payload,
+)
 
 
 def _query(request: httpx.Request) -> list[tuple[str, str]]:
     return parse_qsl(urlsplit(str(request.url)).query, keep_blank_values=True)
 
 
-def _entity(**kw: Any) -> dict[str, Any]:
-    base = {
-        "id": "e1",
-        "schema": "Person",
-        "caption": "Jane Doe",
-        "collection_id": "42",
-        "properties": {"name": ["Jane Doe"]},
-    }
-    base.update(kw)
-    return base
+@pytest.fixture
+def no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise the retry path without paying its backoff in wall-clock time."""
+
+    async def _sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr("aleph_mcp.client.asyncio.sleep", _sleep)
 
 
 # -- slimming ------------------------------------------------------------------
@@ -36,7 +42,7 @@ def _entity(**kw: Any) -> dict[str, Any]:
 
 def test_slim_entity_drops_text_blobs_and_reports_them() -> None:
     out = slim_entity(
-        _entity(properties={"name": ["Jane"], "bodyText": ["x" * 5000], "indexText": ["y"]})
+        raw_entity(properties={"name": ["Jane"], "bodyText": ["x" * 5000], "indexText": ["y"]})
     )
     assert "bodyText" not in out["properties"]
     assert out["_omitted_properties"] == ["bodyText", "indexText"]
@@ -44,16 +50,22 @@ def test_slim_entity_drops_text_blobs_and_reports_them() -> None:
 
 
 def test_slim_entity_truncates_long_values() -> None:
-    out = slim_entity(_entity(properties={"summary": ["z" * 2000]}))
+    out = slim_entity(raw_entity(properties={"summary": ["z" * 2000]}))
     value = out["properties"]["summary"][0]
     assert value.endswith("chars]")
     assert len(value) < 600
 
 
 def test_slim_entity_keeps_highlight_and_score() -> None:
-    out = slim_entity(_entity(highlight=["…hit…"], score=3.5))
+    out = slim_entity(raw_entity(highlight=["…hit…"], score=3.5))
     assert out["highlight"] == ["…hit…"]
     assert out["score"] == 3.5
+
+
+def test_slim_entity_keeps_a_scalar_property_value() -> None:
+    """Truncation applies per list item; a scalar value is passed through as it came."""
+    out = slim_entity(raw_entity(properties={"summary": "z" * 2000}))
+    assert out["properties"]["summary"] == "z" * 2000
 
 
 # -- auth / transport ----------------------------------------------------------
@@ -68,12 +80,8 @@ async def test_sends_apikey_header(client: AlephClient, respx_mock: respx.MockRo
 
 
 async def test_retries_on_429_then_succeeds(
-    client: AlephClient, respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+    client: AlephClient, respx_mock: respx.MockRouter, no_sleep: None
 ) -> None:
-    async def _no_sleep(_: float) -> None:
-        return None
-
-    monkeypatch.setattr("aleph_mcp.client.asyncio.sleep", _no_sleep)
     route = respx_mock.get("/api/2/collections").mock(
         side_effect=[
             httpx.Response(429, headers={"Retry-After": "0"}),
@@ -85,16 +93,61 @@ async def test_retries_on_429_then_succeeds(
 
 
 async def test_gives_up_after_max_retries(
-    client: AlephClient, respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+    client: AlephClient, respx_mock: respx.MockRouter, no_sleep: None
 ) -> None:
-    async def _no_sleep(_: float) -> None:
-        return None
-
-    monkeypatch.setattr("aleph_mcp.client.asyncio.sleep", _no_sleep)
     route = respx_mock.get("/api/2/collections").mock(return_value=httpx.Response(503))
     with pytest.raises(ToolError, match="unexpected HTTP 503"):
         await client.list_collections()
     assert route.call_count == 4  # Settings.max_retries default
+
+
+# Aleph's status codes are ambiguous on their own, so errors.py names the likely cause and
+# the next move. Nothing else asserted that mapping.
+HTTP_ERRORS = (
+    (401, "API key invalid or expired"),
+    (403, "not authorised"),
+    (404, "not found"),
+    (400, "bad request"),
+    (429, "rate limited"),
+    (500, "unexpected HTTP 500"),
+)
+
+
+@pytest.mark.parametrize(("status", "phrase"), HTTP_ERRORS, ids=[str(s) for s, _ in HTTP_ERRORS])
+async def test_http_status_becomes_an_actionable_error(
+    client: AlephClient, respx_mock: respx.MockRouter, no_sleep: None, status: int, phrase: str
+) -> None:
+    respx_mock.get("/api/2/entities/e1").mock(return_value=httpx.Response(status))
+    with pytest.raises(ToolError, match=phrase):
+        await client.get_entity(entity_id="e1")
+
+
+async def test_request_wraps_a_bare_list_response(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """Some Aleph routes answer with a bare JSON array; the client always returns a dict,
+    so a caller never has to branch on the response type."""
+    respx_mock.get("/api/2/entities/e1/tags").mock(
+        return_value=httpx.Response(200, json=[{"field": "emails", "count": 2}])
+    )
+    out = await client.entity_tags(entity_id="e1")
+    assert out == {"results": [{"field": "emails", "count": 2}]}
+
+
+async def test_unparseable_retry_after_falls_back_to_backoff(
+    client: AlephClient, respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    """Aleph is not required to send a numeric Retry-After. An unparseable one must not
+    abort the retry — it falls back to exponential backoff."""
+    route = respx_mock.get("/api/2/collections").mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "soon"}),
+            httpx.Response(200, json={"results": [], "total": 0}),
+        ]
+    )
+    out = await client.list_collections()
+    assert route.call_count == 2
+    assert out["results"] == []
 
 
 # -- collections ---------------------------------------------------------------
@@ -168,6 +221,26 @@ async def test_get_collection_unknown_foreign_id_is_actionable(
         await client.get_collection(collection="nope")
 
 
+async def test_negative_offset_is_refused(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    wire = respx_mock.route().mock(return_value=httpx.Response(200, json={"results": []}))
+    with pytest.raises(ValueError, match="offset must be >= 0"):
+        await client.list_collections(offset=-1)
+    assert wire.call_count == 0
+
+
+async def test_numeric_collection_id_is_validated_before_interpolation(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """`"42\n"` reads as numeric intent, so it must be refused rather than falling through
+    to the foreign_id branch and silently answering nothing."""
+    wire = respx_mock.route().mock(return_value=httpx.Response(200, json={"results": []}))
+    with pytest.raises(ValueError, match="invalid collection_id"):
+        await client.get_collection(collection="42\n")
+    assert wire.call_count == 0
+
+
 # -- search --------------------------------------------------------------------
 
 
@@ -223,16 +296,11 @@ async def test_search_strips_text_from_hits(
     client: AlephClient, respx_mock: respx.MockRouter
 ) -> None:
     respx_mock.get("/api/2/entities").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "total": {"value": 1},
-                "results": [_entity(properties={"name": ["Jane"], "bodyText": ["x" * 10000]})],
-            },
-        )
+        return_value=httpx.Response(200, json=raw_search_payload(raw_document()))
     )
     out = await client.search_entities(q="jane")
-    assert "bodyText" not in out["results"][0]["properties"]
+    assert_search_envelope(out, searched={"schemata": "Thing"})
+    assert out["results"][0]["_omitted_properties"] == sorted(BLOB_PROPS)
 
 
 async def test_highlight_only_when_query_present(
@@ -243,6 +311,41 @@ async def test_highlight_only_when_query_present(
     )
     await client.search_entities(highlight=True)
     assert ("highlight", "true") not in _query(route.calls.last.request)
+
+
+async def test_reachable_total_carries_no_note(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The UNENUMERATED note is a warning about an unreachable tail; a long-but-reachable
+    result set must not carry it, or the warning stops meaning anything."""
+    respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json=raw_search_payload(total=500))
+    )
+    out = await client.search_entities(q="a")
+    assert_search_envelope(out, searched={"schemata": "Thing"})
+    assert "_note" not in out
+
+
+@pytest.mark.parametrize("args", [{"limit": -1}, {"offset": -1}])
+async def test_search_rejects_negative_paging(
+    client: AlephClient, respx_mock: respx.MockRouter, args: dict[str, int]
+) -> None:
+    wire = respx_mock.route().mock(return_value=httpx.Response(200, json={}))
+    with pytest.raises(ValueError, match="must be >= 0"):
+        await client.search_entities(**args)
+    assert wire.call_count == 0
+
+
+async def test_highlight_is_sent_when_a_query_is_present(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    route = respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json=raw_search_payload(total=0))
+    )
+    await client.search_entities(q="acme", highlight=True)
+    q = _query(route.calls.last.request)
+    assert ("highlight", "true") in q
+    assert ("highlight_count", "3") in q
 
 
 # -- entity, expand ------------------------------------------------------------
@@ -271,7 +374,7 @@ async def test_expand_passes_property_filters_and_slims(
                     {
                         "property": "ownershipOwner",
                         "count": 7,
-                        "entities": [_entity(properties={"bodyText": ["x"], "name": ["A"]})],
+                        "entities": [raw_document()],
                     }
                 ],
             },
@@ -280,7 +383,79 @@ async def test_expand_passes_property_filters_and_slims(
     out = await client.expand_entity(entity_id="e1", properties=["ownershipOwner"], limit=10)
     assert ("filter:property", "ownershipOwner") in _query(route.calls.last.request)
     assert out["results"][0]["count"] == 7
-    assert "bodyText" not in out["results"][0]["entities"][0]["properties"]
+    assert_slim_entity(out["results"][0]["entities"][0])
+
+
+async def test_get_entity_strips_document_text(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.get("/api/2/entities/d1").mock(return_value=httpx.Response(200, json=raw_document()))
+    out = await client.get_entity(entity_id="d1")
+    assert out["_omitted_properties"] == sorted(BLOB_PROPS)
+    assert_slim_entity(out)
+
+
+async def test_nothing_dropped_means_no_omitted_marker(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The marker names what was left out, so it must be absent when nothing was."""
+    respx_mock.get("/api/2/entities/e1").mock(return_value=httpx.Response(200, json=raw_entity()))
+    out = await client.get_entity(entity_id="e1")
+    assert "_omitted_properties" not in out
+    assert_slim_entity(out)
+
+
+@pytest.mark.parametrize("entity_id", ["e1\n", "e1\r", "e1\n\n", "e1 "])
+async def test_ids_with_trailing_whitespace_are_refused(
+    client: AlephClient, respx_mock: respx.MockRouter, entity_id: str
+) -> None:
+    """Regression for 7d6c175: the validators used `$`, which matches before a trailing
+    newline, so `"e1\n"` passed here and was then refused by the read-only guard with a
+    misleading message — or, on a path that does not re-check, sent as-is."""
+    wire = respx_mock.route().mock(return_value=httpx.Response(200, json={}))
+    with pytest.raises(ValueError, match="invalid entity_id"):
+        await client.get_entity(entity_id=entity_id)
+    assert wire.call_count == 0
+
+
+# Every method that interpolates a caller id into a path. An id of only dot segments
+# passes the charset and is then normalised away at URL construction, so
+# `/api/2/entitysets/../entities` would answer a different question than was asked.
+ID_METHODS = (
+    ("get_entity", "entity_id"),
+    ("entity_tags", "entity_id"),
+    ("expand_entity", "entity_id"),
+    ("similar_entities", "entity_id"),
+    ("get_entity_text", "entity_id"),
+    ("get_profile", "profile_id"),
+    ("profile_tags", "profile_id"),
+    ("profile_similar", "profile_id"),
+    ("expand_profile", "profile_id"),
+    ("get_entityset", "entityset_id"),
+    ("entityset_items", "entityset_id"),
+)
+
+
+@pytest.mark.parametrize("bad", ["..", ".", "...", "./."])
+@pytest.mark.parametrize(("method", "field"), ID_METHODS, ids=[name for name, _ in ID_METHODS])
+async def test_id_that_addresses_nothing_is_refused(
+    client: AlephClient, respx_mock: respx.MockRouter, method: str, field: str, bad: str
+) -> None:
+    wire = respx_mock.route().mock(return_value=httpx.Response(200, json={}))
+    with pytest.raises(ValueError, match=f"invalid {field}"):
+        await getattr(client, method)(**{field: bad})
+    assert wire.call_count == 0
+
+
+async def test_dotted_ids_are_still_accepted(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The dot-only refusal must not become a ban on dots — real Aleph ids contain them."""
+    respx_mock.get("/api/2/entities/a.b.c").mock(
+        return_value=httpx.Response(200, json=raw_entity(id="a.b.c"))
+    )
+    out = await client.get_entity(entity_id="a.b.c")
+    assert out["id"] == "a.b.c"
 
 
 # -- match ---------------------------------------------------------------------
@@ -326,7 +501,7 @@ async def test_expand_profile_passes_property_filters_and_slims(
                     {
                         "property": "ownershipOwner",
                         "count": 7,
-                        "entities": [_entity(properties={"bodyText": ["x"], "name": ["A"]})],
+                        "entities": [raw_document()],
                     }
                 ],
             },
@@ -335,7 +510,7 @@ async def test_expand_profile_passes_property_filters_and_slims(
     out = await client.expand_profile(profile_id="p1", properties=["ownershipOwner"], limit=10)
     assert ("filter:property", "ownershipOwner") in _query(route.calls.last.request)
     assert out["results"][0]["count"] == 7
-    assert "bodyText" not in out["results"][0]["entities"][0]["properties"]
+    assert_slim_entity(out["results"][0]["entities"][0])
 
 
 async def test_get_profile_slims_the_merged_entity(
@@ -352,7 +527,7 @@ async def test_get_profile_slims_the_merged_entity(
                 "label": "Jane Doe",
                 "collection": {"id": "42"},
                 "entities": ["e1", "e2"],
-                "merged": _entity(properties={"bodyText": ["x" * 50], "name": ["Jane Doe"]}),
+                "merged": raw_entity(properties={"bodyText": ["x" * 50], "name": ["Jane Doe"]}),
             },
         )
     )
@@ -373,7 +548,7 @@ async def test_get_profile_drops_the_latinized_block(
             json={
                 "id": "p1",
                 "type": "profile",
-                "merged": _entity(),
+                "merged": raw_entity(),
                 "latinized": {"name": ["Zhanna Doe"]},
             },
         )
@@ -399,7 +574,7 @@ async def test_profile_similar_reports_score_and_judgement(
             200,
             json={
                 "total": 1,
-                "results": [{"score": 4.5, "judgement": None, "entity": _entity()}],
+                "results": [{"score": 4.5, "judgement": None, "entity": raw_entity()}],
             },
         )
     )
@@ -407,6 +582,7 @@ async def test_profile_similar_reports_score_and_judgement(
     assert out["results"][0]["score"] == 4.5
     assert out["results"][0]["judgement"] is None
     assert out["results"][0]["entity"]["id"] == "e1"
+    assert_slim_entity(out["results"][0]["entity"])
 
 
 async def test_get_entityset_reports_a_profile_without_following_the_redirect(
@@ -465,7 +641,7 @@ async def test_get_entity_text_from_body_text(
     respx_mock.get("/api/2/entities/d1").mock(
         return_value=httpx.Response(
             200,
-            json=_entity(id="d1", schema="PlainText", properties={"bodyText": ["abcdefghij"]}),
+            json=raw_entity(id="d1", schema="PlainText", properties={"bodyText": ["abcdefghij"]}),
         )
     )
     out = await client.get_entity_text(entity_id="d1", offset=2, limit=3)
@@ -479,7 +655,7 @@ async def test_get_entity_text_falls_back_to_pages(
     client: AlephClient, respx_mock: respx.MockRouter
 ) -> None:
     respx_mock.get("/api/2/entities/d2").mock(
-        return_value=httpx.Response(200, json=_entity(id="d2", schema="Pages", properties={}))
+        return_value=httpx.Response(200, json=raw_entity(id="d2", schema="Pages", properties={}))
     )
     route = respx_mock.get("/api/2/entities").mock(
         return_value=httpx.Response(
@@ -501,9 +677,23 @@ async def test_get_entity_text_falls_back_to_pages(
     assert out["truncated"] is False
 
 
-async def test_get_entity_text_rejects_absurd_limit(client: AlephClient) -> None:
-    with pytest.raises(ValueError, match="200000"):
-        await client.get_entity_text(entity_id="d1", limit=10**9)
+@pytest.mark.parametrize(
+    ("args", "match"),
+    [
+        ({"offset": -1}, "offset must be >= 0"),
+        ({"limit": 0}, "between 1 and 200000"),
+        ({"limit": 200001}, "between 1 and 200000"),
+    ],
+)
+async def test_text_slice_bounds(
+    client: AlephClient, respx_mock: respx.MockRouter, args: dict[str, int], match: str
+) -> None:
+    """A slice request outside the bounds is refused before the document is fetched, so an
+    absurd limit costs nothing."""
+    wire = respx_mock.route().mock(return_value=httpx.Response(200, json={}))
+    with pytest.raises(ValueError, match=match):
+        await client.get_entity_text(entity_id="d1", **args)
+    assert wire.call_count == 0
 
 
 # -- ontology ------------------------------------------------------------------
@@ -513,26 +703,7 @@ async def test_get_schema_is_cached_after_first_fetch(
     client: AlephClient, respx_mock: respx.MockRouter
 ) -> None:
     route = respx_mock.get("/api/2/metadata").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "model": {
-                    "schemata": {
-                        "Person": {
-                            "label": "Person",
-                            "matchable": True,
-                            "schemata": ["Person", "LegalEntity", "Thing"],
-                            "properties": {"name": {"label": "Name", "type": "name"}},
-                        },
-                        "Ownership": {
-                            "label": "Ownership",
-                            "edge": {"source": "owner", "target": "asset", "directed": True},
-                            "properties": {},
-                        },
-                    }
-                }
-            },
-        )
+        return_value=httpx.Response(200, json=raw_model())
     )
     person = await client.get_schema(name="Person")
     listing = await client.list_schemata()
@@ -619,8 +790,22 @@ def test_derive_caption_returns_none_when_nothing_matches() -> None:
     assert derive_caption({"schema": "Page", "properties": {"index": [3]}}) is None
 
 
+def test_derive_caption_accepts_a_scalar_property_value() -> None:
+    """FtM property values are lists by convention, but Aleph does not guarantee it."""
+    assert derive_caption({"schema": "Person", "properties": {"name": "Jane"}}) == "Jane"
+
+
 def test_slim_entity_reads_the_nested_collection_object() -> None:
     out = slim_entity({"id": "e1", "schema": "Person", "collection": {"id": 583, "label": "x"}})
+    assert out["collection_id"] == "583"
+
+
+def test_slim_entity_prefers_an_explicit_collection_id() -> None:
+    """Not every payload nests: entityset records carry `collection_id` directly. When both
+    are present the explicit field wins, so provenance never depends on which shape arrived."""
+    out = slim_entity(
+        {"id": "e1", "schema": "Person", "collection_id": 583, "collection": {"id": 7}}
+    )
     assert out["collection_id"] == "583"
 
 
@@ -754,7 +939,7 @@ async def test_similar_entities_reports_score_judgement_and_a_slim_entity(
                     {
                         "score": 4.5,
                         "judgement": "positive",
-                        "entity": _entity(
+                        "entity": raw_entity(
                             id="e2", properties={"name": ["Jane Doe"], "indexText": ["huge"]}
                         ),
                     }
@@ -767,7 +952,7 @@ async def test_similar_entities_reports_score_judgement_and_a_slim_entity(
     hit = out["results"][0]
     assert (hit["score"], hit["judgement"]) == (4.5, "positive")
     assert hit["entity"]["id"] == "e2"
-    assert "indexText" not in hit["entity"]["properties"]
+    assert_slim_entity(hit["entity"])
 
 
 async def test_similar_entities_survives_a_result_with_no_entity(
@@ -826,17 +1011,15 @@ async def test_entityset_items_slims_and_pages(
     route = respx_mock.get("/api/2/entitysets/es1/entities").mock(
         return_value=httpx.Response(
             200,
-            json={
-                "total": 1,
-                "results": [_entity(properties={"name": ["Jane"], "bodyText": ["huge"]})],
-            },
+            json=raw_search_payload(raw_document()),
         )
     )
     out = await client.entityset_items(entityset_id="es1", limit=10, offset=5)
     q = _query(route.calls.last.request)
     assert ("limit", "10") in q and ("offset", "5") in q
+    assert_search_envelope(out)
     assert out["total"] == 1
-    assert out["results"][0]["_omitted_properties"] == ["bodyText"]
+    assert out["results"][0]["_omitted_properties"] == sorted(BLOB_PROPS)
 
 
 async def test_entityset_items_refuses_a_limit_above_the_cap(
@@ -864,10 +1047,8 @@ async def test_xref_results_pairs_both_sides_of_the_match(
                     {
                         "score": 3.25,
                         "judgement": "unsure",
-                        "entity": _entity(id="e1"),
-                        "match": _entity(
-                            id="m1", properties={"name": ["Jane Doe"], "bodyText": ["huge"]}
-                        ),
+                        "entity": raw_entity(id="e1"),
+                        "match": raw_document(id="m1"),
                         "match_collection_id": "77",
                     }
                 ],
@@ -882,7 +1063,8 @@ async def test_xref_results_pairs_both_sides_of_the_match(
     assert hit["match_collection_id"] == "77"
     assert hit["entity"]["id"] == "e1"
     assert hit["match"]["id"] == "m1"
-    assert "bodyText" not in hit["match"]["properties"]
+    assert_slim_entity(hit["entity"])
+    assert_slim_entity(hit["match"])
 
 
 async def test_xref_results_rejects_a_foreign_id(client: AlephClient) -> None:

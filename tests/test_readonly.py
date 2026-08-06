@@ -113,6 +113,15 @@ async def test_redirect_into_a_write_endpoint_is_blocked(
     assert blocked.call_count == 0
 
 
+async def test_empty_path_is_normalised_to_root() -> None:
+    """An Aleph mounted under a path prefix: a request to the prefix itself leaves an empty
+    API-relative path, which is read as `/` and refused. No allowlist rule matches `/`, and
+    an empty string would have matched nothing either — but only by accident."""
+    hook = read_only_hook("https://aleph.test/aleph")
+    with pytest.raises(ReadOnlyViolation, match="read-only"):
+        await hook(httpx.Request("GET", "https://aleph.test/aleph"))
+
+
 async def test_base_path_prefix_is_stripped_before_matching() -> None:
     hook = read_only_hook("https://aleph.test/aleph")
     await hook(httpx.Request("GET", "https://aleph.test/aleph/api/2/entities"))

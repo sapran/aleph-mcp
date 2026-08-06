@@ -5,6 +5,10 @@ ALEPH_HOST/ALEPH_API_KEY aliases) are set. Every assertion here is deliberately 
 *shape and contract*, never about a particular instance's content, so the suite is
 portable to any Aleph deployment.
 
+Set ALEPH_MCP_LIVE_STRICT=1 against an instance you know is seeded: a case that would
+skip for missing fixture data fails instead. Without it a run whose discovery quietly
+stopped finding the profile or the documents is indistinguishable from a green one.
+
 Two of these exist because a mocked suite could not have caught the corresponding bug:
 - `/api/2/entities` rejects a query that names no schema or schemata.
 - Aleph serialises `caption` as null and nests the collection object in search hits.
@@ -18,7 +22,7 @@ says which data would make it run — an empty instance must not read as coverag
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 from fastmcp import Client as MCPClient
@@ -28,6 +32,7 @@ from aleph_mcp.client import MAX_PAGE, AlephClient
 from aleph_mcp.config import Settings
 from aleph_mcp.readonly import ReadOnlyViolation
 from aleph_mcp.server import build_server
+from tests.shapes import assert_search_envelope
 
 pytestmark = [
     pytest.mark.live,
@@ -36,6 +41,18 @@ pytestmark = [
         reason="set ALEPH_MCP_LIVE_TESTS=1 to run against a real Aleph instance",
     ),
 ]
+
+
+def _no_fixture_data(reason: str) -> NoReturn:
+    """Skip — or, under ALEPH_MCP_LIVE_STRICT=1, fail — when the instance lacks the data.
+
+    An empty instance must not read as coverage. On a seeded instance a skip means
+    discovery broke rather than that the data is absent, which is what strict mode makes
+    visible.
+    """
+    if os.environ.get("ALEPH_MCP_LIVE_STRICT") == "1":
+        pytest.fail(reason)
+    pytest.skip(reason)
 
 
 @pytest.fixture
@@ -91,7 +108,7 @@ async def test_profile_tools_accept_a_real_profile_id(live_client: AlephClient) 
     out = await live_client.search_entities(schemata="LegalEntity", limit=50)
     profile_id = next((hit["profile_id"] for hit in out["results"] if hit.get("profile_id")), None)
     if not profile_id:
-        pytest.skip("no profile on the sampled entities; instance has no judged xref")
+        _no_fixture_data("no profile on the sampled entities; instance has no judged xref")
 
     profile = await live_client.get_profile(profile_id=profile_id)
     assert profile["type"] == "profile"
@@ -125,7 +142,7 @@ async def test_document_text_is_bounded_and_reports_truncation(
 ) -> None:
     out = await live_client.search_entities(schema="Pages", limit=5)
     if not out["results"]:
-        pytest.skip("instance has no Pages documents")
+        _no_fixture_data("instance has no Pages documents")
     for hit in out["results"]:
         text = await live_client.get_entity_text(entity_id=hit["id"], limit=200)
         if text["total_chars"]:
@@ -133,7 +150,7 @@ async def test_document_text_is_bounded_and_reports_truncation(
             assert text["truncated"] == (text["total_chars"] > 200)
             assert text["source"] in {"bodyText", "pages"}
             return
-    pytest.skip("no extracted text on the sampled documents")
+    _no_fixture_data("no extracted text on the sampled documents")
 
 
 async def test_ontology_comes_from_the_instance(live_client: AlephClient) -> None:
@@ -181,23 +198,47 @@ async def live_server():
 async def ids(live_client: AlephClient) -> dict[str, str | None]:
     """Real ids for the tools that need one, discovered the way a caller would.
 
-    None means the instance holds nothing of that kind; the cases that need it skip.
+    Discovery must not depend on which collection sorts first, nor on what happens to be in
+    the first page of a large result set — both assumptions produced skips against an
+    instance that did hold the data. So: ask every readable collection for its sets, and ask
+    Aleph for the schema you want rather than filtering a general search for it.
+
+    None means the instance genuinely holds nothing of that kind; the cases needing it skip,
+    or fail under ALEPH_MCP_LIVE_STRICT=1.
     """
-    collections = await live_client.list_collections(limit=1)
-    collection_id = collections["results"][0]["id"] if collections["results"] else None
+    collections = await live_client.list_collections(limit=100)
+    collection_ids = [c["id"] for c in collections["results"] if c.get("id")]
+    collection_id = collection_ids[0] if collection_ids else None
 
     entities = await live_client.search_entities(schemata="Thing", limit=50)
     hits = entities["results"]
     entity_id = hits[0]["id"] if hits else None
-    profile_id = next((h["profile_id"] for h in hits if h.get("profile_id")), None)
-    document_id = next(
-        (h["id"] for h in hits if h.get("_omitted_properties") or h["schema"] == "Pages"), None
-    )
 
+    # Any set type will do for get_entityset/entityset_items, but it may live in a
+    # collection that is not the first one listed.
     entityset_id = None
-    if collection_id:
-        sets = await live_client.list_entitysets(collection_id=collection_id)
-        entityset_id = sets["results"][0]["id"] if sets["results"] else None
+    for cid in collection_ids:
+        sets = await live_client.list_entitysets(collection_id=cid)
+        if sets["results"]:
+            entityset_id = sets["results"][0]["id"]
+            break
+
+    # A search hit carries `profile_id` when it belongs to one, which is the discovery path
+    # the tools advertise. Failing that, a profile IS an entityset of type "profile" and its
+    # entityset id *is* the profile id, so the listing route finds one the search missed.
+    profile_id = next((h["profile_id"] for h in hits if h.get("profile_id")), None)
+    if not profile_id:
+        for cid in collection_ids:
+            sets = await live_client.list_entitysets(collection_id=cid, set_type="profile")
+            if sets["results"]:
+                profile_id = sets["results"][0]["id"]
+                break
+
+    # Aleph returns no indexText/bodyText on search hits, so a live `Pages` row never carries
+    # `_omitted_properties` and scanning general hits for one finds nothing. Ask for the
+    # schema instead.
+    pages = await live_client.search_entities(schema="Pages", limit=1)
+    document_id = pages["results"][0]["id"] if pages["results"] else None
 
     return {
         "collection_id": collection_id,
@@ -218,7 +259,7 @@ def _tool_arguments(name: str, ids: dict[str, str | None]) -> dict[str, Any]:
     def need(key: str) -> str:
         value = ids[key]
         if not value:
-            pytest.skip(f"instance has no {key} to exercise {name} against")
+            _no_fixture_data(f"instance has no {key} to exercise {name} against")
         return value
 
     match name:
@@ -297,6 +338,26 @@ async def test_live_coverage_reaches_every_registered_tool(live_server: FastMCP)
     async with MCPClient(live_server) as mcp:
         registered = {t.name for t in await mcp.list_tools()}
     assert registered == set(LIVE_TOOL_ARGUMENTS)
+
+
+async def test_live_responses_match_the_shape_the_mocked_suite_asserts(
+    live_client: AlephClient, ids: dict[str, str | None]
+) -> None:
+    """Closes the mocked-vs-real drift loop.
+
+    `assert_search_envelope` is the same helper that guards every mocked payload, so an
+    Aleph field the slimmer starts leaking fails here instead of passing everywhere — the
+    mocks cannot grow the field on their own.
+    """
+    assert_search_envelope(
+        await live_client.search_entities(schemata="Thing", limit=5),
+        searched={"schemata": "Thing"},
+    )
+
+    entityset_id = ids["entityset_id"]
+    if not entityset_id:
+        _no_fixture_data("instance has no entityset_id to check the entityset_items shape")
+    assert_search_envelope(await live_client.entityset_items(entityset_id=entityset_id, limit=5))
 
 
 async def test_resources_answer_against_the_real_instance(live_server: FastMCP) -> None:
