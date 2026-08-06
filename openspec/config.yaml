@@ -1,5 +1,17 @@
 schema: spec-driven
 
+# Cross-root reference (records-only). This server's tool surface and limits
+# are a published contract consumed by the `aleph-entity-graph` skill in the
+# acordia-analysts plugin. Declaring acordia makes the seam visible to
+# `openspec doctor` and carries a reproducible register recipe. It is NOT
+# registered on this machine: registration writes `.openspec-store/store.yaml`
+# into acordia and the seam is one-directional by design. The declaration
+# records the edge and, once registered locally, indexes acordia's specs — it
+# runs no cross-root drift check. See docs/implementation-notes.md.
+references:
+  - id: acordia
+    remote: https://github.com/sapran/acordia-agents.git
+
 # Project context (shown to AI when creating artifacts)
 context: |
   aleph-mcp is a read-only FastMCP server over the Aleph HTTP API (OCCRP's
