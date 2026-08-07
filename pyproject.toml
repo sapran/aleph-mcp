@@ -24,7 +24,7 @@ dependencies = [
     # The read-only guard is an httpx request event hook; keep the major version bounded
     # so hook semantics cannot change under a routine upgrade (see src/aleph_mcp/readonly.py).
     "httpx>=0.27,<1",
-    "pydantic-settings>=2.5",
+    "pydantic-settings>=2.5,<3",
 ]
 
 [project.urls]
