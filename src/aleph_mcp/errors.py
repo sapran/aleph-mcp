@@ -19,7 +19,7 @@ def raise_for_status(resp: httpx.Response, *, context: str, resource: bool = Fal
         return
 
     err_cls = ResourceError if resource else ToolError
-    body = _truncate(resp.text, 500)
+    detail = _upstream_detail(resp)
 
     if resp.status_code == 401:
         raise err_cls(
@@ -38,14 +38,14 @@ def raise_for_status(resp: httpx.Response, *, context: str, resource: bool = Fal
             "call list_collections to see what is readable."
         )
     if resp.status_code == 400:
-        raise err_cls(f"{context}: bad request (400). {body}")
+        raise err_cls(f"{context}: bad request (400).{detail}")
     if resp.status_code == 429:
         raise err_cls(
             f"{context}: rate limited (429) and retries are exhausted. "
             "Aleph limits anonymous callers to ~30 requests/minute; slow down or widen "
             "each query instead of issuing many narrow ones."
         )
-    raise err_cls(f"{context}: unexpected HTTP {resp.status_code}. {body}")
+    raise err_cls(f"{context}: unexpected HTTP {resp.status_code}.{detail}")
 
 
 def raise_read_only(exc: ReadOnlyViolation, *, context: str, resource: bool = False) -> NoReturn:
@@ -56,6 +56,37 @@ def raise_read_only(exc: ReadOnlyViolation, *, context: str, resource: bool = Fa
         "sent to Aleph. If the instance redirected the read — SSO, or a canonical-host "
         "redirect — that is the likely cause rather than a write attempt."
     ) from exc
+
+
+# Aleph's own error text is upstream content, so it is quoted as data, kept to one line
+# and kept short. It is an aid to the operator, not a channel: nothing that fails the
+# shape below reaches the model at all.
+_MAX_UPSTREAM_CHARS = 200
+
+
+def _upstream_detail(resp: httpx.Response) -> str:
+    """The `message` string from Aleph's JSON error body, labelled — or nothing.
+
+    Everything else is dropped: an HTML page from a proxy in front of the instance, a
+    stack fragment, a 500-character blob. Echoing a raw body would hand whoever can shape
+    an error response a write primitive into the model's context, and would disclose
+    whatever internal detail the upstream put in it.
+    """
+    if "json" not in resp.headers.get("content-type", "").lower():
+        return ""
+    try:
+        payload = resp.json()
+    except ValueError:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    message = payload.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return ""
+    # Collapsing whitespace is deliberate: it keeps a multi-line body from presenting as
+    # separate lines of server-authored text.
+    flat = _truncate(" ".join(message.split()), _MAX_UPSTREAM_CHARS)
+    return f' Aleph reported (untrusted upstream text): "{flat}"'
 
 
 def _truncate(s: str, n: int) -> str:
