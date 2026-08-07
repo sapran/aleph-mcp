@@ -118,6 +118,8 @@ def build_server(settings: Settings) -> tuple[FastMCP, AlephClient]:
           Every result reports the scope it actually searched under `searched`.
         - `facets`: request bucket counts, e.g. ["schema", "collection_id", "countries"].
           Combine with limit=0 to survey a result set for free before pulling rows.
+          `facet_size` is the buckets per facet, 1..200; a longer tail means the slice is
+          too broad, so filter and facet again rather than asking for every bucket.
         - `highlight`: return matching snippets; only meaningful together with `q`.
 
         Document-sized text properties are stripped from results — use get_entity_text.

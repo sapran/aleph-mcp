@@ -7,7 +7,9 @@ from fastmcp.exceptions import ToolError
 
 from aleph_mcp.client import (
     MAX_EXPAND,
+    MAX_FACET_SIZE,
     MAX_PAGE,
+    MAX_RESPONSE_BYTES,
     AlephClient,
     derive_caption,
     slim_entity,
@@ -272,6 +274,55 @@ async def test_search_builds_filter_and_facet_params(
 async def test_search_rejects_deep_pagination(client: AlephClient) -> None:
     with pytest.raises(ValueError, match="facets"):
         await client.search_entities(limit=50, offset=MAX_PAGE)
+
+
+@pytest.mark.parametrize("facet_size", [0, MAX_FACET_SIZE + 1], ids=["zero", "over-cap"])
+async def test_search_rejects_an_unbounded_facet_size(
+    client: AlephClient, respx_mock: respx.MockRouter, facet_size: int
+) -> None:
+    """facet_size was the one pagination-shaped parameter with no cap, and it is the one
+    the row limit does not cover: buckets are an aggregation, not a page of results."""
+    wire = respx_mock.route().mock(return_value=httpx.Response(200, json={}))
+    with pytest.raises(ValueError, match="facet_size must be between"):
+        await client.search_entities(facets=["schema"], facet_size=facet_size)
+    assert wire.call_count == 0
+
+
+async def test_facet_buckets_are_bounded_and_their_labels_truncated(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """Facets skipped the slimmer entirely, so bucket labels — entity names, file names —
+    reached the model untouched and unbounded in number."""
+    buckets = [{"id": str(i), "label": "z" * 2000, "count": 1} for i in range(MAX_FACET_SIZE + 5)]
+    respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [],
+                "total": {"value": 0},
+                "facets": {"names": {"total": len(buckets), "values": buckets}},
+            },
+        )
+    )
+    out = await client.search_entities(facets=["names"], limit=0)
+    names = out["facets"]["names"]
+    assert len(names["values"]) == MAX_FACET_SIZE
+    assert names["_omitted_values"] == 5
+    assert names["total"] == MAX_FACET_SIZE + 5, "the true bucket count must survive clipping"
+    assert names["values"][0]["label"].endswith("chars]")
+
+
+async def test_a_response_over_the_ceiling_is_refused_before_decoding(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    oversized = b'{"padding": "' + b"z" * (MAX_RESPONSE_BYTES + 1) + b'"}'
+    respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(
+            200, content=oversized, headers={"content-type": "application/json"}
+        )
+    )
+    with pytest.raises(ToolError, match=r"over the .* ceiling"):
+        await client.list_collections()
 
 
 async def test_search_allows_the_exact_ceiling(

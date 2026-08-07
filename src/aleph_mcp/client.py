@@ -9,7 +9,7 @@ from typing import Any, Literal
 import httpx
 
 from .config import Settings
-from .errors import raise_for_status, raise_read_only
+from .errors import raise_for_status, raise_read_only, raise_too_large
 from .readonly import ReadOnlyViolation, read_only_hook
 
 # Elasticsearch `from + size` window enforced by Aleph (aleph/index/util.py MAX_PAGE).
@@ -25,6 +25,17 @@ DEFAULT_SCHEMATA = "Thing"
 
 # Separate, much lower cap on graph traversal (SETTINGS.MAX_EXPAND_ENTITIES default).
 MAX_EXPAND = 200
+
+# Aleph's facet buckets are the one part of a payload that is an aggregation rather than a
+# row set, so neither `limit` nor the slimmer bounds them. Cap what may be asked for, and
+# cap again what is copied back, because the two are set by different parties.
+MAX_FACET_SIZE = 200
+
+# A ceiling on what this server will decode into the model's context. It bounds the JSON
+# decode and everything downstream of it, not the transport buffer — httpx has already
+# read the body by then, and bounding that would mean streaming every request. The peer is
+# the operator's own pinned Aleph, so the buffer is not the interesting half.
+MAX_RESPONSE_BYTES = 25 * 1024 * 1024
 
 # Properties that carry whole documents. Never worth spending context on inside a
 # search hit; get_entity_text exists to read them deliberately and in bounded slices.
@@ -161,6 +172,36 @@ def slim_entity(entity: dict[str, Any], schemata: dict[str, Any] | None = None) 
     return slim
 
 
+def _slim_facets(facets: Any) -> Any:
+    """Bound a facets block the way slim_entity bounds properties.
+
+    Bucket labels are entity names, countries and file names — upstream content that
+    reaches the model untouched otherwise, because facets are the one part of a payload
+    the row limit does not cover. `total` is preserved, so a clipped list still reports
+    the true number of buckets.
+    """
+    if not isinstance(facets, dict):
+        return facets
+    out: dict[str, Any] = {}
+    for name, facet in facets.items():
+        if not isinstance(facet, dict):
+            out[name] = facet
+            continue
+        slim = dict(facet)
+        values = facet.get("values")
+        if isinstance(values, list):
+            slim["values"] = [
+                {k: _truncate(v) if isinstance(v, str) else v for k, v in bucket.items()}
+                if isinstance(bucket, dict)
+                else bucket
+                for bucket in values[:MAX_FACET_SIZE]
+            ]
+            if len(values) > MAX_FACET_SIZE:
+                slim["_omitted_values"] = len(values) - MAX_FACET_SIZE
+        out[name] = slim
+    return out
+
+
 def _slim_result(payload: dict[str, Any], schemata: dict[str, Any] | None = None) -> dict[str, Any]:
     total = payload.get("total")
     out: dict[str, Any] = {
@@ -170,7 +211,7 @@ def _slim_result(payload: dict[str, Any], schemata: dict[str, Any] | None = None
         "results": [slim_entity(e, schemata) for e in payload.get("results") or []],
     }
     if payload.get("facets"):
-        out["facets"] = payload["facets"]
+        out["facets"] = _slim_facets(payload["facets"])
     return out
 
 
@@ -319,6 +360,9 @@ class AlephClient:
             raise_read_only(e, context=context, resource=resource)
         assert resp is not None
         raise_for_status(resp, context=context, resource=resource)
+        size = len(resp.content)
+        if size > MAX_RESPONSE_BYTES:
+            raise_too_large(size, MAX_RESPONSE_BYTES, context=context, resource=resource)
         data: Any = resp.json()
         if not isinstance(data, dict):
             return {"results": data}
@@ -401,6 +445,12 @@ class AlephClient:
             raise ValueError("limit must be >= 0")
         if offset < 0:
             raise ValueError("offset must be >= 0")
+        if facet_size < 1 or facet_size > MAX_FACET_SIZE:
+            raise ValueError(
+                f"facet_size must be between 1 and {MAX_FACET_SIZE}. A facet is a summary; "
+                "if you need more buckets than that, filter to a narrower slice and facet "
+                "again rather than asking for the whole aggregation."
+            )
         if limit + offset > MAX_PAGE:
             raise ValueError(
                 f"limit + offset must be <= {MAX_PAGE}: Aleph cannot page past result "

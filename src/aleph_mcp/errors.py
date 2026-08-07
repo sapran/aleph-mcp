@@ -58,6 +58,16 @@ def raise_read_only(exc: ReadOnlyViolation, *, context: str, resource: bool = Fa
     ) from exc
 
 
+def raise_too_large(size: int, limit: int, *, context: str, resource: bool = False) -> NoReturn:
+    """Refuse an upstream response too big to decode into the model's context."""
+    err_cls = ResourceError if resource else ToolError
+    raise err_cls(
+        f"{context}: upstream response is {size} bytes, over the {limit}-byte ceiling this "
+        "server decodes. Narrow the request — fewer facets, a smaller facet_size, a shorter "
+        "text slice — rather than retrying it unchanged."
+    )
+
+
 # Aleph's own error text is upstream content, so it is quoted as data, kept to one line
 # and kept short. It is an aid to the operator, not a channel: nothing that fails the
 # shape below reaches the model at all.
