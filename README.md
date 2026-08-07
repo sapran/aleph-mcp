@@ -32,7 +32,11 @@ write-scoped key, run by a human.
 Requires Python ≥ 3.12 and [`uv`](https://github.com/astral-sh/uv).
 
 ```bash
-uv tool install git+https://github.com/sapran/aleph-mcp.git   # or, from a checkout:
+# Pin a release commit: this server is handed your Aleph key, and an unpinned git+ spec
+# builds and runs whatever the branch head happens to be. Latest tag: v0.1.6.
+uv tool install git+https://github.com/sapran/aleph-mcp.git@<commit-sha>
+
+# Or, from a checkout:
 uv sync --all-extras
 ```
 

@@ -162,16 +162,24 @@ from `disabledProviders` in `~/.omp/agent/config.yml`, or override it for a sing
 `--config <overlay.yml>`. The other entries (`claude`, `opencode`, `cursor`, `codex`) are
 unrelated and can stay.
 
-If the credentials are missing, the server exits `2` and these lines appear in the MCP logs:
+If the credentials are missing, the server exits `2` and these lines appear in the MCP
+logs:
 
 ```
 aleph-mcp: configuration error: …
 aleph-mcp: set ALEPHCLIENT_HOST and ALEPHCLIENT_API_KEY (use a READ-only Aleph role).
 ```
 
-That is the intended failure: no `env` block means an unset variable stays unset, instead of
-a passthrough map handing the server the literal string `ALEPHCLIENT_API_KEY` and turning a
-clean exit into a runtime 403.
+That is the intended failure. The `env` block resolves each value by running a shell
+command — `$ALEPHCLIENT_HOST` for the URL, a login-Keychain read for the key — at every
+server start, and a lookup that finds nothing yields a refusal marker rather than a
+plausible-looking empty string. So an unset or mismatched credential produces a clean
+exit naming the cause, instead of a passthrough map handing the server a literal
+`ALEPHCLIENT_API_KEY` and turning it into a runtime 403.
+
+If the error names a host you did not expect, a `.env` in the working directory has
+redefined `ALEPHCLIENT_HOST`; that is the case the host-scoped Keychain entry exists to
+catch.
 
 ## Pinning and updates
 

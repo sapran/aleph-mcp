@@ -3,15 +3,22 @@
 Findings recorded during other work, kept out of the change that surfaced them. An entry leaves
 this file when it becomes a spec requirement or is fixed — not when someone remembers to tidy up.
 
-- **`0.1.0` is now written in three places**: `src/aleph_mcp/__init__.py`,
-  `plugins/aleph/.claude-plugin/plugin.json`, and `plugins[0].version` in
-  `.claude-plugin/marketplace.json`. A release bumps all three together. The *catalog*
-  version is what drives change detection in `omp plugin upgrade`, so a stale
-  `.claude-plugin/marketplace.json` makes an upgrade silently no-op even when the plugin
-  manifest moved.
+- **The shipped plugin `.mcp.json` runs a shell at every server start.** Both `env` values
+  are `!`-prefixed commands: the host is `$ALEPHCLIENT_HOST`, and the key is read from the
+  macOS login Keychain under a service name that includes the host. That behaviour is
+  documented in `plugins/aleph/README.md` rather than only implied, because installing the
+  plugin makes a Keychain read happen per session. A miss deliberately prints the marker
+  `aleph-mcp:keychain-miss` instead of an empty string: the harness *omits* an `env` entry
+  whose command prints only whitespace, and an omitted entry lets the server inherit an
+  ambient `ALEPHCLIENT_API_KEY`. Non-macOS users are directed to declare their own server
+  entry instead.
 
 Retired since the last prune:
 
+- The version being written in three places with nothing checking they agree — which shipped
+  0.1.4 to every marketplace user as 0.1.2, because the *catalog* version is what drives
+  change detection in `omp plugin upgrade`. **Fixed** by `tests/test_packaging.py`, which
+  asserts the three declared versions equal `aleph_mcp.__version__`.
 - The `$` anchor letting `entity_id="e1\n"` through, and `entityset_id=".."` normalising away to
   a different endpoint. **Fixed** by `fix-id-validation-anchors`; the validators now use
   `re.fullmatch`, as the allowlist always has.

@@ -96,7 +96,7 @@ This was verified against a live instance: `GET /api/2/entitysets/<id>` for a pr
 
 Where a documented redirect exists, the tool SHALL disable redirect-following for that request and treat the `302` itself as the answer, reporting where the caller should go instead. `get_entityset` does this: a profile-type set yields the profile id and a `_note` naming `get_profile`, with no second request issued.
 
-The host pin compares hostnames and not ports, so a same-host, different-port redirect is not refused by the guard. That is acceptable only because the client strips credentials across the origin change and because no tool now follows such a redirect; it SHALL NOT be relied upon as a boundary, and any future tool that follows a redirect SHALL re-derive the target against the configured API base rather than trusting the advertised `Location`.
+The origin pin covers scheme, host and port, so a same-host, different-port redirect **is** refused by the guard — see "Requests that leave the configured origin or base path are refused" above. Even so, the pin SHALL NOT be treated as the reason a redirect is safe to follow: any future tool that follows one SHALL re-derive the target against the configured API base rather than trusting the advertised `Location`.
 
 #### Scenario: A profile redirect is reported rather than followed
 
