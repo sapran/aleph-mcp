@@ -49,17 +49,23 @@ The id character class SHALL NOT be narrowed to hexadecimal in order to exclude 
 - **WHEN** the allowlist is enumerated
 - **THEN** every entry is a `GET`, except a single `POST /api/2/match`, which is a lookup that carries its query in a body
 
-### Requirement: Requests that leave the configured host or base path are refused
+### Requirement: Requests that leave the configured origin or base path are refused
 
-The server SHALL refuse any request whose host differs from the configured Aleph host, and any request whose path does not fall under the configured base path. The configured base path SHALL be stripped before the allowlist is matched, so an Aleph mounted under a sub-path is checked on its API-relative path like any other.
+The server SHALL refuse any request whose origin — scheme, host and port, with the scheme's default port resolved — differs from the configured Aleph origin, and any request whose path does not fall under the configured base path. The configured base path SHALL be stripped before the allowlist is matched, so an Aleph mounted under a sub-path is checked on its API-relative path like any other.
 
-This exists because an Aleph instance can redirect, and the body of a `POST /api/2/match` would otherwise be re-sent to the redirect target.
+This exists because an Aleph instance can redirect, and the body of a `POST /api/2/match` would otherwise be re-sent to the redirect target. The pin is the whole origin rather than the hostname because a hostname comparison admits a redirect that downgrades `https` to `http`, or that points at a different service on another port of the same machine.
 
 #### Scenario: Cross-host redirect is refused and no credential is emitted
 
 - **WHEN** an allowlisted request receives a redirect to a host other than the configured one
 - **THEN** the redirected request is refused
 - **AND** the `Authorization` header is never sent to that host
+
+#### Scenario: A redirect keeping the hostname but changing scheme or port is refused
+
+- **WHEN** a redirect targets the configured hostname on `http` instead of `https`, or on a port other than the configured one
+- **THEN** the request is refused before the allowlist is consulted
+- **AND** naming the scheme's default port explicitly is the same origin, so the instance's own canonical redirect is still allowed
 
 #### Scenario: A sub-path mount is matched on its API-relative path
 

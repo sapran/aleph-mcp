@@ -64,25 +64,47 @@ def is_read_only(method: str, path: str) -> bool:
     return any(m == method and p.fullmatch(path) for m, p in _ALLOWED)
 
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin(url: httpx.URL) -> tuple[str, str, int | None]:
+    """Scheme, host and explicit port, with the scheme's default port filled in.
+
+    Resolving the default is what makes `https://aleph.test` and `https://aleph.test:443`
+    the same origin, so a redirect cannot restate the pinned host in a form that compares
+    unequal — or, worse, reach a different service by naming a port at all.
+    """
+    return (
+        url.scheme,
+        url.host,
+        url.port if url.port is not None else _DEFAULT_PORTS.get(url.scheme),
+    )
+
+
 def read_only_hook(host: str) -> Callable[[httpx.Request], Awaitable[None]]:
     """Build the httpx request hook that pins every request to `host` and the allowlist.
 
     The returned hook runs for every request the client sends, redirect hops included, so
     the guarantee holds regardless of what the API key is permitted to do server-side. It
-    refuses a request that leaves the configured host — an Aleph instance can redirect,
+    refuses a request that leaves the configured origin — an Aleph instance can redirect,
     and a POST /api/2/match body would otherwise be re-sent to the redirect target — and
     it strips the host's own path prefix before matching, so an Aleph mounted under
     https://example.org/aleph is checked on /api/2/... like any other.
+
+    The pin is on the whole origin, not the hostname: comparing hostnames alone would let
+    a redirect downgrade https to http, or point at a different service on another port of
+    the same machine, and still be matched against the read allowlist.
     """
     base = httpx.URL(host)
-    expected_host = base.host
+    expected = _origin(base)
     prefix = base.path.rstrip("/")
 
     async def enforce_read_only(request: httpx.Request) -> None:
-        if request.url.host != expected_host:
+        if _origin(request.url) != expected:
+            scheme, name, port = expected
             raise ReadOnlyViolation(
                 f"blocked {request.method} {request.url}: this request leaves the configured "
-                f"Aleph host {expected_host}"
+                f"Aleph origin {scheme}://{name}:{port}"
             )
         path = request.url.path
         if prefix:

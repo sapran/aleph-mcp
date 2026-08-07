@@ -131,10 +131,36 @@ async def test_base_path_prefix_is_stripped_before_matching() -> None:
         await hook(httpx.Request("GET", "https://aleph.test/api/2/entities"))
 
 
-async def test_request_leaving_the_configured_host_is_blocked() -> None:
+async def test_request_leaving_the_configured_origin_is_blocked() -> None:
     hook = read_only_hook("https://aleph.test")
-    with pytest.raises(ReadOnlyViolation, match="configured Aleph host"):
+    with pytest.raises(ReadOnlyViolation, match="configured Aleph origin"):
         await hook(httpx.Request("GET", "https://evil.example/api/2/entities"))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://aleph.test/api/2/entities",
+        "https://aleph.test:9200/api/2/entities",
+    ],
+    ids=["cleartext-downgrade", "other-port-same-machine"],
+)
+async def test_same_hostname_on_another_scheme_or_port_is_blocked(url: str) -> None:
+    """The pin is the origin, not the hostname. A redirect that keeps the hostname but
+    downgrades the scheme, or names another service's port, is a different destination and
+    is refused before the allowlist ever sees the path."""
+    hook = read_only_hook("https://aleph.test")
+    with pytest.raises(ReadOnlyViolation, match="configured Aleph origin"):
+        await hook(httpx.Request("GET", url))
+
+
+async def test_the_default_port_is_the_same_origin_as_no_port() -> None:
+    """Otherwise the pin would refuse the instance's own canonical redirect."""
+    hook = read_only_hook("https://aleph.test")
+    await hook(httpx.Request("GET", "https://aleph.test:443/api/2/entities"))
+    await read_only_hook("http://aleph.test:80")(
+        httpx.Request("GET", "http://aleph.test/api/2/entities")
+    )
 
 
 async def test_cross_host_redirect_is_blocked(
@@ -145,7 +171,7 @@ async def test_cross_host_redirect_is_blocked(
             302, headers={"Location": "https://evil.example/api/2/entities"}
         )
     )
-    with pytest.raises(ToolError, match="configured Aleph host"):
+    with pytest.raises(ToolError, match="configured Aleph origin"):
         await client.get_entity(entity_id="e1")
 
 
@@ -237,7 +263,7 @@ async def test_cross_host_redirect_never_reaches_the_foreign_host(
         return httpx.Response(200, json={})
 
     evil = respx_mock.get("https://evil.example/steal").mock(side_effect=capture)
-    with pytest.raises(ToolError, match="configured Aleph host"):
+    with pytest.raises(ToolError, match="configured Aleph origin"):
         await client.get_entity(entity_id="e1")
     assert evil.call_count == 0
     assert seen_auth == []
