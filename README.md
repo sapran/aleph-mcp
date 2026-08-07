@@ -95,14 +95,16 @@ several Aleph instances and running from a checkout:
     "aleph": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/sapran/aleph-mcp.git", "aleph-mcp"]
+      "args": ["--from", "git+https://github.com/sapran/aleph-mcp.git@<commit-sha>", "aleph-mcp"]
     }
   }
 }
 ```
 
 No `env` block — credentials come from the environment the client itself runs in. Under omp
-this form is not plugin-namespaced, so its tools are `mcp__aleph_<tool>`.
+this form is not plugin-namespaced, so its tools are `mcp__aleph_<tool>`. Pin `@<commit-sha>`
+to a full commit: an unpinned `git+` spec builds and runs whatever the branch head is at
+launch, in a process you have just handed your Aleph key.
 
 ### opencode
 
@@ -114,7 +116,7 @@ this form is not plugin-namespaced, so its tools are `mcp__aleph_<tool>`.
   "mcp": {
     "aleph": {
       "type": "local",
-      "command": ["uvx", "--from", "git+https://github.com/sapran/aleph-mcp.git", "aleph-mcp"],
+      "command": ["uvx", "--from", "git+https://github.com/sapran/aleph-mcp.git@<commit-sha>", "aleph-mcp"],
       "enabled": true,
       "environment": {
         "ALEPHCLIENT_HOST": "https://aleph.example.org",

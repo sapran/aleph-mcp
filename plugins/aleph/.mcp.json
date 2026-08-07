@@ -5,7 +5,7 @@
       "command": "uvx",
       "args": [
         "--from",
-        "git+https://github.com/sapran/aleph-mcp.git",
+        "git+https://github.com/sapran/aleph-mcp.git@8e97e4459335d7a8cf5ab9e57aa84e0c7f4a0dac",
         "aleph-mcp"
       ],
       "env": {

@@ -111,7 +111,7 @@ why it carries no `env` block at all.
       "aleph-eu": {
         "type": "stdio",
         "command": "uvx",
-        "args": ["--from", "git+https://github.com/sapran/aleph-mcp.git", "aleph-mcp"],
+        "args": ["--from", "git+https://github.com/sapran/aleph-mcp.git@<commit-sha>", "aleph-mcp"],
         "env": {
           "ALEPHCLIENT_HOST": "https://aleph.eu.example.org",
           "ALEPHCLIENT_API_KEY": "<key>"
@@ -170,9 +170,11 @@ That refreshes the plugin files. The **server build** is resolved and cached sep
 uv cache clean aleph-mcp
 ```
 
-To pin a version, change the `--from` spec to
-`git+https://github.com/sapran/aleph-mcp.git@<tag>`. The shipped spec is deliberately
-unpinned because the repository carries no release tag yet.
+The shipped `--from` spec is pinned to a full commit SHA. That is deliberate: this server
+is handed your Aleph API key, and an unpinned `git+` spec would resolve, build and run
+whatever the default branch happened to be at launch. Each release bumps the SHA, so
+updating the plugin is what moves the server forward — the pin is not a version you are
+expected to edit by hand.
 
 ## Local development
 
