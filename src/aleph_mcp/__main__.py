@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import sys
 
+from pydantic import ValidationError
+
 from .config import Settings
 from .server import build_server
 
@@ -18,8 +20,8 @@ async def _serve(settings: Settings) -> None:
 def main() -> None:
     try:
         settings = Settings()  # type: ignore[call-arg]
-    except Exception as e:
-        print(f"aleph-mcp: configuration error: {e}", file=sys.stderr)
+    except ValidationError as e:
+        print(f"aleph-mcp: configuration error: {e.errors(include_input=False)}", file=sys.stderr)
         print(
             "aleph-mcp: set ALEPHCLIENT_HOST and ALEPHCLIENT_API_KEY (use a READ-only Aleph role).",
             file=sys.stderr,

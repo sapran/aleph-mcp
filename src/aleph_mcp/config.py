@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,6 +16,9 @@ class Settings(BaseSettings):
         env_prefix="ALEPH_MCP_",
         case_sensitive=False,
         extra="ignore",
+        # Keep the assembled settings dict — which holds the API key — out of the
+        # string form of any validation error.
+        hide_input_in_errors=True,
     )
 
     host: str = Field(
@@ -23,7 +26,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("ALEPHCLIENT_HOST", "ALEPH_HOST", "ALEPH_MCP_HOST"),
         description="Base URL of the Aleph instance, e.g. https://aleph.occrp.org",
     )
-    api_key: str = Field(
+    api_key: SecretStr = Field(
         ...,
         validation_alias=AliasChoices("ALEPHCLIENT_API_KEY", "ALEPH_API_KEY", "ALEPH_MCP_API_KEY"),
         description="Aleph API key. Use a role with READ-only collection access.",

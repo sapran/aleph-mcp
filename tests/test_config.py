@@ -37,4 +37,4 @@ def test_aleph_mcp_prefixed_aliases_work(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("ALEPH_MCP_HOST", "https://other.test")
     monkeypatch.setenv("ALEPH_MCP_API_KEY", "k2")
     s = Settings()  # type: ignore[call-arg]
-    assert (s.host, s.api_key) == ("https://other.test", "k2")
+    assert (s.host, s.api_key.get_secret_value()) == ("https://other.test", "k2")

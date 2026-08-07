@@ -178,7 +178,7 @@ class AlephClient:
         self._http = httpx.AsyncClient(
             base_url=settings.host,
             headers={
-                "Authorization": f"ApiKey {settings.api_key}",
+                "Authorization": f"ApiKey {settings.api_key.get_secret_value()}",
                 "Accept": "application/json",
                 "User-Agent": "aleph-mcp",
             },
