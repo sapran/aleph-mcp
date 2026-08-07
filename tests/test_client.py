@@ -1,3 +1,4 @@
+import asyncio
 import gzip
 from urllib.parse import parse_qsl, urlsplit
 
@@ -11,6 +12,7 @@ from aleph_mcp.client import (
     MAX_FACET_SIZE,
     MAX_PAGE,
     MAX_RESPONSE_BYTES,
+    MAX_RETRY_SLEEP_SECS,
     AlephClient,
     derive_caption,
     slim_entity,
@@ -96,6 +98,27 @@ async def test_retries_on_429_then_succeeds(
     assert route.call_count == 2
 
 
+async def test_a_hostile_retry_after_cannot_stall_past_the_timeout_budget(
+    client: AlephClient, respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each hop's delay is clamped, but the clamp times max_retries is the upstream's to
+    spend unless one call shares one budget. httpx's timeout does not cover asyncio.sleep,
+    so nothing else bounds this."""
+    slept: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+    respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(429, headers={"Retry-After": "3600"})
+    )
+    with pytest.raises(ToolError, match="rate limited"):
+        await client.list_collections()
+    assert sum(slept) <= client._settings.timeout_secs
+    assert max(slept) <= MAX_RETRY_SLEEP_SECS
+
+
 async def test_gives_up_after_max_retries(
     client: AlephClient, respx_mock: respx.MockRouter, no_sleep: None
 ) -> None:
@@ -135,7 +158,7 @@ async def test_request_wraps_a_bare_list_response(
         return_value=httpx.Response(200, json=[{"field": "emails", "count": 2}])
     )
     out = await client.entity_tags(entity_id="e1")
-    assert out == {"results": [{"field": "emails", "count": 2}]}
+    assert out["results"] == [{"field": "emails", "count": 2}]
 
 
 async def test_unparseable_retry_after_falls_back_to_backoff(
@@ -631,12 +654,15 @@ async def test_get_profile_drops_the_latinized_block(
     assert "latinized" not in out["merged"]
 
 
-async def test_profile_tags_passes_the_envelope_through(
+async def test_profile_tags_gets_the_same_bounding_as_entity_tags(
     client: AlephClient, respx_mock: respx.MockRouter
 ) -> None:
     payload = {"status": "ok", "total": 1, "results": [{"field": "phones", "count": 3}]}
     respx_mock.get("/api/2/profiles/p1/tags").mock(return_value=httpx.Response(200, json=payload))
-    assert await client.profile_tags(profile_id="p1") == payload
+    out = await client.profile_tags(profile_id="p1")
+    assert out["results"] == payload["results"]
+    assert out["total"] == 1
+    assert out["_provenance"]["trust"] == "untrusted"
 
 
 async def test_profile_similar_reports_score_and_judgement(
@@ -1001,23 +1027,26 @@ async def test_list_collections_rejects_a_limit_above_the_listing_cap(
     assert route.call_count == 0
 
 
-async def test_entity_tags_passes_the_pivot_envelope_through(
+async def test_entity_tags_is_bounded_and_labelled(
     client: AlephClient, respx_mock: respx.MockRouter
 ) -> None:
-    """The tags payload is already minimal and its `id` values are the queries to run
-    next, so it is deliberately not slimmed. Guard that it stays untouched."""
-    payload = {
-        "status": "ok",
-        "total": 2,
-        "results": [
-            {"id": "name:jane-doe", "field": "names", "value": "Jane Doe", "count": 3},
-            {"id": "mailto:j@x.test", "field": "emails", "value": "j@x.test", "count": 7},
-        ],
-    }
+    """A tags response aggregates values lifted out of third-party documents, and the
+    endpoint accepts no limit — so the row count is the upstream's to choose unless this
+    end caps it. Same treatment as a facets block."""
+    tags = [
+        {"id": f"name:x{i}", "field": "names", "value": "z" * 2000, "count": 1}
+        for i in range(MAX_FACET_SIZE + 3)
+    ]
     route = respx_mock.get("/api/2/entities/e1/tags").mock(
-        return_value=httpx.Response(200, json=payload)
+        return_value=httpx.Response(200, json={"status": "ok", "total": len(tags), "results": tags})
     )
-    assert await client.entity_tags(entity_id="e1") == payload
+    out = await client.entity_tags(entity_id="e1")
+    assert len(out["results"]) == MAX_FACET_SIZE
+    assert out["_omitted_values"] == 3
+    assert out["total"] == len(tags), "the true count must survive the clipping"
+    assert out["results"][0]["value"].endswith("chars]")
+    assert out["_provenance"]["trust"] == "untrusted"
+    assert "status" not in out, "upstream envelope keys are not passed through"
     assert route.call_count == 1
 
 

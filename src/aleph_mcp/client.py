@@ -204,6 +204,34 @@ def _slim_facets(facets: Any) -> Any:
     return out
 
 
+def _slim_tags(payload: dict[str, Any]) -> dict[str, Any]:
+    """Bound a tags aggregation the way _slim_facets bounds a facets block.
+
+    A tags response aggregates an entity's own property values — names, emails, phones,
+    addresses — which are document-derived, so anyone able to get a file ingested into a
+    readable collection controls the labels. The endpoint accepts no limit, so without a
+    cap here the row count is the upstream's to choose.
+    """
+    results = payload.get("results") or []
+    kept = [
+        {k: _truncate(v) if isinstance(v, str) else v for k, v in tag.items()}
+        if isinstance(tag, dict)
+        else tag
+        for tag in results[:MAX_FACET_SIZE]
+    ]
+    out: dict[str, Any] = {
+        "total": payload.get("total"),
+        "results": kept,
+        "_provenance": {
+            "trust": "untrusted",
+            "origin": "values aggregated from third-party documents in Aleph",
+        },
+    }
+    if len(results) > MAX_FACET_SIZE:
+        out["_omitted_values"] = len(results) - MAX_FACET_SIZE
+    return out
+
+
 def _slim_result(payload: dict[str, Any], schemata: dict[str, Any] | None = None) -> dict[str, Any]:
     total = payload.get("total")
     out: dict[str, Any] = {
@@ -349,6 +377,10 @@ class AlephClient:
         resp: httpx.Response | None = None
         body = b""
         follow = self._http.follow_redirects if follow_redirects is None else follow_redirects
+        # One tool call, one sleep budget. Each hop's delay is clamped, but an upstream
+        # that answers every attempt with a Retry-After would otherwise multiply that
+        # clamp by max_retries and decide how long the caller hangs.
+        budget = self._settings.timeout_secs
         try:
             for attempt in range(1, attempts + 1):
                 async with self._http.stream(
@@ -356,10 +388,17 @@ class AlephClient:
                 ) as resp:
                     if on_redirect is not None and resp.is_redirect:
                         return on_redirect(resp)
-                    if resp.status_code not in self._RETRY_STATUS or attempt == attempts:
+                    # A zero delay still retries; only an exhausted budget stops the loop.
+                    give_up = (
+                        resp.status_code not in self._RETRY_STATUS
+                        or attempt == attempts
+                        or budget <= 0
+                    )
+                    delay = 0.0 if give_up else min(_retry_delay(resp, attempt), budget)
+                    if give_up:
                         body = await self._read_bounded(resp, context=context, resource=resource)
                         break
-                    delay = _retry_delay(resp, attempt)
+                budget -= delay
                 await asyncio.sleep(delay)
         except ReadOnlyViolation as e:
             raise_read_only(e, context=context, resource=resource)
@@ -577,9 +616,10 @@ class AlephClient:
 
     async def entity_tags(self, *, entity_id: str) -> dict[str, Any]:
         _check_entity_id(entity_id)
-        return await self._request(
+        payload = await self._request(
             "GET", f"/api/2/entities/{entity_id}/tags", context="entity_tags"
         )
+        return _slim_tags(payload)
 
     async def match_entity(
         self,
@@ -623,9 +663,10 @@ class AlephClient:
 
     async def profile_tags(self, *, profile_id: str) -> dict[str, Any]:
         _check_entity_id(profile_id, field="profile_id")
-        return await self._request(
+        payload = await self._request(
             "GET", f"/api/2/profiles/{profile_id}/tags", context="profile_tags"
         )
+        return _slim_tags(payload)
 
     async def profile_similar(self, *, profile_id: str, limit: int = 20) -> dict[str, Any]:
         _check_entity_id(profile_id, field="profile_id")
@@ -884,11 +925,17 @@ def _page_params(limit: int, offset: int, *, cap: int) -> Query:
     return [("limit", str(limit)), ("offset", str(offset))]
 
 
+# Total time a single tool call may spend asleep between retries. The per-request httpx
+# timeout does not cover asyncio.sleep, so without this an upstream answering every
+# attempt with `Retry-After: 30` decides how long the caller's tool invocation hangs.
+MAX_RETRY_SLEEP_SECS = 30.0
+
+
 def _retry_delay(resp: httpx.Response, attempt: int) -> float:
     retry_after = resp.headers.get("Retry-After")
     if retry_after:
         try:
-            return min(60.0, max(0.0, float(retry_after)))
+            return min(MAX_RETRY_SLEEP_SECS, max(0.0, float(retry_after)))
         except ValueError:
             pass
-    return min(30.0, float(2 ** (attempt - 1)))
+    return min(MAX_RETRY_SLEEP_SECS, float(2 ** (attempt - 1)))
