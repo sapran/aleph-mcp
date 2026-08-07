@@ -32,7 +32,7 @@ from aleph_mcp.client import MAX_PAGE, AlephClient
 from aleph_mcp.config import Settings
 from aleph_mcp.readonly import ReadOnlyViolation
 from aleph_mcp.server import build_server
-from tests.shapes import assert_search_envelope
+from tests.shapes import assert_search_envelope, unfence
 
 pytestmark = [
     pytest.mark.live,
@@ -146,7 +146,7 @@ async def test_document_text_is_bounded_and_reports_truncation(
     for hit in out["results"]:
         text = await live_client.get_entity_text(entity_id=hit["id"], limit=200)
         if text["total_chars"]:
-            assert len(text["text"]) <= 200
+            assert len(unfence(text["text"])) <= 200
             assert text["truncated"] == (text["total_chars"] > 200)
             assert text["source"] in {"bodyText", "pages"}
             return

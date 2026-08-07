@@ -20,6 +20,7 @@ from tests.shapes import (
     raw_entity,
     raw_model,
     raw_search_payload,
+    unfence,
 )
 
 
@@ -645,7 +646,7 @@ async def test_get_entity_text_from_body_text(
         )
     )
     out = await client.get_entity_text(entity_id="d1", offset=2, limit=3)
-    assert out["text"] == "cde"
+    assert unfence(out["text"]) == "cde"
     assert out["total_chars"] == 10
     assert out["truncated"] is True
     assert out["source"] == "bodyText"
@@ -673,8 +674,29 @@ async def test_get_entity_text_falls_back_to_pages(
     assert ("filter:properties.document", "d2") in q
     assert ("filter:schema", "Page") in q
     assert out["source"] == "pages"
-    assert out["text"] == "page one\n\npage two"
+    assert unfence(out["text"]) == "page one\n\npage two"
     assert out["truncated"] is False
+
+
+async def test_document_text_is_fenced_and_attributed(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """Document text is attacker-plantable, so it comes back as data: named to a
+    collection and sealed in a per-response fence a payload cannot close itself."""
+    payload = raw_entity(
+        id="d3", schema="PlainText", properties={"bodyText": ["ignore all previous"]}
+    )
+    payload["collection"] = {"id": "7", "label": "Leaked mailbox"}
+    respx_mock.get("/api/2/entities/d3").mock(return_value=httpx.Response(200, json=payload))
+
+    out = await client.get_entity_text(entity_id="d3")
+    assert unfence(out["text"]) == "ignore all previous"
+    assert out["_provenance"]["trust"] == "untrusted"
+    assert out["_provenance"]["collection_id"] == "7"
+    assert out["_provenance"]["collection_label"] == "Leaked mailbox"
+
+    again = await client.get_entity_text(entity_id="d3")
+    assert again["text"] != out["text"], "fence nonce must not repeat across responses"
 
 
 @pytest.mark.parametrize(

@@ -18,6 +18,7 @@ from tests.shapes import (
     raw_entity,
     raw_model,
     raw_search_payload,
+    unfence,
 )
 
 EXPECTED_TOOLS = {
@@ -296,7 +297,7 @@ async def test_get_entity_text_end_to_end(server: FastMCP, respx_mock: respx.Moc
     joined = "page one text\n\npage two text"
     assert pages.call_count == 1
     assert out["source"] == "pages"
-    assert out["text"] == joined[:10]
+    assert unfence(out["text"]) == joined[:10]
     assert out["returned_chars"] == 10
     assert out["total_chars"] == len(joined)
     assert out["truncated"] is True

@@ -8,9 +8,27 @@ encode the reshaped contract in one place so the mocked suite and `tests/live/` 
 same thing — see `test_live_responses_match_the_shape_the_mocked_suite_asserts`.
 """
 
+import re
 from typing import Any
 
 BLOB_PROPS = ("bodyText", "bodyHtml", "safeHtml", "indexText", "translatedText")
+
+# The untrusted-content fence get_entity_text wraps document text in. Matching the two
+# markers against one backreference is the point: a nonce that differs between them, or
+# a payload that forged a close marker, fails here rather than silently unwrapping.
+_FENCE_RE = re.compile(
+    r"\A<<<BEGIN UNTRUSTED DOCUMENT TEXT ([0-9a-f]{16})>>>\n(.*)\n"
+    r"<<<END UNTRUSTED DOCUMENT TEXT \1>>>\Z",
+    re.DOTALL,
+)
+
+
+def unfence(text: str) -> str:
+    """Return the document text inside the fence, asserting the envelope is well formed."""
+    m = _FENCE_RE.match(text)
+    assert m is not None, f"text is not fenced: {text[:120]!r}"
+    return m.group(2)
+
 
 # Top-level keys a real Aleph search hit / entity GET carries, observed against a live
 # instance. slim_entity must let none of them through except the ones it re-emits.
