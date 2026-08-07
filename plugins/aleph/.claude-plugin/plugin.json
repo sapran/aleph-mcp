@@ -1,6 +1,6 @@
 {
   "name": "aleph",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Read-only MCP server over the OCCRP Aleph HTTP API — 17 search/pivot/read tools plus the aleph-entity-graph method skill.",
   "author": { "name": "Vlad Styran", "email": "sapran@gmail.com" },
   "homepage": "https://github.com/sapran/aleph-mcp",
