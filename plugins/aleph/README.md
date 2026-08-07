@@ -236,9 +236,14 @@ a copy, its entry is a `git-subdir` source:
     "source": "git-subdir",
     "url": "https://github.com/sapran/aleph-mcp.git",
     "path": "plugins/aleph",
-    "ref": "main"
+    "ref": "<commit-sha>"
   }
 }
 ```
+
+Pin `ref` to a release commit rather than `main`. It decides which copy of
+`plugins/aleph/.mcp.json` that catalog serves — and therefore which server commit the
+plugin installs and hands the Aleph key to. A mutable `ref` puts that choice in the hands
+of whoever can push to the default branch.
 
 Documentation only — no change is made to any other catalog by this repository.
