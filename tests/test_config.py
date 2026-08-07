@@ -40,6 +40,15 @@ def test_aleph_mcp_prefixed_aliases_work(monkeypatch: pytest.MonkeyPatch) -> Non
     assert (s.host, s.api_key.get_secret_value()) == ("https://other.test", "k2")
 
 
+def test_host_with_userinfo_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """httpx keeps userinfo on every request.url and renders it unmasked in str(), so a
+    password here would surface in any message that names the target."""
+    monkeypatch.setenv("ALEPHCLIENT_HOST", "https://svc:hunter2@aleph.test")
+    monkeypatch.setenv("ALEPHCLIENT_API_KEY", "k")
+    with pytest.raises(ValidationError, match="must not carry userinfo"):
+        Settings()  # type: ignore[call-arg]
+
+
 def test_the_keychain_miss_marker_is_refused_and_names_the_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -57,7 +57,8 @@ def raise_read_only(exc: ReadOnlyViolation, *, context: str, resource: bool = Fa
     raise err_cls(
         f"{context}: {exc}. Refused locally by the read-only allowlist; this request was not "
         "sent to Aleph. If the instance redirected the read — SSO, or a canonical-host "
-        "redirect — that is the likely cause rather than a write attempt."
+        "redirect — that is the likely cause rather than a write attempt. The target shown "
+        "is untrusted: on a redirect hop it comes from the upstream's Location header."
     ) from exc
 
 
@@ -104,10 +105,21 @@ def _upstream_detail(resp: httpx.Response, body: bytes | None) -> str:
     message = payload.get("message")
     if not isinstance(message, str) or not message.strip():
         return ""
-    # Collapsing whitespace is deliberate: it keeps a multi-line body from presenting as
-    # separate lines of server-authored text.
-    flat = _truncate(" ".join(message.split()), _MAX_UPSTREAM_CHARS)
-    return f' Aleph reported (untrusted upstream text): "{flat}"'
+    return f' Aleph reported (untrusted upstream text): "{_as_quoted_data(message)}"'
+
+
+def _as_quoted_data(text: str) -> str:
+    """Make upstream text safe to embed between quotes in a model-visible message.
+
+    The label is the only mitigation on this path, and a single double quote in the
+    payload closes the quoted region early — after which the rest reads as server-authored
+    guidance. So the delimiter is neutralised, and anything non-printable goes with it:
+    C0/C1 controls, ANSI escapes and bidi overrides all survive `str.split()`, which
+    collapses whitespace only, and MCP clients render tool errors into terminals.
+    """
+    printable = "".join(ch if ch.isprintable() else " " for ch in text)
+    # Collapsing whitespace keeps a multi-line body from presenting as separate lines.
+    return _truncate(" ".join(printable.split()).replace('"', "'"), _MAX_UPSTREAM_CHARS)
 
 
 def _truncate(s: str, n: int) -> str:

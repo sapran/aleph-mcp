@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import httpx
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -50,6 +51,13 @@ class Settings(BaseSettings):
         v = v.strip().rstrip("/")
         if not v.startswith(("http://", "https://")):
             raise ValueError("host must start with http:// or https://")
+        # httpx keeps userinfo on every request.url and renders it unmasked in str(), so a
+        # password embedded here would surface in any message that names the target.
+        if httpx.URL(v).userinfo:
+            raise ValueError(
+                "host must not carry userinfo (user:password@). Put the credential in "
+                "ALEPHCLIENT_API_KEY, or in the Keychain entry the plugin reads."
+            )
         # Tolerate someone exporting the API base rather than the site root.
         for suffix in ("/api/2", "/api"):
             if v.endswith(suffix):

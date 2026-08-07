@@ -163,6 +163,29 @@ async def test_the_default_port_is_the_same_origin_as_no_port() -> None:
     )
 
 
+async def test_a_refusal_does_not_echo_the_query_or_a_hostile_redirect_target() -> None:
+    """On a redirect hop the URL comes from the upstream's Location header, so the refusal
+    message is a channel into the model's context. It gets the same treatment as upstream
+    error text: bounded, control-characters replaced, and no query string."""
+    hook = read_only_hook("https://aleph.test")
+    hostile = "https://evil.example/" + "z" * 400 + "?q=analyst-search-term"
+    with pytest.raises(ReadOnlyViolation) as exc:
+        await hook(httpx.Request("GET", hostile))
+    message = str(exc.value)
+    assert "analyst-search-term" not in message
+    assert "…" in message
+    assert len(message) < 300
+
+
+async def test_a_refusal_never_prints_host_userinfo() -> None:
+    """httpx renders userinfo unmasked in str(), and config refuses such a host outright —
+    but the guard is reachable with a redirect target that carries one."""
+    hook = read_only_hook("https://aleph.test")
+    with pytest.raises(ReadOnlyViolation) as exc:
+        await hook(httpx.Request("GET", "https://svc:hunter2@evil.example/api/2/entities"))
+    assert "hunter2" not in str(exc.value)
+
+
 async def test_cross_host_redirect_is_blocked(
     client: AlephClient, respx_mock: respx.MockRouter
 ) -> None:
