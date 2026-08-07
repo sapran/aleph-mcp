@@ -81,3 +81,12 @@ def test_the_echoed_message_is_one_short_line() -> None:
     assert "\n" not in rendered
     assert rendered.endswith('…"')
     assert len(rendered) < 300
+
+
+def test_an_oversized_error_body_is_not_parsed() -> None:
+    """The transport ceiling cannot cover this path — the status is known before the body
+    is, so raise_for_status runs first. An error body worth quoting is never large."""
+    huge = {"message": "x", "padding": "z" * (64 * 1024)}
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(_json_resp(400, huge), context="ctx")
+    assert str(exc.value) == "ctx: bad request (400)."

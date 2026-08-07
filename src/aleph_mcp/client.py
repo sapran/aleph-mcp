@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json as jsonlib
 import re
 import secrets
 from collections.abc import Callable
@@ -31,10 +32,11 @@ MAX_EXPAND = 200
 # cap again what is copied back, because the two are set by different parties.
 MAX_FACET_SIZE = 200
 
-# A ceiling on what this server will decode into the model's context. It bounds the JSON
-# decode and everything downstream of it, not the transport buffer — httpx has already
-# read the body by then, and bounding that would mean streaming every request. The peer is
-# the operator's own pinned Aleph, so the buffer is not the interesting half.
+# A ceiling on the body this server will accept. Enforced while the response is streamed,
+# so it bounds the allocation rather than describing it after the fact — httpx decodes
+# Content-Encoding as it iterates, so a gzip bomb is refused at the same threshold as a
+# plain body. The error path has its own, much smaller bound in errors.py, because there
+# the status is known before the body is.
 MAX_RESPONSE_BYTES = 25 * 1024 * 1024
 
 # Properties that carry whole documents. Never worth spending context on inside a
@@ -345,28 +347,44 @@ class AlephClient:
         attempts = self._settings.max_retries
         query = httpx.QueryParams(params) if params else None
         resp: httpx.Response | None = None
+        body = b""
         follow = self._http.follow_redirects if follow_redirects is None else follow_redirects
         try:
             for attempt in range(1, attempts + 1):
-                resp = await self._http.request(
+                async with self._http.stream(
                     method, path, params=query, json=json, follow_redirects=follow
-                )
-                if on_redirect is not None and resp.is_redirect:
-                    return on_redirect(resp)
-                if resp.status_code not in self._RETRY_STATUS or attempt == attempts:
-                    break
-                await asyncio.sleep(_retry_delay(resp, attempt))
+                ) as resp:
+                    if on_redirect is not None and resp.is_redirect:
+                        return on_redirect(resp)
+                    if resp.status_code not in self._RETRY_STATUS or attempt == attempts:
+                        body = await self._read_bounded(resp, context=context, resource=resource)
+                        break
+                    delay = _retry_delay(resp, attempt)
+                await asyncio.sleep(delay)
         except ReadOnlyViolation as e:
             raise_read_only(e, context=context, resource=resource)
         assert resp is not None
-        raise_for_status(resp, context=context, resource=resource)
-        size = len(resp.content)
-        if size > MAX_RESPONSE_BYTES:
-            raise_too_large(size, MAX_RESPONSE_BYTES, context=context, resource=resource)
-        data: Any = resp.json()
+        raise_for_status(resp, context=context, resource=resource, body=body)
+        data: Any = jsonlib.loads(body)
         if not isinstance(data, dict):
             return {"results": data}
         return data
+
+    async def _read_bounded(self, resp: httpx.Response, *, context: str, resource: bool) -> bytes:
+        """Accumulate the body, refusing the moment the running total crosses the ceiling.
+
+        The refusal has to happen here rather than after the read: httpx content-decodes
+        as it iterates, so this is the only point at which a compressed body's expanded
+        size is knowable before it has all been allocated.
+        """
+        total = 0
+        chunks: list[bytes] = []
+        async for chunk in resp.aiter_bytes():
+            total += len(chunk)
+            if total > MAX_RESPONSE_BYTES:
+                raise_too_large(total, MAX_RESPONSE_BYTES, context=context, resource=resource)
+            chunks.append(chunk)
+        return b"".join(chunks)
 
     # -- collections -----------------------------------------------------------
 

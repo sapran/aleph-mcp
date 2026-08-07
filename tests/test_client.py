@@ -1,3 +1,4 @@
+import gzip
 from urllib.parse import parse_qsl, urlsplit
 
 import httpx
@@ -319,6 +320,26 @@ async def test_a_response_over_the_ceiling_is_refused_before_decoding(
     respx_mock.get("/api/2/collections").mock(
         return_value=httpx.Response(
             200, content=oversized, headers={"content-type": "application/json"}
+        )
+    )
+    with pytest.raises(ToolError, match=r"over the .* ceiling"):
+        await client.list_collections()
+
+
+async def test_a_compressed_body_is_refused_on_its_expanded_size(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The ceiling has to bound the allocation, not describe it afterwards. httpx decodes
+    Content-Encoding as the body is iterated, so a small transfer that expands past the
+    ceiling must be refused at the same threshold as a large one."""
+    payload = b'{"padding": "' + b"z" * (MAX_RESPONSE_BYTES + 1) + b'"}'
+    compressed = gzip.compress(payload)
+    assert len(compressed) < 1024 * 1024, "the point is that the wire transfer is small"
+    respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(
+            200,
+            content=compressed,
+            headers={"content-type": "application/json", "content-encoding": "gzip"},
         )
     )
     with pytest.raises(ToolError, match=r"over the .* ceiling"):

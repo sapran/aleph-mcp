@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import NoReturn
 
 import httpx
@@ -8,7 +9,9 @@ from fastmcp.exceptions import ResourceError, ToolError
 from .readonly import ReadOnlyViolation
 
 
-def raise_for_status(resp: httpx.Response, *, context: str, resource: bool = False) -> None:
+def raise_for_status(
+    resp: httpx.Response, *, context: str, resource: bool = False, body: bytes | None = None
+) -> None:
     """Convert non-2xx HTTP responses to MCP errors. No-op for 2xx.
 
     `context` is a short label (tool name or resource URI) included in the message so
@@ -19,7 +22,7 @@ def raise_for_status(resp: httpx.Response, *, context: str, resource: bool = Fal
         return
 
     err_cls = ResourceError if resource else ToolError
-    detail = _upstream_detail(resp)
+    detail = _upstream_detail(resp, body)
 
     if resp.status_code == 401:
         raise err_cls(
@@ -73,19 +76,27 @@ def raise_too_large(size: int, limit: int, *, context: str, resource: bool = Fal
 # shape below reaches the model at all.
 _MAX_UPSTREAM_CHARS = 200
 
+# An error body worth quoting is never large. Parsing before checking would let the error
+# path allocate without bound, which is the one path the transport ceiling cannot cover:
+# the status is known before the body is.
+_MAX_ERROR_BODY_BYTES = 64 * 1024
 
-def _upstream_detail(resp: httpx.Response) -> str:
+
+def _upstream_detail(resp: httpx.Response, body: bytes | None) -> str:
     """The `message` string from Aleph's JSON error body, labelled — or nothing.
 
     Everything else is dropped: an HTML page from a proxy in front of the instance, a
-    stack fragment, a 500-character blob. Echoing a raw body would hand whoever can shape
-    an error response a write primitive into the model's context, and would disclose
-    whatever internal detail the upstream put in it.
+    stack fragment, a body too big to be an error message. Echoing a raw body would hand
+    whoever can shape an error response a write primitive into the model's context, and
+    would disclose whatever internal detail the upstream put in it.
     """
     if "json" not in resp.headers.get("content-type", "").lower():
         return ""
+    raw = resp.content if body is None else body
+    if len(raw) > _MAX_ERROR_BODY_BYTES:
+        return ""
     try:
-        payload = resp.json()
+        payload = json.loads(raw)
     except ValueError:
         return ""
     if not isinstance(payload, dict):
