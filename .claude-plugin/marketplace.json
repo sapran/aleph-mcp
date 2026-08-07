@@ -12,7 +12,7 @@
     {
       "name": "aleph",
       "source": "./plugins/aleph",
-      "version": "0.1.2",
+      "version": "0.1.4",
       "description": "Read-only MCP server over the OCCRP Aleph HTTP API: 17 search/pivot/read tools, 3 resources, and the aleph-entity-graph method skill.",
       "category": "security",
       "keywords": ["aleph", "occrp", "osint", "followthemoney", "mcp", "investigation"],
