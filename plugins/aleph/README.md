@@ -61,45 +61,33 @@ Two variables, both required:
 Optional: `ALEPH_MCP_TIMEOUT_SECS` (default `60`), `ALEPH_MCP_MAX_RETRIES` (default `4`),
 `ALEPH_MCP_VERIFY_TLS` (default `true`; set `false` for a self-signed instance).
 
-**Never put them in `plugins/aleph/.mcp.json`.** That file is committed and shared, which is
-why it carries no `env` block at all.
+**Never put the key itself in `plugins/aleph/.mcp.json`.** That file is committed and
+shared. Its `env` block contains no secret: it forwards `$ALEPHCLIENT_HOST` from your
+environment, and looks the key up in the macOS login Keychain under a service name
+**keyed on that host**. The binding is the point — see "Why the Keychain entry is
+host-scoped" below.
 
-- **omp, all projects (recommended) — `~/.omp/.env`:**
+- **The plugin (macOS) — host in the environment, key in the Keychain.** Put the URL
+  wherever omp reads it, e.g. `~/.omp/.env` (then `chmod 600 ~/.omp/.env`):
 
   ```dotenv
   ALEPHCLIENT_HOST=https://aleph.example.org
-  ALEPHCLIENT_API_KEY=<key>
   ```
 
-  omp loads this into its own process environment at startup, and the MCP stdio child
-  inherits that environment, so no per-client `env` block is needed. Then
-  `chmod 600 ~/.omp/.env`.
+  and store the key against that exact host, as shown below. An `ALEPHCLIENT_API_KEY` in
+  a `.env` file or your shell rc is **not** used by the plugin: its `env` block always
+  supplies the key, and supplies a refusal marker when the Keychain holds no entry for
+  the host in play, so the server stops instead of starting against the wrong instance.
+  That is deliberate — see "Why the Keychain entry is host-scoped".
 
-- **omp, one project only — `<project>/.env`:** the same two lines. It wins over
-  `~/.omp/.env`. Full precedence, highest first: inherited process environment →
-  `<cwd>/.env` → `~/.omp/agent/.env` → `~/.omp/.env` → `~/.env`. A variable already present
-  in the process environment is never overwritten by any `.env` file.
+  omp's `.env` precedence, highest first, is: inherited process environment →
+  `<cwd>/.env` → `~/.omp/agent/.env` → `~/.omp/.env` → `~/.env`. A variable already
+  present in the process environment is never overwritten by any `.env` file.
 
-- **Any harness, including Claude Code and opencode — export in your shell rc**
-  (`~/.zshrc`), because only omp autoloads `.env`:
-
-  ```bash
-  export ALEPHCLIENT_HOST=https://aleph.example.org
-  export ALEPHCLIENT_API_KEY=<key>
-  ```
-
-  On macOS, keep the key out of every file by reading it from the login Keychain. This
-  works with all harnesses, and omp passes it down to the MCP child like any other
-  inherited variable:
-
-  ```bash
-  # security add-generic-password -s aleph-mcp -a "$USER" -w '<api-key>' -U
-  export ALEPHCLIENT_HOST="https://aleph.example.org"
-  export ALEPHCLIENT_API_KEY="$(security find-generic-password -s aleph-mcp -a "$USER" -w 2>/dev/null)"
-  ```
-
-  Alternatively add an `env` block to that client's own MCP entry — but then the literal
-  value sits in that client's config file.
+- **Not on macOS, or you keep the key in a file** — do not use the plugin's server entry.
+  Disable it and declare your own with an explicit `env` block, as under "Per-instance
+  override without touching the plugin" below. Both variables are then yours to place,
+  together, from a single source you control.
 
 - **Per-instance override without touching the plugin** — also the answer to "I have two
   Aleph instances". Declare a same-purpose server in `~/.omp/agent/mcp.json` with an
@@ -123,6 +111,35 @@ why it carries no `env` block at all.
   ```
 
   A config `env` block is an overlay on the inherited environment, not a replacement.
+
+### Storing the key
+
+```bash
+security add-generic-password -s "aleph-mcp:https://aleph.example.org" \
+  -a "$USER" -w '<api-key>' -U
+```
+
+The service name is `aleph-mcp:` followed by the host **exactly as `ALEPHCLIENT_HOST`
+is set** — same scheme, no trailing slash. A harness that is not the plugin reads it
+back the same way:
+
+```bash
+export ALEPHCLIENT_API_KEY="$(security find-generic-password \
+  -s "aleph-mcp:$ALEPHCLIENT_HOST" -a "$USER" -w 2>/dev/null)"
+```
+
+**Why the Keychain entry is host-scoped.** `ALEPHCLIENT_HOST` comes from the ambient
+environment, and `<cwd>/.env` outranks `~/.omp/.env` in the precedence above — so a
+`.env` arriving inside a cloned repository or an extracted archive can redirect the
+client to an origin the attacker chose. Nothing else would notice: the read-only guard
+pins whatever host it was configured with, so it would approve every request to the
+substituted origin. Keying the entry on the host means the substituted host finds no
+credential; the plugin then passes an explicit refusal marker rather than an empty
+value, because an empty one would let the child inherit your real key from the ambient
+environment instead. The server stops at startup and says which host it was pointed at.
+
+Upgrading from 0.1.4 or earlier: re-store the key under the new name, then
+`security delete-generic-password -s aleph-mcp -a "$USER"`.
 
 ## Verify
 

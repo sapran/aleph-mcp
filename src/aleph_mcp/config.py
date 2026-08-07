@@ -1,7 +1,14 @@
 from __future__ import annotations
 
-from pydantic import AliasChoices, Field, SecretStr, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# What the shipped plugin manifest emits when the login Keychain holds no entry for the
+# host it was told to talk to. It is a literal rather than an empty string on purpose: the
+# harness drops an `env` entry whose command prints nothing, which would let the child
+# inherit an ambient ALEPHCLIENT_API_KEY and attach the operator's real credential to a
+# host that some `.env` in the working directory chose. Failing closed is the whole point.
+KEYCHAIN_MISS = "aleph-mcp:keychain-miss"
 
 
 class Settings(BaseSettings):
@@ -48,3 +55,31 @@ class Settings(BaseSettings):
             if v.endswith(suffix):
                 v = v[: -len(suffix)]
         return v.rstrip("/")
+
+    @field_validator("api_key")
+    @classmethod
+    def _require_a_key(cls, v: SecretStr) -> SecretStr:
+        # An empty string is what a failed Keychain lookup yields, and pydantic would
+        # accept it as a present str. Refusing here turns a silent 401 on the first tool
+        # call into a startup error that names the cause.
+        if not v.get_secret_value().strip():
+            raise ValueError(
+                "api_key is empty. If the plugin reads it from the macOS Keychain, the "
+                "entry is keyed on the host: store it with "
+                '`security add-generic-password -s "aleph-mcp:$ALEPHCLIENT_HOST" '
+                "-a \"$USER\" -w '<api-key>' -U`."
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _refuse_a_credential_not_minted_for_this_host(self) -> Settings:
+        if self.api_key.get_secret_value() == KEYCHAIN_MISS:
+            raise ValueError(
+                f"no Keychain entry for {self.host}. The plugin binds the key to the host "
+                "it was issued for, so a host taken from the ambient environment cannot "
+                "borrow a credential minted for a different instance. Store it with "
+                f'`security add-generic-password -s "aleph-mcp:{self.host}" -a "$USER" '
+                "-w '<api-key>' -U`, and if the host is not the one you expected, check "
+                "for a .env in the current directory."
+            )
+        return self

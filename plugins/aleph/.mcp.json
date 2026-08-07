@@ -10,7 +10,7 @@
       ],
       "env": {
         "ALEPHCLIENT_HOST": "!printf %s \"$ALEPHCLIENT_HOST\"",
-        "ALEPHCLIENT_API_KEY": "!security find-generic-password -s aleph-mcp -a \"$USER\" -w 2>/dev/null || printf %s \"$ALEPHCLIENT_API_KEY\""
+        "ALEPHCLIENT_API_KEY": "!k=$(security find-generic-password -s \"aleph-mcp:$ALEPHCLIENT_HOST\" -a \"$USER\" -w 2>/dev/null); printf %s \"${k:-aleph-mcp:keychain-miss}\""
       }
     }
   }
