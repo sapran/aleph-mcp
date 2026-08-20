@@ -1,0 +1,31 @@
+version: 2
+
+updates:
+  # Keeps the full-SHA pins in .github/workflows/ci.yml current. Pinning to a SHA is
+  # what makes a third-party action immutable; without this the pins simply rot.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns: ["*"]
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      python-minor-patch:
+        update-types: ["minor", "patch"]
+    # A freshly published version is the one most likely to be a hijacked release, so
+    # let it age before adopting it. Cooldown applies to version updates only —
+    # Dependabot security updates are never delayed by it.
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    # Note for reviewers: httpx is deliberately bounded to <1 in pyproject.toml because
+    # the read-only guard is an httpx request event hook. A major bump is a security
+    # change, not a routine upgrade — see src/aleph_mcp/readonly.py.
