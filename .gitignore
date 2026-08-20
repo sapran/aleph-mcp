@@ -9,3 +9,13 @@ build/
 *.egg-info/
 .DS_Store
 .env
+
+# Never commit a variant of the credential file. `.env` above is an exact match
+# only, so `.env.local` and friends would otherwise be committable.
+.env.*
+!.env.example
+
+# Agent session state. `.remember/` currently relies on its own nested .gitignore
+# containing `*`; if that file is ever removed, session memory becomes committable.
+.remember/
+.claude/settings.local.json
