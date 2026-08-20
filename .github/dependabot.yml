@@ -19,6 +19,7 @@ updates:
       interval: "weekly"
     groups:
       python-minor-patch:
+        patterns: ["*"]
         update-types: ["minor", "patch"]
     # A freshly published version is the one most likely to be a hijacked release, so
     # let it age before adopting it. Cooldown applies to version updates only —
