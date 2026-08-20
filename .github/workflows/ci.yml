@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Start from nothing and grant only what a step needs. Each job re-adds its own.
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both are advertised in the pyproject classifiers, so both are proven here.
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      # Third-party actions are pinned to a full commit SHA, never a tag: a tag is
+      # mutable and this workflow runs on pull_request. Dependabot keeps the pins
+      # current — see .github/dependabot.yml.
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing here pushes; leaving the token in .git/config would only widen
+          # what a compromised dependency could reach.
+          persist-credentials: false
+
+      - name: Install uv and Python ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      # No ALEPHCLIENT_* secrets exist in this repository and none should be added.
+      # tests/live/ skips itself without ALEPH_MCP_LIVE_TESTS=1, so this runs the
+      # mocked suite only; the live suite stays a local, human-run activity against
+      # a real key.
+      - name: Tests
+        run: uv run --frozen pytest
+
+      - name: Lint
+        run: uv run --frozen ruff check .
+
+      - name: Format
+        run: uv run --frozen ruff format --check .
+
+      - name: Types
+        run: uv run --frozen mypy
