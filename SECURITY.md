@@ -27,8 +27,8 @@ There is no backport branch: a fix lands in a new release, so "supported" means 
 latest one. Use it.
 
 Every install path in this project pins a full commit SHA, which means an old, vulnerable
-tree stays installable forever. Two credential-handling defects were fixed before this
-repository was public, and both are the subject of published advisories:
+tree stays installable forever. Three releases closed security findings, each described in
+full in that release's notes:
 
 - **Before 0.1.4**, the Aleph API key could reach stderr. `Settings` rendered the
   assembled settings dictionary as the `input_value` of an unrelated missing-field error,
@@ -39,8 +39,13 @@ repository was public, and both are the subject of published advisories:
   ambient environment, so a `.env` arriving inside a cloned repository could point the
   client at an attacker-chosen origin with your real key attached.
 
-If you pinned a SHA at or before either point, move to the current release and re-store
-your Keychain entry under the host-scoped name.
+- **Before 0.1.6**, the response ceiling was applied only after the body had been
+  buffered and content-decoded, so a gzip-encoded response could expand unbounded before
+  the limit was consulted, and the error path was not bounded at all. The bundled skill
+  also documented a raw-`curl` fallback that stepped around the read-only guard.
+
+If you pinned a SHA at or before any of those points, move to the latest release. For the
+pre-0.1.5 case also re-store your Keychain entry under the host-scoped name.
 
 ## What this project treats as a security boundary
 

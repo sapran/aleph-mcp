@@ -27,6 +27,8 @@ updates:
     cooldown:
       default-days: 7
       semver-major-days: 14
-    # Note for reviewers: httpx is deliberately bounded to <1 in pyproject.toml because
-    # the read-only guard is an httpx request event hook. A major bump is a security
-    # change, not a routine upgrade — see src/aleph_mcp/readonly.py.
+    # Reviewer instruction, not a control this file enforces: `update-types` above limits
+    # what gets *grouped*, so Dependabot can still open a standalone PR widening the
+    # httpx bound. httpx is pinned <1 in pyproject.toml because the read-only guard is an
+    # httpx request event hook, so treat any httpx major as a security change needing the
+    # guard re-verified — never as a routine upgrade. See src/aleph_mcp/readonly.py.
