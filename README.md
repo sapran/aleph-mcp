@@ -48,7 +48,8 @@ uv sync --all-extras
 | `ALEPH_MCP_VERIFY_TLS` | no | `true` | Set `false` for a self-signed instance. |
 
 `ALEPHCLIENT_HOST` / `ALEPHCLIENT_API_KEY` are deliberately the same names upstream
-`alephclient` and `aleph-coldbackup` read, so one exported key serves all three.
+[`alephclient`](https://github.com/alephdata/alephclient) reads, so one exported key
+serves both it and this server.
 
 Missing required variables cause exit code 2 with a message on stderr, visible in the MCP
 client's logs.
@@ -237,7 +238,7 @@ allowlist in `src/aleph_mcp/readonly.py`, not the agent harness's tool permissio
 [why read-only is enforced outside the agent](#why-read-only-and-why-it-is-enforced-outside-the-agent).
 
 **Use the latest release.** Every install path here pins a commit SHA, so an old tree stays
-installable forever, and credential-handling defects were fixed at 0.1.4, 0.1.5 and 0.1.6.
+installable forever, and security defects were fixed at 0.1.4, 0.1.5 and 0.1.6.
 To report a vulnerability, and for what is in and out of scope, see
 [`SECURITY.md`](SECURITY.md).
 

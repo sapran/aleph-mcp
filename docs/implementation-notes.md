@@ -13,6 +13,22 @@ this file when it becomes a spec requirement or is fixed — not when someone re
   ambient `ALEPHCLIENT_API_KEY`. Non-macOS users are directed to declare their own server
   entry instead.
 
+- **References to non-public siblings survive outside the README.** The open-source
+  readiness branch removed the dead `../aleph-coldbackup` / `../datashare-mcp` links from
+  `README.md`, but the same tool is still named in `src/aleph_mcp/server.py:50` (server
+  instructions, so a model sees it), `src/aleph_mcp/config.py:19` (comment) and
+  `plugins/aleph/skills/aleph-entity-graph/SKILL.md:62`. Parked because that branch was
+  scoped to licensing, docs and CI with no `src/` changes, and `tests/test_tools.py`
+  asserts on the instructions string. Decide before publication whether a public reader
+  being pointed at a private tool is acceptable.
+
+- **`openspec/config.yaml` declares a private remote.** The `acordia` reference points at
+  `https://github.com/sapran/acordia-agents.git`, which is private; `acordia` is also
+  named across the specs, the archived changes, `plugins/aleph/README.md` and this file.
+  On publication `openspec doctor` or a register attempt hits a 404 on a repo the
+  contributor cannot see. Parked: the declaration is deliberate and documented above, so
+  removing it is a design decision, not a cleanup.
+
 Retired since the last prune:
 
 - The version being written in three places with nothing checking they agree — which shipped

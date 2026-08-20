@@ -12,8 +12,12 @@ indent_size = 4
 # Matches [tool.ruff] line-length in pyproject.toml.
 max_line_length = 100
 
-[*.{yml,yaml,json,toml}]
+[*.{yml,yaml,json}]
 indent_size = 2
+
+[*.toml]
+# pyproject.toml is indented with four spaces.
+indent_size = 4
 
 [*.md]
 # Two trailing spaces are a hard line break in Markdown.

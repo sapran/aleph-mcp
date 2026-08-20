@@ -12,21 +12,66 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Third-party actions are pinned to a full commit SHA, never a tag: a tag is mutable and
+# this workflow runs on pull_request. Dependabot keeps the pins current — see
+# .github/dependabot.yml. The uv binary is pinned for the same reason; Dependabot does
+# not track an action's inputs, so that one is bumped by hand.
+#
+# Every uv invocation uses --locked, not --frozen: --frozen runs against whatever uv.lock
+# says without checking it still matches pyproject.toml, so a dependency added or bumped
+# without re-locking would go green having tested the old dependency set. --locked fails
+# instead. uv.lock is the only thing pinning transitive versions here.
+
 jobs:
-  check:
+  lint:
+    # Not matrixed on purpose. ruff pins target-version = "py312" and mypy pins
+    # python_version = "3.12", so a second Python leg would re-run identical work and
+    # imply a 3.13 type-check that the pyproject pin guarantees is not happening.
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.5"
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Lint
+        run: uv run --locked ruff check .
+
+      - name: Format
+        run: uv run --locked ruff format --check .
+
+      - name: Types
+        run: uv run --locked mypy
+
+  test:
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         # Both are advertised in the pyproject classifiers, so both are proven here.
         python-version: ["3.12", "3.13"]
+        include:
+          # The plugin credential lookup is a macOS Keychain call, and
+          # test_a_keychain_miss_yields_the_marker_and_never_the_ambient_key is the
+          # tripwire on it. On Linux `security` is simply absent, so the miss comes from
+          # command-not-found rather than from a real Keychain miss and the test passes
+          # without exercising the mechanism. One macOS leg makes it mean something.
+          - os: macos-latest
+            python-version: "3.13"
 
     steps:
-      # Third-party actions are pinned to a full commit SHA, never a tag: a tag is
-      # mutable and this workflow runs on pull_request. Dependabot keeps the pins
-      # current — see .github/dependabot.yml.
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -37,6 +82,7 @@ jobs:
       - name: Install uv and Python ${{ matrix.python-version }}
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
+          version: "0.12.5"
           python-version: ${{ matrix.python-version }}
           enable-cache: true
 
@@ -45,13 +91,42 @@ jobs:
       # mocked suite only; the live suite stays a local, human-run activity against
       # a real key.
       - name: Tests
-        run: uv run --frozen pytest
+        run: uv run --locked pytest
 
-      - name: Lint
-        run: uv run --frozen ruff check .
+  build:
+    # The only release path is a source build on the user's machine
+    # (uvx --from git+…@<sha>), so the build backend has to be exercised somewhere.
+    # PEP 639 metadata is the specific trap: hatchling below 1.27 builds successfully
+    # but silently emits Metadata-Version 2.3 with a legacy free-text License and no
+    # License-File, which — with the OSI classifier removed — would ship a package
+    # advertising no licence at all. These assertions fail instead.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Format
-        run: uv run --frozen ruff format --check .
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.5"
+          python-version: "3.12"
+          enable-cache: true
 
-      - name: Types
-        run: uv run --frozen mypy
+      - name: Build the wheel and sdist
+        run: uv build
+
+      - name: The licence must actually ship, not merely be declared
+        run: |
+          set -euo pipefail
+          wheel=$(ls dist/*.whl)
+          meta=$(unzip -p "$wheel" '*/METADATA')
+          grep -qx 'Metadata-Version: 2.4' <<<"$meta" || grep -qx 'Metadata-Version: 2.5' <<<"$meta"
+          grep -qx 'License-Expression: MIT' <<<"$meta"
+          grep -qx 'License-File: LICENSE' <<<"$meta"
+          unzip -l "$wheel" | grep -q 'licenses/LICENSE'
+          tar tzf dist/*.tar.gz | grep -q '/LICENSE$'
+          echo "licence expression, header and file all present"
