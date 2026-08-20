@@ -4,9 +4,6 @@ A **read-only** [MCP](https://modelcontextprotocol.io) server over the
 [Aleph](https://github.com/alephdata/aleph) HTTP API, so an LLM agent can search,
 pivot and read an investigative dataset without being able to change it.
 
-Sibling tools: [`aleph-coldbackup`](../aleph-coldbackup) (bulk export of a collection)
-and [`datashare-mcp`](../datashare-mcp) (the same idea for ICIJ Datashare).
-
 ## Why read-only, and why it is enforced outside the agent
 
 Aleph's write surface is destructive: `DELETE /api/2/collections/<id>` removes an entire
@@ -24,8 +21,8 @@ credential:
 Known cost of that choice: `GET /api/2/collections/<id>/_stream` requires **WRITE**
 (`aleph/views/stream_api.py`), so a read-only key cannot bulk-export. This server is built
 around that constraint — it is facet-first, so the agent narrows a result set instead of
-trying to page through it. For genuine bulk export use `aleph-coldbackup` with a
-write-scoped key, run by a human.
+trying to page through it. For genuine bulk export use a write-scoped tool run by a
+human — deliberately not this server.
 
 ## Install
 
@@ -207,7 +204,7 @@ uv run ruff check .
 uv run mypy
 ```
 
-250 unit tests mock all HTTP with `respx`. The 31 tests under `tests/live/` hit a real
+277 unit tests mock all HTTP with `respx`. The 31 tests under `tests/live/` hit a real
 instance and are skipped unless `ALEPH_MCP_LIVE_TESTS=1`:
 
 ```bash
@@ -233,6 +230,16 @@ skips — loudly, naming the missing data — when the instance holds nothing of
 needs, so an empty instance cannot pass for coverage; set `ALEPH_MCP_LIVE_STRICT=1`
 against an instance you know is seeded and those skips become failures instead.
 
+## Security
+
+The security boundary is the read-scoped Aleph credential plus the outgoing-request
+allowlist in `src/aleph_mcp/readonly.py`, not the agent harness's tool permissions — see
+[why read-only is enforced outside the agent](#why-read-only-and-why-it-is-enforced-outside-the-agent).
+
+**Use 0.1.5 or later.** Every install path here pins a commit SHA, so older trees stay
+installable, and two credential-handling defects were fixed at 0.1.4 and 0.1.5. To report
+a vulnerability, and for what is in and out of scope, see [`SECURITY.md`](SECURITY.md).
+
 ## License
 
-MIT
+MIT — see [`LICENSE`](LICENSE).
