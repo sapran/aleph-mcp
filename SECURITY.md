@@ -10,8 +10,8 @@ real Aleph API key or any excerpt of a real collection's content in the report. 
 description of the request and the response shape is enough; if a proof of concept needs
 data, use a local instance with synthetic entities.
 
-Expect an acknowledgement within seven days. This is a single-maintainer project, so a fix
-may take longer than an acknowledgement — you will be told which is happening.
+This is a single-maintainer project. Reports are acknowledged as soon as they are seen,
+and you will be told whether a fix is in progress rather than left waiting silently.
 
 [report]: https://github.com/sapran/aleph-mcp/security/advisories/new
 
@@ -19,9 +19,12 @@ may take longer than an acknowledgement — you will be told which is happening.
 
 | Version | Supported |
 | --- | --- |
-| 0.1.6 and later | Yes |
-| 0.1.5 | Security fixes only |
-| Below 0.1.5 | **No — known vulnerable, do not use** |
+| Latest release | Yes |
+| 0.1.5 | No — 0.1.6 closed further security findings |
+| Below 0.1.5 | **No — known credential defects, do not use** |
+
+There is no backport branch: a fix lands in a new release, so "supported" means the
+latest one. Use it.
 
 Every install path in this project pins a full commit SHA, which means an old, vulnerable
 tree stays installable forever. Two credential-handling defects were fixed before this

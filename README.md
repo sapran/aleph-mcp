@@ -236,9 +236,10 @@ The security boundary is the read-scoped Aleph credential plus the outgoing-requ
 allowlist in `src/aleph_mcp/readonly.py`, not the agent harness's tool permissions — see
 [why read-only is enforced outside the agent](#why-read-only-and-why-it-is-enforced-outside-the-agent).
 
-**Use 0.1.5 or later.** Every install path here pins a commit SHA, so older trees stay
-installable, and two credential-handling defects were fixed at 0.1.4 and 0.1.5. To report
-a vulnerability, and for what is in and out of scope, see [`SECURITY.md`](SECURITY.md).
+**Use the latest release.** Every install path here pins a commit SHA, so an old tree stays
+installable forever, and credential-handling defects were fixed at 0.1.4, 0.1.5 and 0.1.6.
+To report a vulnerability, and for what is in and out of scope, see
+[`SECURITY.md`](SECURITY.md).
 
 ## License
 
