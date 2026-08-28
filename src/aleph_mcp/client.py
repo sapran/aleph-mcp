@@ -45,6 +45,13 @@ _TEXT_BLOB_PROPS = frozenset({"bodyText", "bodyHtml", "safeHtml", "indexText", "
 
 _MAX_VALUE_CHARS = 500
 
+# The number of values kept per property. `_MAX_VALUE_CHARS` bounds how long ONE value may
+# be and nothing bounded how MANY there were, which is the axis Aleph's NER fills: an email
+# from a long thread carries `namesMentioned`, `emailMentioned` and `phoneMentioned` lists
+# running to hundreds of entries. Same shape as MAX_FACET_SIZE, and the overflow is reported
+# in `_omitted_values` rather than dropped silently, so a caller can see the list was cut.
+MAX_PROPERTY_VALUES = 25
+
 # Document text is third-party content: anyone able to get a file ingested into a
 # readable collection controls it. It is returned inside a nonce-delimited fence so a
 # payload cannot forge the end marker and pass itself off as server-authored context.
@@ -141,22 +148,62 @@ def _collection_id(entity: dict[str, Any]) -> str | None:
     return None
 
 
+def _slim_value(value: Any, schemata: dict[str, Any] | None) -> Any:
+    """Bound one property value: strings by length, nested entities to an identity stub.
+
+    Anything else — a number, a bool, None — is already small and is passed through as it
+    came, which is what the scalar-passthrough contract in the tests depends on.
+    """
+    if isinstance(value, str):
+        return _truncate(value)
+    if isinstance(value, dict):
+        return _stub_entity(value, schemata)
+    return value
+
+
+def _stub_entity(value: dict[str, Any], schemata: dict[str, Any] | None) -> dict[str, Any]:
+    """Reduce an entity-valued property to the identity a caller can act on.
+
+    Aleph serialises these in full — its own `properties`, `links` block of four absolute
+    URLs, both timestamps and the `mutable`/`writeable`/`score` housekeeping — so a single
+    `parent` Folder costs ~800 characters to say a file lives in a folder. Only `id` can be
+    followed (`get_entity`, or `filters={"id": ...}`), and `schema`/`caption` are what make
+    it recognisable; everything else is reachable from the id when it is actually wanted.
+
+    Recursion is deliberately not used. A stub has no nested entities left in it, so one
+    level is the fixed point, and a hostile or merely deep payload cannot drive the depth.
+    """
+    return {
+        "id": value.get("id"),
+        "schema": value.get("schema"),
+        "caption": derive_caption(value, schemata),
+    }
+
+
 def slim_entity(entity: dict[str, Any], schemata: dict[str, Any] | None = None) -> dict[str, Any]:
     """Strip an entity down to what is worth putting in a model's context.
 
-    Drops document-sized text properties and truncates long values, keeping the
-    identity, schema, collection and highlights intact so the model can decide what
-    to fetch in full.
+    Drops document-sized text properties, reduces entity-valued properties to identity
+    stubs, truncates long values and bounds long value lists, keeping the identity, schema,
+    collection and highlights intact so the model can decide what to fetch in full.
     """
     props: dict[str, Any] = {}
     dropped: list[str] = []
+    omitted_values: dict[str, int] = {}
     for name, values in (entity.get("properties") or {}).items():
         if name in _TEXT_BLOB_PROPS:
             dropped.append(name)
             continue
         if isinstance(values, list):
-            props[name] = [_truncate(v) if isinstance(v, str) else v for v in values]
+            if len(values) > MAX_PROPERTY_VALUES:
+                omitted_values[name] = len(values) - MAX_PROPERTY_VALUES
+            props[name] = [_slim_value(v, schemata) for v in values[:MAX_PROPERTY_VALUES]]
         else:
+            # Scalar values are passed through as they came — the pre-existing contract,
+            # covered by test_slim_entity_keeps_a_scalar_property_value. Aleph serialises
+            # properties as lists, so the bloat this function exists to bound always
+            # arrives above; narrowing the scalar path would change behaviour no measured
+            # payload exercises.
             props[name] = values
 
     slim: dict[str, Any] = {
@@ -171,6 +218,8 @@ def slim_entity(entity: dict[str, Any], schemata: dict[str, Any] | None = None) 
             slim[optional] = entity[optional]
     if dropped:
         slim["_omitted_properties"] = sorted(dropped)
+    if omitted_values:
+        slim["_omitted_values"] = omitted_values
     return slim
 
 

@@ -11,6 +11,7 @@ from aleph_mcp.client import (
     MAX_EXPAND,
     MAX_FACET_SIZE,
     MAX_PAGE,
+    MAX_PROPERTY_VALUES,
     MAX_RESPONSE_BYTES,
     MAX_RETRY_SLEEP_SECS,
     AlephClient,
@@ -72,6 +73,49 @@ def test_slim_entity_keeps_a_scalar_property_value() -> None:
     """Truncation applies per list item; a scalar value is passed through as it came."""
     out = slim_entity(raw_entity(properties={"summary": "z" * 2000}))
     assert out["properties"]["summary"] == "z" * 2000
+
+
+def test_slim_entity_reduces_a_nested_entity_property_to_a_stub() -> None:
+    """Aleph serialises entity-valued properties as WHOLE nested entities, links and all.
+
+    Measured on the live gdx gateway 2026-08-28: one `PlainText` search hit spent ~800 of its
+    characters on a single `parent` Folder — four absolute URLs, two timestamps and three
+    housekeeping flags — to say the file sits in a folder named "files". Six searches put
+    671,544 characters of tool result into one leg's prompt and drove it to 428,885 tokens
+    against a 212,144 budget. The identity is all a model can act on; get_entity fetches the
+    rest deliberately, which is the same bargain _TEXT_BLOB_PROPS already strikes.
+    """
+    nested = {
+        "id": "14384680.08014cd",
+        "schema": "Folder",
+        "caption": None,
+        "properties": {"fileName": ["files"], "bodyText": ["x" * 4000]},
+        "created_at": "2026-03-12T14:24:00.828949",
+        "updated_at": "2026-03-12T14:24:00.828957",
+        "mutable": False,
+        "writeable": True,
+        "score": 1,
+        "links": {
+            "self": "https://aleph.example/api/2/entities/14384680.08014cd",
+            "expand": "https://aleph.example/api/2/entities/14384680.08014cd/expand",
+            "tags": "https://aleph.example/api/2/entities/14384680.08014cd/tags",
+            "ui": "https://aleph.example/entities/14384680.08014cd",
+        },
+    }
+    out = slim_entity(raw_entity(properties={"parent": [nested], "name": ["Jane"]}))
+
+    stub = out["properties"]["parent"][0]
+    assert stub == {"id": "14384680.08014cd", "schema": "Folder", "caption": "files"}
+    assert "bodyText" not in str(stub)
+    assert out["properties"]["name"] == ["Jane"]
+
+
+def test_slim_entity_bounds_a_long_property_value_list() -> None:
+    """NER fills `*Mentioned` lists without limit; bound them the way facets are bounded."""
+    out = slim_entity(raw_entity(properties={"namesMentioned": [f"n{i}" for i in range(500)]}))
+    values = out["properties"]["namesMentioned"]
+    assert len(values) == MAX_PROPERTY_VALUES
+    assert out["_omitted_values"] == {"namesMentioned": 500 - MAX_PROPERTY_VALUES}
 
 
 # -- auth / transport ----------------------------------------------------------
