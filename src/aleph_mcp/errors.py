@@ -94,9 +94,36 @@ def raise_unreachable(
     ) from exc
 
 
+class ResponseTooLarge(Exception):
+    """Marker mixed into the ceiling refusal so a caller can catch it by type instead of
+    matching message text. `search_entities` re-asks with a smaller page on this.
+
+    Deliberately carries no data. The crossing size was tried, so that a first shrink could
+    aim proportionally at the ceiling instead of halving — but `_read_bounded` refuses at the
+    chunk that crosses, so the reported size is always within a fraction of a percent of the
+    ceiling however large the real body is. Measured: a body ten times over reported 1.0025x,
+    making the aim a fixed 0.798 of the page. The attributes were inert, so they are gone,
+    and with them the local `raise_too_large` needed to attach them — a local in the raising
+    frame is kept alive by the exception's own traceback, which made every refusal a
+    reference cycle the collector had to reach.
+    """
+
+
+class TooLargeToolError(ToolError, ResponseTooLarge):
+    """The ceiling refusal on a tool call."""
+
+
+class TooLargeResourceError(ResourceError, ResponseTooLarge):
+    """The ceiling refusal on a resource read."""
+
+
 def raise_too_large(size: int, limit: int, *, context: str, resource: bool = False) -> NoReturn:
-    """Refuse an upstream response too big to decode into the model's context."""
-    err_cls = ResourceError if resource else ToolError
+    """Refuse an upstream response too big to decode into the model's context.
+
+    The message is unchanged from when this refusal was untyped: it is what a model reads,
+    and tests match on it.
+    """
+    err_cls = TooLargeResourceError if resource else TooLargeToolError
     raise err_cls(
         f"{context}: upstream response is {size} bytes, over the {limit}-byte ceiling this "
         "server decodes. Narrow the request — fewer facets, a smaller facet_size, a shorter "

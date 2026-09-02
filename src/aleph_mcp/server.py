@@ -122,6 +122,13 @@ def build_server(settings: Settings) -> tuple[FastMCP, AlephClient]:
           too broad, so filter and facet again rather than asking for every bucket.
         - `highlight`: return matching snippets; only meaningful together with `q`.
 
+        A page whose response would exceed the server's size ceiling is served smaller
+        rather than failed: the reply then carries `truncated: true` and
+        `continue_from_offset`, and `limit` reports the page actually served. `total` is
+        unaffected, so resume by calling again with that offset. Those two keys are absent
+        when the reduced page returned no rows — resuming would repeat the same call, so
+        narrow the query instead; the `_note` says which.
+
         Document-sized text properties are stripped from results — use get_entity_text.
         """
         try:
