@@ -39,9 +39,22 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("ALEPHCLIENT_API_KEY", "ALEPH_API_KEY", "ALEPH_MCP_API_KEY"),
         description="Aleph API key. Use a role with READ-only collection access.",
     )
-    timeout_secs: float = Field(60, ge=1, description="Per-request HTTP timeout.")
+    timeout_secs: float = Field(
+        60,
+        ge=1,
+        description=(
+            "Per-request HTTP timeout, and the total budget one call may spend retrying. "
+            "Connecting is capped separately at MAX_CONNECT_SECS."
+        ),
+    )
     max_retries: int = Field(
-        4, ge=1, le=10, description="Attempts per request for 429/5xx responses."
+        4,
+        ge=1,
+        le=10,
+        description=(
+            "Attempts per request on 429/5xx responses (honouring Retry-After) and on a "
+            "connection failure. The backoff between them is drawn from timeout_secs."
+        ),
     )
     verify_tls: bool = Field(True, description="Verify TLS certs (set false for self-signed).")
 

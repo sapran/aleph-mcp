@@ -62,6 +62,38 @@ def raise_read_only(exc: ReadOnlyViolation, *, context: str, resource: bool = Fa
     ) from exc
 
 
+def raise_unreachable(
+    exc: Exception, *, context: str, attempts: int, resource: bool = False
+) -> NoReturn:
+    """Surface an exhausted connection retry as the MCP error for this call site.
+
+    The attempt count is in the message on purpose. Without it a caller cannot tell one
+    unlucky connect from an instance that is down, so it retries by hand — which is the
+    behaviour the retry loop exists to remove.
+
+    The transport text is labelled untrusted as well as sanitised. `_as_quoted_data` calls
+    the label the mitigation on this path, so the two halves belong together even though no
+    attacker-authored string is known to reach here: every message in this file that embeds
+    foreign text carries one, and the next call site inherits whichever pattern it copies.
+    """
+    err_cls = ResourceError if resource else ToolError
+    detail = _as_quoted_data(str(exc))
+    # A ConnectTimeout carries no message at all — anyio raises a bare TimeoutError — so an
+    # unconditional parenthetical renders as empty quotes and reads as a broken message.
+    reported = (
+        f'{type(exc).__name__}, untrusted transport text: "{detail}"'
+        if detail
+        else type(exc).__name__
+    )
+    raise err_cls(
+        f"{context}: could not reach Aleph after {attempts} "
+        f"attempt{'' if attempts == 1 else 's'} ({reported}). No response was received. "
+        "This server issues only read requests, so no retry can have changed anything "
+        "upstream. Check the host is reachable and the network path is up; retrying "
+        "immediately will not help."
+    ) from exc
+
+
 def raise_too_large(size: int, limit: int, *, context: str, resource: bool = False) -> NoReturn:
     """Refuse an upstream response too big to decode into the model's context."""
     err_cls = ResourceError if resource else ToolError
