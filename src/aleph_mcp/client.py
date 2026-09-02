@@ -11,7 +11,13 @@ from typing import Any, Literal
 import httpx
 
 from .config import Settings
-from .errors import raise_for_status, raise_read_only, raise_too_large, raise_unreachable
+from .errors import (
+    ResponseTooLarge,
+    raise_for_status,
+    raise_read_only,
+    raise_too_large,
+    raise_unreachable,
+)
 from .readonly import ReadOnlyViolation, read_only_hook
 
 # Indirected so a test can advance a fake clock across an attempt. The retry budget is
@@ -43,6 +49,15 @@ MAX_FACET_SIZE = 200
 # plain body. The error path has its own, much smaller bound in errors.py, because there
 # the status is known before the body is.
 MAX_RESPONSE_BYTES = 25 * 1024 * 1024
+
+# How many times search_entities may re-ask with a smaller page after crossing the ceiling.
+# Each hop is a whole extra request against Aleph and buffers up to the ceiling again, so
+# this is deliberately small: the goal is a usable partial page, not a binary search for the
+# largest one that fits. Halving each time, this rescues a body up to 8x over the ceiling —
+# but only where the row slice is what makes it big. A body dominated by the facet block
+# does not shrink with `limit` at all, so those calls spend every hop and still fail; the
+# deadline in search_entities is what bounds that case, not this count.
+MAX_SEARCH_SHRINKS = 3
 
 # The connect phase gets its own, much shorter ceiling than the rest of the request. A
 # handshake that takes a minute will not produce a useful answer, and the retry loop has
@@ -456,6 +471,18 @@ class AlephClient:
         async for chunk in resp.aiter_bytes():
             total += len(chunk)
             if total > MAX_RESPONSE_BYTES:
+                # Drop both buffers before raising. The exception's traceback keeps this
+                # frame alive for as long as the exception lives, and `search_entities` can
+                # reach this point MAX_SEARCH_SHRINKS + 1 times in one call. Measured
+                # without the clear: 106 MiB of real resident growth for a 25 MiB ceiling,
+                # 4.16x.
+                #
+                # `chunk` matters as much as `chunks` and is easy to miss. For a
+                # `Content-Encoding: gzip` body the ceiling is crossed on the first decoded
+                # chunk, so the list is empty and `chunk` is the whole of it — and httpx
+                # decodes with no `max_length`, so it is the one buffer nothing bounds.
+                chunks.clear()
+                chunk = b""
                 raise_too_large(total, MAX_RESPONSE_BYTES, context=context, resource=resource)
             chunks.append(chunk)
         return b"".join(chunks)
@@ -558,38 +585,106 @@ class AlephClient:
         # Default to the same value the Aleph UI uses for a general search.
         effective_schemata = None if schema else (schemata or DEFAULT_SCHEMATA)
 
-        params: Query = [("limit", str(limit)), ("offset", str(offset))]
-        if q:
-            params.append(("q", q))
-        if schema:
-            params.append(("filter:schema", schema))
-        if effective_schemata:
-            params.append(("filter:schemata", effective_schemata))
-        for key, value in (filters or {}).items():
-            for item in value if isinstance(value, list) else [value]:
-                params.append((f"filter:{key}", str(item)))
-        for facet in facets or []:
-            params.append(("facet", facet))
-            params.append((f"facet_size:{facet}", str(facet_size)))
-            params.append((f"facet_total:{facet}", "true"))
-        if highlight and q:
-            params.append(("highlight", "true"))
-            params.append(("highlight_count", "3"))
+        def page_params(page: int) -> Query:
+            params: Query = [("limit", str(page)), ("offset", str(offset))]
+            if q:
+                params.append(("q", q))
+            if schema:
+                params.append(("filter:schema", schema))
+            if effective_schemata:
+                params.append(("filter:schemata", effective_schemata))
+            for key, value in (filters or {}).items():
+                for item in value if isinstance(value, list) else [value]:
+                    params.append((f"filter:{key}", str(item)))
+            for facet in facets or []:
+                params.append(("facet", facet))
+                params.append((f"facet_size:{facet}", str(facet_size)))
+                params.append((f"facet_total:{facet}", "true"))
+            if highlight and q:
+                params.append(("highlight", "true"))
+                params.append(("highlight_count", "3"))
+            return params
 
-        payload = await self._request(
-            "GET", "/api/2/entities", context="search_entities", params=params
-        )
+        page = limit
+        payload: dict[str, Any] | None = None
+        # One tool call, one deadline. `_request` bounds each request on its own budget, but
+        # a shrink issues a whole fresh one: without this, four hops against a slow or
+        # 5xx-ing upstream multiply that budget by MAX_SEARCH_SHRINKS + 1, which is the same
+        # amplification the per-request budget exists to prevent, one level up.
+        deadline = _monotonic() + self._settings.timeout_secs
+        for shrink in range(MAX_SEARCH_SHRINKS + 1):
+            try:
+                payload = await self._request(
+                    "GET", "/api/2/entities", context="search_entities", params=page_params(page)
+                )
+                break
+            except ResponseTooLarge as e:
+                # A page of one is the floor: below it only the caller can narrow the query,
+                # and a facet-only search (limit=0) is oversized for a reason no page size
+                # fixes. Both re-raise the ceiling error, which already says what to do.
+                if page <= 1:
+                    raise
+                if shrink == MAX_SEARCH_SHRINKS or _monotonic() >= deadline:
+                    # Name the pages already tried. The bare message says "narrow the
+                    # request", which a model reads against its own limit and satisfies by
+                    # retrying at one row fewer — another four upstream requests of up to
+                    # the ceiling each, failing identically. Same reasoning as the attempt
+                    # count in raise_unreachable. Raised without binding a local, so the
+                    # frame holding the refused body is not kept alive by a cycle.
+                    raise type(e)(
+                        f"{e} Pages from {limit} down to {page} rows were all over the "
+                        f"ceiling, so only a page below {page} — or a narrower query — "
+                        "can fit."
+                    ) from e
+                page = _shrunk_page(page)
+        assert payload is not None  # the loop either bound it or raised
+
         result = _slim_result(payload, await self._schemata())
         result["searched"] = {"schema": schema} if schema else {"schemata": effective_schemata}
+        # The notes compose rather than overwrite: a shrunk page in a result set past the
+        # window is both truncated and unenumerated, and a caller needs to be told both.
+        notes: list[str] = []
+        returned = len(result["results"])
+        if page != limit and returned:
+            resume = offset + returned
+            # `limit` and `offset` report what was served rather than what Aleph echoed, so
+            # they agree with continue_from_offset on any instance.
+            result["limit"] = page
+            result["offset"] = offset
+            result["truncated"] = True
+            result["continue_from_offset"] = resume
+            notes.append(
+                f"TRUNCATED PAGE: {limit} rows would have exceeded the "
+                f"{MAX_RESPONSE_BYTES}-byte response ceiling, so the page was reduced to "
+                f"{page}. These {returned} results are complete and in rank order, and "
+                f"`total` is unaffected; call again with offset={resume} for the next slice."
+            )
+        elif page != limit:
+            # A shrink that served no rows has nothing to resume from: `offset + 0` is the
+            # offset just used, so a caller told to continue there repeats this exact call
+            # and pays the whole shrink loop again. No `truncated`, no
+            # `continue_from_offset` — an absent key is the honest signal — and the note
+            # says what actually has to change.
+            result["limit"] = page
+            result["offset"] = offset
+            notes.append(
+                f"EMPTY SLICE: {limit} rows would have exceeded the "
+                f"{MAX_RESPONSE_BYTES}-byte response ceiling and a page of {page} returned "
+                "no rows, so this offset yields nothing and calling again with it would "
+                "repeat this request. Narrow the query — the size is coming from something "
+                "other than the row count, most likely the facet block."
+            )
         total = result.get("total") or 0
         total_count = total.get("value") if isinstance(total, dict) else total
         if isinstance(total_count, int) and total_count > MAX_PAGE:
-            result["_note"] = (
+            notes.append(
                 f"At least {total_count} matches — Aleph caps the reported total, so treat "
                 f"this as a lower bound. Only the first {MAX_PAGE} are reachable at all, so "
                 "this result set is UNENUMERATED, not merely long. Narrow it with filters, "
                 "or facet on schema/collection_id/countries/dates and query each slice."
             )
+        if notes:
+            result["_note"] = " ".join(notes)
         return result
 
     async def get_entity(self, *, entity_id: str) -> dict[str, Any]:
@@ -950,6 +1045,29 @@ def _slim_entityset(s: dict[str, Any], *, full: bool = False) -> dict[str, Any]:
         out["role_id"] = s.get("role_id")
         out["collection_id"] = _collection_id(s)
     return out
+
+
+def _shrunk_page(page: int) -> int:
+    """The next, smaller page size to re-ask for after crossing the response ceiling.
+
+    Halves, from the first shrink. A proportional first aim was tried — the crossing size is
+    on the exception, so a body barely over ought to need a page barely smaller — but
+    `_read_bounded` refuses at the chunk that crosses, so that size is always within a
+    fraction of a percent of the ceiling however large the real body is. Measured: a body ten
+    times over the ceiling reported 1.0025x, making the aim a fixed 0.798 of the page, a
+    schedule of 0.8/0.4/0.2 that rescues bodies only up to 5x over. Halving rescues 8x for
+    the same number of requests, so the proportional branch cost accuracy and bought nothing.
+    A real proportional aim needs a real body size — `Content-Length`, when no
+    `Content-Encoding` is in play — and that is a different change.
+
+    The result is always at least 1 and strictly less than `page`, which is what stops the
+    loop spinning on an arithmetic edge. `min(…, page - 1)` is belt-and-braces and currently
+    slack, since `page // 2 < page` for every page that reaches here — so do not go looking
+    for the input that makes it bind. It is there so a future change to the aim cannot
+    reintroduce a non-terminating loop; the invariant, not the clamp, is what
+    `test_the_shrink_arithmetic_always_decreases` pins.
+    """
+    return max(1, min(page // 2, page - 1))
 
 
 def _page_params(limit: int, offset: int, *, cap: int) -> Query:

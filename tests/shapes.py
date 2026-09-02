@@ -61,7 +61,7 @@ SLIM_OPTIONAL = frozenset(
 # `searched` is search_entities' own addition and `_note`/`facets` are conditional, so the
 # shared envelope requires only what every _slim_result caller emits.
 ENVELOPE_REQUIRED = frozenset({"total", "limit", "offset", "results"})
-ENVELOPE_OPTIONAL = frozenset({"searched", "facets", "_note"})
+ENVELOPE_OPTIONAL = frozenset({"searched", "facets", "_note", "truncated", "continue_from_offset"})
 
 
 def raw_entity(

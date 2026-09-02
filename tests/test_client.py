@@ -1,5 +1,7 @@
 import asyncio
 import gzip
+from collections.abc import AsyncIterator, Callable
+from itertools import pairwise
 from urllib.parse import parse_qsl, urlsplit
 
 import httpx
@@ -14,7 +16,9 @@ from aleph_mcp.client import (
     MAX_PAGE,
     MAX_RESPONSE_BYTES,
     MAX_RETRY_SLEEP_SECS,
+    MAX_SEARCH_SHRINKS,
     AlephClient,
+    _shrunk_page,
     derive_caption,
     slim_entity,
 )
@@ -490,6 +494,78 @@ async def test_a_response_over_the_ceiling_is_refused_before_decoding(
         await client.list_collections()
 
 
+class _ChunkedOversizedStream(httpx.AsyncByteStream):
+    """Delivers a body over the ceiling in many chunks.
+
+    A single-chunk body is useless for this: `_read_bounded` crosses the ceiling on the
+    first iteration and raises before appending anything, so the frame's buffer is empty
+    whether or not it is cleared, and the guard below passes for the wrong reason.
+    Measured — the mutation deleting `chunks.clear()` stayed GREEN until the body was
+    streamed.
+    """
+
+    chunk = b"z" * (1024 * 1024)
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for _ in range((MAX_RESPONSE_BYTES // len(self.chunk)) + 1):
+            yield self.chunk
+
+
+@pytest.mark.parametrize("compressed", [False, True], ids=["chunked", "gzip"])
+async def test_a_refused_body_is_released_before_the_error_propagates(
+    client: AlephClient, respx_mock: respx.MockRouter, compressed: bool
+) -> None:
+    """The ceiling has to bound the allocation across retries, not only within one.
+
+    An exception's traceback keeps `_read_bounded`'s frame alive for as long as the
+    exception lives, so a buffer left in that frame is retained with it — and
+    `search_entities` can refuse up to `MAX_SEARCH_SHRINKS + 1` times in a single call.
+    Measured before the buffers were dropped at the raise: 106 MiB of real resident growth
+    against a 25 MiB ceiling, 4.16x. Asserting the frame is empty is the deterministic form
+    of that measurement.
+
+    Both cases are needed because they retain through different locals. Chunked: the
+    ceiling is crossed after many appends, so `chunks` holds the body and `chunk` is one
+    small piece. Gzip: httpx decodes with no `max_length`, so the ceiling is crossed on the
+    first decoded chunk — `chunks` is empty regardless and `chunk` is the whole body, which
+    is the buffer nothing else bounds.
+    """
+    if compressed:
+        raw = gzip.compress(b'{"padding": "' + b"z" * (MAX_RESPONSE_BYTES + 1) + b'"}')
+        assert len(raw) < 1024 * 1024, "the point is that the wire transfer is small"
+        response = httpx.Response(
+            200,
+            content=raw,
+            headers={"content-type": "application/json", "content-encoding": "gzip"},
+        )
+    else:
+        response = httpx.Response(
+            200,
+            stream=_ChunkedOversizedStream(),
+            headers={"content-type": "application/json"},
+        )
+    respx_mock.get("/api/2/collections").mock(return_value=response)
+
+    with pytest.raises(ToolError, match=r"over the .* ceiling") as excinfo:
+        await client.list_collections()
+
+    tb = excinfo.value.__traceback__
+    frames = []
+    while tb is not None:
+        if tb.tb_frame.f_code.co_name == "_read_bounded":
+            frames.append(tb.tb_frame.f_locals)
+        tb = tb.tb_next
+    assert frames, "the refusal must come from _read_bounded, or this proves nothing"
+    held = frames[0]
+    assert held.get("chunks") == [], (
+        f"the accumulated body must be dropped at the raise, held {len(held['chunks'])} chunks"
+    )
+    assert not held.get("chunk"), (
+        "the crossing chunk must be dropped too, held "
+        f"{len(held.get('chunk') or b'')} bytes — for a gzip body it is the whole of it"
+    )
+
+
 async def test_a_compressed_body_is_refused_on_its_expanded_size(
     client: AlephClient, respx_mock: respx.MockRouter
 ) -> None:
@@ -526,6 +602,222 @@ async def test_search_notes_unreachable_tail(
         return_value=httpx.Response(200, json={"results": [], "total": {"value": 50000}})
     )
     out = await client.search_entities(q="a")
+    assert "UNENUMERATED" in out["_note"]
+
+
+_OVERSIZED = b'{"padding": "' + b"z" * (MAX_RESPONSE_BYTES + 1) + b'"}'
+
+
+# A `limit` no page the client asks for can equal. `raw_search_payload` derives its echoed
+# `limit` from the row count, so it coincides exactly with the page served — and a test
+# asserting the served page then passes whether or not the client overwrites the echo.
+# Measured: the mutation deleting `result["limit"] = page` stayed GREEN until this landed.
+# A real instance echoes the limit it was asked for, and may clamp it to something else
+# again, so pinning a distinct value is also the more faithful fixture.
+_ECHOED_LIMIT = 4242
+
+
+def _too_big_above(page_ceiling: int) -> Callable[[httpx.Request], httpx.Response]:
+    """An upstream that answers any page above `page_ceiling` with a body over the size
+    ceiling — the shape of the real failure, where the row count decides the body size."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        asked = int(request.url.params["limit"])
+        if asked > page_ceiling:
+            return httpx.Response(
+                200, content=_OVERSIZED, headers={"content-type": "application/json"}
+            )
+        payload = raw_search_payload(*(raw_entity(id=f"e{i}") for i in range(asked)), total=500)
+        payload["limit"] = _ECHOED_LIMIT
+        return httpx.Response(200, json=payload)
+
+    return respond
+
+
+def test_the_shrink_arithmetic_always_decreases() -> None:
+    """The loop terminates only because each page is strictly smaller and never below one.
+
+    Pinned on the arithmetic rather than through `search_entities`, because no upstream
+    response can exercise it: `page // 2 < page` for every page that reaches here, so the
+    `min(…, page - 1)` clamp is slack and a mutation removing it cannot be observed through
+    the tool. This sweep is what a future change to the aim has to satisfy — it goes red if
+    the clamp is dropped AND the aim is changed to one that can fail to decrease.
+
+    `page >= 2` is the helper's precondition, not an omission in the sweep: the caller
+    re-raises at `page <= 1` before ever asking for a smaller one, because below a single
+    row there is nothing left to reduce.
+    """
+    for start in (2, 3, 20, 200, 9999):
+        page = start
+        for _ in range(MAX_SEARCH_SHRINKS + 1):
+            if page <= 1:
+                break
+            nxt = _shrunk_page(page)
+            assert 1 <= nxt < page, f"from {start}: page={page} -> {nxt}"
+            page = nxt
+
+
+async def test_the_shrink_loop_stops_at_the_tool_call_deadline(
+    client: AlephClient, respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_request` bounds each request on its own budget, but a shrink issues a fresh one.
+
+    Without a deadline across the loop, four hops against a slow upstream multiply that
+    budget by MAX_SEARCH_SHRINKS + 1 — the same amplification the per-request budget exists
+    to prevent, one level up. Reviewed worst case at the shipped defaults: ~1360s and 16
+    requests for one tool call, against ~340s and 4 before the shrink loop existed.
+
+    Halving does not make this redundant: it only shrinks the row term, so a body made large
+    by its facet block spends every hop regardless, and the deadline is the only bound.
+    """
+    now = 0.0
+
+    def _slow(request: httpx.Request) -> httpx.Response:
+        nonlocal now
+        now += 30.0  # each hop takes half the default budget
+        return httpx.Response(200, content=_OVERSIZED, headers={"content-type": "application/json"})
+
+    monkeypatch.setattr("aleph_mcp.client._monotonic", lambda: now)
+    route = respx_mock.get("/api/2/entities").mock(side_effect=_slow)
+    with pytest.raises(ToolError, match=r"over the .* ceiling"):
+        await client.search_entities(q="a", limit=20)
+    # 60s budget: hop 1 ends at 30s, hop 2 at 60s which is already the deadline, so the
+    # third and fourth hops MAX_SEARCH_SHRINKS would allow never happen.
+    assert route.call_count == 2, (
+        f"the deadline must cut the loop short of the shrink bound: {route.call_count} hops"
+    )
+    assert now <= client._settings.timeout_secs + 30.0
+
+
+async def test_an_oversized_search_page_is_shrunk_rather_than_discarded(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """26214540 bytes over a 26214400-byte ceiling threw away the whole result set in a
+    real run. The caller wanted counts and a partial page would have served."""
+    route = respx_mock.get("/api/2/entities").mock(side_effect=_too_big_above(8))
+    out = await client.search_entities(q="a", limit=20)
+    asked = [int(c.request.url.params["limit"]) for c in route.calls]
+    assert asked[0] == 20
+    assert all(b < a for a, b in pairwise(asked)), (
+        f"each retry must ask for strictly fewer rows: {asked}"
+    )
+    assert asked[-1] <= 8
+    assert out["truncated"] is True
+    assert out["limit"] == asked[-1]
+    assert out["continue_from_offset"] == len(out["results"])
+    assert out["total"] == 500, "total describes the result set, not the page"
+    assert "TRUNCATED PAGE" in out["_note"]
+    assert_search_envelope(out, searched={"schemata": "Thing"})
+
+
+async def test_a_shrunk_page_resumes_from_a_non_zero_offset(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """`continue_from_offset` is offset + rows, and at offset=0 those two coincide — so a
+    test that only ever pages from the start cannot tell the correct value from the row
+    count. This one starts part-way in."""
+    respx_mock.get("/api/2/entities").mock(side_effect=_too_big_above(8))
+    out = await client.search_entities(q="a", limit=20, offset=100)
+    returned = len(out["results"])
+    assert out["continue_from_offset"] == 100 + returned
+    assert out["continue_from_offset"] != returned, "the offset must not be dropped"
+
+
+async def test_a_page_that_fits_carries_no_truncation_marker(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The marker says something happened, so it must be absent when nothing did."""
+    respx_mock.get("/api/2/entities").mock(side_effect=_too_big_above(50))
+    out = await client.search_entities(q="a", limit=20)
+    assert "truncated" not in out
+    assert "continue_from_offset" not in out
+
+
+async def test_a_single_row_over_the_ceiling_is_still_refused(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """Below a page of one there is nothing left to shrink, so the ceiling error — which
+    already tells the caller to narrow — stays the honest answer."""
+    route = respx_mock.get("/api/2/entities").mock(side_effect=_too_big_above(0))
+    with pytest.raises(ToolError, match=r"over the .* ceiling"):
+        await client.search_entities(q="a", limit=1)
+    assert route.call_count == 1, "a page of one must not be re-asked"
+
+
+async def test_a_facet_only_search_is_not_shrunk(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """limit=0 means the body is an aggregation; no page size reduces it."""
+    route = respx_mock.get("/api/2/entities").mock(side_effect=_too_big_above(-1))
+    with pytest.raises(ToolError, match=r"over the .* ceiling"):
+        await client.search_entities(q="a", limit=0, facets=["schema"])
+    assert route.call_count == 1
+
+
+async def test_a_page_still_over_after_every_shrink_is_refused(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The reduction is bounded, and the bound is the thing that stops the loop.
+
+    Nothing else exercises the `shrink == MAX_SEARCH_SHRINKS` branch: without it an
+    exhausted loop falls through to `assert payload is not None`, which surfaces as a
+    generic tool error rather than the ceiling message — and as an `AttributeError` under
+    `python -O`, where assertions are stripped.
+    """
+    route = respx_mock.get("/api/2/entities").mock(side_effect=_too_big_above(0))
+    with pytest.raises(ToolError, match=r"over the .* ceiling") as excinfo:
+        await client.search_entities(q="a", limit=20)
+    asked = [int(c.request.url.params["limit"]) for c in route.calls]
+    assert len(asked) == MAX_SEARCH_SHRINKS + 1, asked
+    assert all(b < a for a, b in pairwise(asked)), asked
+    # A model told only to "narrow the request" satisfies that at limit=19 and pays the
+    # whole loop again, so the refusal has to name the pages already tried.
+    assert f"from {asked[0]} down to {asked[-1]} rows" in str(excinfo.value)
+
+
+async def test_a_reduced_page_that_served_no_rows_offers_nothing_to_resume(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """`offset + 0` is the offset just used, so a caller obeying `continue_from_offset`
+    would repeat the identical request and pay the whole reduction again. Withholding both
+    markers is the honest answer; an absent key is the signal."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        asked = int(request.url.params["limit"])
+        if asked > 8:
+            return httpx.Response(
+                200, content=_OVERSIZED, headers={"content-type": "application/json"}
+            )
+        return httpx.Response(200, json=raw_search_payload(total=500))
+
+    respx_mock.get("/api/2/entities").mock(side_effect=respond)
+    out = await client.search_entities(q="a", limit=20, offset=100)
+    assert out["results"] == []
+    assert "truncated" not in out, "nothing was truncated; no rows were served at all"
+    assert "continue_from_offset" not in out, "resuming here would repeat this call"
+    assert "EMPTY SLICE" in out["_note"]
+    assert_search_envelope(out, searched={"schemata": "Thing"})
+
+
+async def test_the_shrink_note_and_the_unenumerated_note_coexist(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """Both are true of the same response, so one must not overwrite the other."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        asked = int(request.url.params["limit"])
+        if asked > 4:
+            return httpx.Response(
+                200, content=_OVERSIZED, headers={"content-type": "application/json"}
+            )
+        return httpx.Response(
+            200,
+            json=raw_search_payload(*(raw_entity(id=f"e{i}") for i in range(asked)), total=100_000),
+        )
+
+    respx_mock.get("/api/2/entities").mock(side_effect=respond)
+    out = await client.search_entities(q="a", limit=20)
+    assert "TRUNCATED PAGE" in out["_note"]
     assert "UNENUMERATED" in out["_note"]
 
 
