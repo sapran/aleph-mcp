@@ -436,6 +436,41 @@ async def test_a_numeric_json_collection_is_accepted(server: FastMCP) -> None:
     assert "integer" in rendered, f"a numeric id must be an accepted form: {rendered}"
 
 
+async def test_a_numeric_json_collection_reaches_the_wire_as_a_filter(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The schema advertising `integer` is not the same as the number working.
+
+    `_resolve_collection_scope` dispatches on shape, and an earlier cut branched on
+    `isinstance(collection, str)` — which sent a bare `874` down the list path, where
+    `"*" in 874` raises `TypeError`, a type no tool's `except ValueError` translates. So the
+    schema-only assertion above would have passed with the call still broken.
+    """
+    route = respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json=raw_search_payload(raw_entity(), total=1))
+    )
+    out = await client.search_entities(collection=874, q="acme")
+    assert _scopes(route.calls.last.request) == ["874"]
+    assert out["searched"]["collection"] == ["874"], "reported as the string form"
+
+    # A list mixing both spellings of one id resolves to one filter, not two.
+    out = await client.search_entities(collection=[874, "874"], q="acme")
+    assert _scopes(route.calls.last.request) == ["874"]
+    assert out["searched"]["collection"] == ["874"]
+
+
+async def test_the_all_collections_literal_mixed_with_a_numeric_id_is_a_legible_refusal(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """`["*", 874]` is the shape that turns a shape-dispatch bug into a `TypeError`: the
+    membership test runs against a list holding an int. It must still be the ordinary
+    ValueError refusal, translated to a tool error like every other bad scope."""
+    wire = respx_mock.route().mock(return_value=httpx.Response(200, json={"results": []}))
+    with pytest.raises(ValueError, match="cannot be combined"):
+        await client.search_entities(collection=[ALL_COLLECTIONS, 874], q="acme")
+    assert wire.call_count == 0
+
+
 async def test_an_upstream_id_echoed_into_an_error_is_bounded(
     client: AlephClient, respx_mock: respx.MockRouter
 ) -> None:
