@@ -4,14 +4,19 @@ import asyncio
 import json as jsonlib
 import re
 import secrets
+import time
 from collections.abc import Callable
 from typing import Any, Literal
 
 import httpx
 
 from .config import Settings
-from .errors import raise_for_status, raise_read_only, raise_too_large
+from .errors import raise_for_status, raise_read_only, raise_too_large, raise_unreachable
 from .readonly import ReadOnlyViolation, read_only_hook
+
+# Indirected so a test can advance a fake clock across an attempt. The retry budget is
+# wall-clock, and a test that cannot move the clock is blind to the term that dominates it.
+_monotonic = time.monotonic
 
 # Elasticsearch `from + size` window enforced by Aleph (aleph/index/util.py MAX_PAGE).
 # SearchQueryParser silently clamps beyond this; we fail loudly instead so the model
@@ -38,6 +43,12 @@ MAX_FACET_SIZE = 200
 # plain body. The error path has its own, much smaller bound in errors.py, because there
 # the status is known before the body is.
 MAX_RESPONSE_BYTES = 25 * 1024 * 1024
+
+# The connect phase gets its own, much shorter ceiling than the rest of the request. A
+# handshake that takes a minute will not produce a useful answer, and the retry loop has
+# to be able to afford more than one attempt inside the same budget: a bare float timeout
+# gives httpx one value for every phase, so connect alone would consume the whole of it.
+MAX_CONNECT_SECS = 10.0
 
 # Properties that carry whole documents. Never worth spending context on inside a
 # search hit; get_entity_text exists to read them deliberately and in bounded slices.
@@ -266,7 +277,10 @@ class AlephClient:
                 "Accept": "application/json",
                 "User-Agent": "aleph-mcp",
             },
-            timeout=settings.timeout_secs,
+            timeout=httpx.Timeout(
+                settings.timeout_secs,
+                connect=min(MAX_CONNECT_SECS, settings.timeout_secs),
+            ),
             verify=settings.verify_tls,
             follow_redirects=True,
             event_hooks={"request": [read_only_hook(settings.host)]},
@@ -360,6 +374,12 @@ class AlephClient:
 
     _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 
+    # Failures raised before the request left this process. Retrying them is safe whatever
+    # the method, because nothing was delivered and nothing can be duplicated. Read-side
+    # failures (ReadError, ReadTimeout, RemoteProtocolError) are deliberately excluded:
+    # they are indistinguishable from a request Aleph did receive.
+    _CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout)
+
     async def _request(
         self,
         method: Literal["GET", "POST"],
@@ -377,27 +397,42 @@ class AlephClient:
         resp: httpx.Response | None = None
         body = b""
         follow = self._http.follow_redirects if follow_redirects is None else follow_redirects
-        # One tool call, one sleep budget. Each hop's delay is clamped, but an upstream
-        # that answers every attempt with a Retry-After would otherwise multiply that
-        # clamp by max_retries and decide how long the caller hangs.
+        # One tool call, one budget. Each hop's backoff is clamped, but an upstream that
+        # answers every attempt with a Retry-After — or a host that swallows every connect
+        # until the connect timeout fires — would otherwise multiply that clamp by
+        # max_retries and decide how long the caller hangs.
         budget = self._settings.timeout_secs
         try:
             for attempt in range(1, attempts + 1):
-                async with self._http.stream(
-                    method, path, params=query, json=json, follow_redirects=follow
-                ) as resp:
-                    if on_redirect is not None and resp.is_redirect:
-                        return on_redirect(resp)
-                    # A zero delay still retries; only an exhausted budget stops the loop.
-                    give_up = (
-                        resp.status_code not in self._RETRY_STATUS
-                        or attempt == attempts
-                        or budget <= 0
-                    )
-                    delay = 0.0 if give_up else min(_retry_delay(resp, attempt), budget)
-                    if give_up:
-                        body = await self._read_bounded(resp, context=context, resource=resource)
-                        break
+                started = _monotonic()
+                try:
+                    async with self._http.stream(
+                        method, path, params=query, json=json, follow_redirects=follow
+                    ) as resp:
+                        if on_redirect is not None and resp.is_redirect:
+                            return on_redirect(resp)
+                        # A zero delay still retries; only an exhausted budget stops the loop.
+                        give_up = (
+                            resp.status_code not in self._RETRY_STATUS
+                            or attempt == attempts
+                            or budget <= 0
+                        )
+                        delay = 0.0 if give_up else min(_retry_delay(resp, attempt), budget)
+                        if give_up:
+                            body = await self._read_bounded(
+                                resp, context=context, resource=resource
+                            )
+                            break
+                except self._CONNECT_ERRORS as e:
+                    # A failed connect is spend, not just the sleep after it: it can burn the
+                    # whole connect phase, which is the larger term. Charging only the backoff
+                    # would let max_retries slow connects hold one tool call open for a
+                    # multiple of the budget — the case MAX_CONNECT_SECS also bounds.
+                    budget -= _monotonic() - started
+                    if attempt == attempts or budget <= 0:
+                        raise_unreachable(e, context=context, attempts=attempt, resource=resource)
+                    delay = min(_backoff_delay(attempt), budget)
+                # One place where the budget is spent, whichever path bound the delay.
                 budget -= delay
                 await asyncio.sleep(delay)
         except ReadOnlyViolation as e:
@@ -931,6 +966,10 @@ def _page_params(limit: int, offset: int, *, cap: int) -> Query:
 MAX_RETRY_SLEEP_SECS = 30.0
 
 
+def _backoff_delay(attempt: int) -> float:
+    return min(MAX_RETRY_SLEEP_SECS, float(2 ** (attempt - 1)))
+
+
 def _retry_delay(resp: httpx.Response, attempt: int) -> float:
     retry_after = resp.headers.get("Retry-After")
     if retry_after:
@@ -938,4 +977,4 @@ def _retry_delay(resp: httpx.Response, attempt: int) -> float:
             return min(MAX_RETRY_SLEEP_SECS, max(0.0, float(retry_after)))
         except ValueError:
             pass
-    return min(MAX_RETRY_SLEEP_SECS, float(2 ** (attempt - 1)))
+    return _backoff_delay(attempt)

@@ -3,6 +3,39 @@
 Findings recorded during other work, kept out of the change that surfaced them. An entry leaves
 this file when it becomes a spec requirement or is fixed — not when someone remembers to tidy up.
 
+- **`httpx.ProxyError` reaches the model unsanitised, and its text is attacker-authored.**
+  Found by security review of `fix/retry-connection-failures`; pre-existing, so parked rather
+  than fixed there. `ProxyError` is a sibling of `ConnectError` under `TransportError`, not a
+  subclass, so `AlephClient._CONNECT_ERRORS` does not catch it and it never reaches
+  `errors.py`'s sanitiser. httpcore builds its message from the proxy's `CONNECT` reason
+  phrase (`httpcore/_async/http_proxy.py`), which h11 admits as `([ \t]|[^\x00\s])*` — every
+  C0 control except NUL, `ESC` included — decoded with `errors="ignore"`. FastMCP then renders
+  it verbatim, because `mask_error_details` defaults false. So a hostile or MITM'd forward
+  proxy can write multi-kilobyte ASCII with ANSI escapes into a model-visible tool error,
+  bypassing both the 200-char cap and the non-printable stripping in `_as_quoted_data`. A
+  forward proxy is a live deployment shape here, so this is worth a change of its own: catch
+  `httpx.TransportError` at the top of `_request` and route the non-retryable members through
+  `raise_unreachable`. Do **not** simply add `ProxyError` to `_CONNECT_ERRORS` — a `CONNECT`
+  that reached the proxy is not obviously undelivered, which is the argument that correctly
+  keeps `ReadError` out.
+
+- **A TLS verification failure is retried four times with the wrong advice.** Found by review
+  of the same branch. httpcore maps `ssl.SSLError` from the handshake to `ConnectError`, so
+  `CERTIFICATE_VERIFY_FAILED` — the misconfiguration the README anticipates for a self-signed
+  instance with `ALEPH_MCP_VERIFY_TLS` left true — now costs three backoffs before failing,
+  and the message speaks about network reachability. The real cause is visible only inside the
+  quoted transport text. Retrying is harmless but pointless, since the failure is
+  deterministic. Fixing it means classifying the cause (walk `e.__cause__` for an
+  `ssl.SSLError`) and branching the message to name the setting, which is error classification
+  rather than retry, so it was left out. A DNS failure also arrives as `ConnectError` and
+  should keep being retried: a resolver hiccup is plausibly transient.
+
+- **Only the connect path charges its elapsed time to the retry budget.** A slow 429/5xx round
+  trip is still uncharged, so `max_retries` slow responses can exceed `timeout_secs` in total.
+  That is pre-existing behaviour, not introduced by the connect retry, so the same one-line
+  charge was not extended to the response path in that change. The connect path had to be
+  charged because a connect can burn the whole connect phase without ever sleeping.
+
 - **The shipped plugin `.mcp.json` runs a shell at every server start.** Both `env` values
   are `!`-prefixed commands: the host is `$ALEPHCLIENT_HOST`, and the key is read from the
   macOS login Keychain under a service name that includes the host. That behaviour is

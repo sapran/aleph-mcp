@@ -43,8 +43,8 @@ uv sync --all-extras
 | --- | --- | --- | --- |
 | `ALEPHCLIENT_HOST` | yes | — | Site root, e.g. `https://aleph.occrp.org`. A `/api/2` suffix is tolerated and stripped. |
 | `ALEPHCLIENT_API_KEY` | yes | — | Aleph API key. Use a READ-only role. |
-| `ALEPH_MCP_TIMEOUT_SECS` | no | `60` | Per-request HTTP timeout. |
-| `ALEPH_MCP_MAX_RETRIES` | no | `4` | Attempts per request on 429/5xx, honouring `Retry-After`. |
+| `ALEPH_MCP_TIMEOUT_SECS` | no | `60` | Per-request HTTP timeout, and the total budget one call may spend retrying. Connecting is capped separately at 10s. |
+| `ALEPH_MCP_MAX_RETRIES` | no | `4` | Attempts per request on 429/5xx (honouring `Retry-After`) and on a connection failure. The backoff between them is drawn from `ALEPH_MCP_TIMEOUT_SECS`. |
 | `ALEPH_MCP_VERIFY_TLS` | no | `true` | Set `false` for a self-signed instance. |
 
 `ALEPHCLIENT_HOST` / `ALEPHCLIENT_API_KEY` are deliberately the same names upstream
