@@ -107,7 +107,7 @@ def build_server(settings: Settings) -> tuple[FastMCP, AlephClient]:
 
     @mcp.tool
     async def search_entities(
-        collection: str | list[str],
+        collection: str | int | list[str | int],
         q: str | None = None,
         filters: dict[str, str | list[str]] | None = None,
         schema: str | None = None,
@@ -236,7 +236,7 @@ def build_server(settings: Settings) -> tuple[FastMCP, AlephClient]:
     @mcp.tool
     async def match_entity(
         sample: dict[str, Any],
-        collection: str | list[str],
+        collection: str | int | list[str | int],
         limit: int = 10,
     ) -> dict[str, Any]:
         """Look up a person or company you describe, rather than one already in Aleph.

@@ -631,7 +631,7 @@ class AlephClient:
         return resolved
 
     async def _resolve_collection_scope(
-        self, collection: str | list[str], *, context: str
+        self, collection: str | int | list[str | int], *, context: str
     ) -> Scope:
         """Return `ALL_COLLECTIONS`, or the numeric ids for one or more collections.
 
@@ -642,7 +642,9 @@ class AlephClient:
         Every refusal below is local and precedes any request, so a scope that names
         nothing costs nothing.
         """
-        if isinstance(collection, str):
+        # A scalar, either spelling: a model handed a numeric id often sends the JSON
+        # number rather than the string, and rejecting that would spend a turn on syntax.
+        if not isinstance(collection, list):
             if collection == ALL_COLLECTIONS:
                 return ALL_COLLECTIONS
             return [await self._resolve_collection_id(collection, context=context)]
@@ -661,7 +663,8 @@ class AlephClient:
         # upstream request with its own retry budget, so an unbounded list would let one
         # tool call multiply that budget — the same amplification the per-request budget
         # and the shrink loop's deadline both exist to prevent.
-        unique = list(dict.fromkeys(collection))
+        # Stringified first, so a list mixing 874 and "874" dedups as one spelling.
+        unique = list(dict.fromkeys(str(c) for c in collection))
         if len(unique) > MAX_SCOPE_COLLECTIONS:
             raise ValueError(
                 f"collection may name at most {MAX_SCOPE_COLLECTIONS} collections in one "
@@ -702,7 +705,7 @@ class AlephClient:
     async def search_entities(
         self,
         *,
-        collection: str | list[str],
+        collection: str | int | list[str | int],
         q: str | None = None,
         filters: dict[str, str | list[str]] | None = None,
         schema: str | None = None,
@@ -943,7 +946,7 @@ class AlephClient:
         self,
         *,
         sample: dict[str, Any],
-        collection: str | list[str],
+        collection: str | int | list[str | int],
         limit: int = 10,
     ) -> dict[str, Any]:
         if "schema" not in sample:

@@ -405,14 +405,35 @@ async def test_the_all_collections_literal_is_refused_by_single_collection_tools
 
 
 async def test_a_lookup_failure_is_reported_against_the_tool_that_was_called(
-    client: AlephClient, respx_mock: respx.MockRouter
+    settings: Settings, respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Before this, the resolver hard-coded `context="get_collection"`, so a failed lookup
-    during a search told the model to check an id for a tool it never invoked."""
-    respx_mock.get("/api/2/collections").mock(return_value=httpx.Response(503))
+    during a search told the model to check an id for a tool it never invoked.
+
+    A 400 rather than a 503 on purpose: a 5xx is retried with real backoff, which cost the
+    whole suite seven seconds for one assertion about a message prefix.
+    """
+    monkeypatch.setenv("ALEPH_MCP_MAX_RETRIES", "1")
+    client = AlephClient(Settings())  # type: ignore[call-arg]
+    respx_mock.get("/api/2/collections").mock(return_value=httpx.Response(400))
     with pytest.raises(Exception) as excinfo:
         await client.search_entities(collection="my-case", q="acme")
     assert "search_entities" in str(excinfo.value), str(excinfo.value)
+    await client.aclose()
+
+
+async def test_a_numeric_json_collection_is_accepted(server: FastMCP) -> None:
+    """A model holding the id `874` naturally sends the JSON number, and pydantic does not
+    coerce a number to `str` — so a `str`-only signature would refuse the most obvious
+    spelling of a valid scope and spend a turn teaching syntax rather than method."""
+    props = None
+    async with MCPClient(server) as mcp:
+        for tool in await mcp.list_tools():
+            if tool.name == "search_entities":
+                props = tool.inputSchema["properties"]["collection"]
+    assert props is not None
+    rendered = str(props)
+    assert "integer" in rendered, f"a numeric id must be an accepted form: {rendered}"
 
 
 async def test_an_upstream_id_echoed_into_an_error_is_bounded(
