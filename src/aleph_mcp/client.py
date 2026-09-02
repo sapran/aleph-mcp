@@ -569,9 +569,7 @@ class AlephClient:
         self._foreign_ids[text] = resolved
         return resolved
 
-    async def _resolve_collection_scope(
-        self, collection: str | list[str]
-    ) -> str | list[str]:
+    async def _resolve_collection_scope(self, collection: str | list[str]) -> str | list[str]:
         """Return `ALL_COLLECTIONS`, or the numeric ids for one or more collections.
 
         Accepts the literal `"*"`, a single id in either form, or a list of them. A caller

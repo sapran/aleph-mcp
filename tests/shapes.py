@@ -202,12 +202,16 @@ def assert_slim_entity(e: dict[str, Any]) -> None:
 
 
 def assert_search_envelope(
-    out: dict[str, Any], *, searched: dict[str, str | None] | None = None
+    out: dict[str, Any], *, searched: dict[str, str | list[str] | None] | None = None
 ) -> None:
     """The reshaped result envelope shared by every `_slim_result` caller.
 
     Pass `searched` to also pin the scope search_entities reports; the other callers
-    (entityset_items, match_entity) do not emit that key.
+    (entityset_items, match_entity) do not emit that key. The scope carries both the
+    schema branch and, under `collection`, the resolved numeric collection ids — a list,
+    or the literal `"*"` — so the value type is wider than the schema keys alone. The
+    comparison stays an equality: a scope with an extra or missing key is a different
+    scope, and the whole point of `searched` is that a caller can trust it exactly.
     """
     keys = set(out)
     assert keys <= ENVELOPE_REQUIRED | ENVELOPE_OPTIONAL, (

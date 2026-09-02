@@ -406,9 +406,10 @@ async def test_numeric_collection_id_is_validated_before_interpolation(
     client: AlephClient, respx_mock: respx.MockRouter
 ) -> None:
     """`"42\n"` reads as numeric intent, so it must be refused rather than falling through
-    to the foreign_id branch and silently answering nothing."""
+    to the foreign_id branch — which now resolves, so falling through would spend a lookup
+    on a value that can only be a mistyped id and then answer nothing."""
     wire = respx_mock.route().mock(return_value=httpx.Response(200, json={"results": []}))
-    with pytest.raises(ValueError, match="invalid collection_id"):
+    with pytest.raises(ValueError, match="expected a numeric collection id"):
         await client.get_collection(collection="42\n")
     assert wire.call_count == 0
 
@@ -423,15 +424,18 @@ async def test_search_builds_filter_and_facet_params(
         return_value=httpx.Response(200, json={"results": [], "total": {"value": 0}})
     )
     await client.search_entities(
+        collection="874",
         q="acme",
-        filters={"collection_id": "42", "countries": ["ru", "cy"]},
+        filters={"countries": ["ru", "cy"]},
         schema="Company",
         facets=["schema"],
         limit=0,
     )
     q = _query(route.calls.last.request)
     assert ("q", "acme") in q
-    assert ("filter:collection_id", "42") in q
+    # The scope is emitted as one `filter:collection_id` per resolved id, and it is no
+    # longer expressible through `filters` — that spelling is refused outright.
+    assert [v for k, v in q if k == "filter:collection_id"] == ["874"]
     assert ("filter:countries", "ru") in q
     assert ("filter:countries", "cy") in q
     assert ("filter:schema", "Company") in q
@@ -442,7 +446,7 @@ async def test_search_builds_filter_and_facet_params(
 
 async def test_search_rejects_deep_pagination(client: AlephClient) -> None:
     with pytest.raises(ValueError, match="facets"):
-        await client.search_entities(limit=50, offset=MAX_PAGE)
+        await client.search_entities(collection="874", limit=50, offset=MAX_PAGE)
 
 
 @pytest.mark.parametrize("facet_size", [0, MAX_FACET_SIZE + 1], ids=["zero", "over-cap"])
@@ -453,7 +457,7 @@ async def test_search_rejects_an_unbounded_facet_size(
     the row limit does not cover: buckets are an aggregation, not a page of results."""
     wire = respx_mock.route().mock(return_value=httpx.Response(200, json={}))
     with pytest.raises(ValueError, match="facet_size must be between"):
-        await client.search_entities(facets=["schema"], facet_size=facet_size)
+        await client.search_entities(collection="874", facets=["schema"], facet_size=facet_size)
     assert wire.call_count == 0
 
 
@@ -473,7 +477,7 @@ async def test_facet_buckets_are_bounded_and_their_labels_truncated(
             },
         )
     )
-    out = await client.search_entities(facets=["names"], limit=0)
+    out = await client.search_entities(collection="874", facets=["names"], limit=0)
     names = out["facets"]["names"]
     assert len(names["values"]) == MAX_FACET_SIZE
     assert names["_omitted_values"] == 5
@@ -592,7 +596,7 @@ async def test_search_allows_the_exact_ceiling(
     respx_mock.get("/api/2/entities").mock(
         return_value=httpx.Response(200, json={"results": [], "total": {"value": 0}})
     )
-    await client.search_entities(limit=9, offset=MAX_PAGE - 9)
+    await client.search_entities(collection="874", limit=9, offset=MAX_PAGE - 9)
 
 
 async def test_search_notes_unreachable_tail(
@@ -601,7 +605,7 @@ async def test_search_notes_unreachable_tail(
     respx_mock.get("/api/2/entities").mock(
         return_value=httpx.Response(200, json={"results": [], "total": {"value": 50000}})
     )
-    out = await client.search_entities(q="a")
+    out = await client.search_entities(collection="874", q="a")
     assert "UNENUMERATED" in out["_note"]
 
 
@@ -680,7 +684,7 @@ async def test_the_shrink_loop_stops_at_the_tool_call_deadline(
     monkeypatch.setattr("aleph_mcp.client._monotonic", lambda: now)
     route = respx_mock.get("/api/2/entities").mock(side_effect=_slow)
     with pytest.raises(ToolError, match=r"over the .* ceiling"):
-        await client.search_entities(q="a", limit=20)
+        await client.search_entities(collection="874", q="a", limit=20)
     # 60s budget: hop 1 ends at 30s, hop 2 at 60s which is already the deadline, so the
     # third and fourth hops MAX_SEARCH_SHRINKS would allow never happen.
     assert route.call_count == 2, (
@@ -695,7 +699,7 @@ async def test_an_oversized_search_page_is_shrunk_rather_than_discarded(
     """26214540 bytes over a 26214400-byte ceiling threw away the whole result set in a
     real run. The caller wanted counts and a partial page would have served."""
     route = respx_mock.get("/api/2/entities").mock(side_effect=_too_big_above(8))
-    out = await client.search_entities(q="a", limit=20)
+    out = await client.search_entities(collection="874", q="a", limit=20)
     asked = [int(c.request.url.params["limit"]) for c in route.calls]
     assert asked[0] == 20
     assert all(b < a for a, b in pairwise(asked)), (
@@ -707,7 +711,7 @@ async def test_an_oversized_search_page_is_shrunk_rather_than_discarded(
     assert out["continue_from_offset"] == len(out["results"])
     assert out["total"] == 500, "total describes the result set, not the page"
     assert "TRUNCATED PAGE" in out["_note"]
-    assert_search_envelope(out, searched={"schemata": "Thing"})
+    assert_search_envelope(out, searched={"schemata": "Thing", "collection": ["874"]})
 
 
 async def test_a_shrunk_page_resumes_from_a_non_zero_offset(
@@ -717,7 +721,7 @@ async def test_a_shrunk_page_resumes_from_a_non_zero_offset(
     test that only ever pages from the start cannot tell the correct value from the row
     count. This one starts part-way in."""
     respx_mock.get("/api/2/entities").mock(side_effect=_too_big_above(8))
-    out = await client.search_entities(q="a", limit=20, offset=100)
+    out = await client.search_entities(collection="874", q="a", limit=20, offset=100)
     returned = len(out["results"])
     assert out["continue_from_offset"] == 100 + returned
     assert out["continue_from_offset"] != returned, "the offset must not be dropped"
@@ -728,7 +732,7 @@ async def test_a_page_that_fits_carries_no_truncation_marker(
 ) -> None:
     """The marker says something happened, so it must be absent when nothing did."""
     respx_mock.get("/api/2/entities").mock(side_effect=_too_big_above(50))
-    out = await client.search_entities(q="a", limit=20)
+    out = await client.search_entities(collection="874", q="a", limit=20)
     assert "truncated" not in out
     assert "continue_from_offset" not in out
 
@@ -740,7 +744,7 @@ async def test_a_single_row_over_the_ceiling_is_still_refused(
     already tells the caller to narrow — stays the honest answer."""
     route = respx_mock.get("/api/2/entities").mock(side_effect=_too_big_above(0))
     with pytest.raises(ToolError, match=r"over the .* ceiling"):
-        await client.search_entities(q="a", limit=1)
+        await client.search_entities(collection="874", q="a", limit=1)
     assert route.call_count == 1, "a page of one must not be re-asked"
 
 
@@ -750,7 +754,7 @@ async def test_a_facet_only_search_is_not_shrunk(
     """limit=0 means the body is an aggregation; no page size reduces it."""
     route = respx_mock.get("/api/2/entities").mock(side_effect=_too_big_above(-1))
     with pytest.raises(ToolError, match=r"over the .* ceiling"):
-        await client.search_entities(q="a", limit=0, facets=["schema"])
+        await client.search_entities(collection="874", q="a", limit=0, facets=["schema"])
     assert route.call_count == 1
 
 
@@ -766,7 +770,7 @@ async def test_a_page_still_over_after_every_shrink_is_refused(
     """
     route = respx_mock.get("/api/2/entities").mock(side_effect=_too_big_above(0))
     with pytest.raises(ToolError, match=r"over the .* ceiling") as excinfo:
-        await client.search_entities(q="a", limit=20)
+        await client.search_entities(collection="874", q="a", limit=20)
     asked = [int(c.request.url.params["limit"]) for c in route.calls]
     assert len(asked) == MAX_SEARCH_SHRINKS + 1, asked
     assert all(b < a for a, b in pairwise(asked)), asked
@@ -791,12 +795,12 @@ async def test_a_reduced_page_that_served_no_rows_offers_nothing_to_resume(
         return httpx.Response(200, json=raw_search_payload(total=500))
 
     respx_mock.get("/api/2/entities").mock(side_effect=respond)
-    out = await client.search_entities(q="a", limit=20, offset=100)
+    out = await client.search_entities(collection="874", q="a", limit=20, offset=100)
     assert out["results"] == []
     assert "truncated" not in out, "nothing was truncated; no rows were served at all"
     assert "continue_from_offset" not in out, "resuming here would repeat this call"
     assert "EMPTY SLICE" in out["_note"]
-    assert_search_envelope(out, searched={"schemata": "Thing"})
+    assert_search_envelope(out, searched={"schemata": "Thing", "collection": ["874"]})
 
 
 async def test_the_shrink_note_and_the_unenumerated_note_coexist(
@@ -816,7 +820,7 @@ async def test_the_shrink_note_and_the_unenumerated_note_coexist(
         )
 
     respx_mock.get("/api/2/entities").mock(side_effect=respond)
-    out = await client.search_entities(q="a", limit=20)
+    out = await client.search_entities(collection="874", q="a", limit=20)
     assert "TRUNCATED PAGE" in out["_note"]
     assert "UNENUMERATED" in out["_note"]
 
@@ -827,8 +831,8 @@ async def test_search_strips_text_from_hits(
     respx_mock.get("/api/2/entities").mock(
         return_value=httpx.Response(200, json=raw_search_payload(raw_document()))
     )
-    out = await client.search_entities(q="jane")
-    assert_search_envelope(out, searched={"schemata": "Thing"})
+    out = await client.search_entities(collection="874", q="jane")
+    assert_search_envelope(out, searched={"schemata": "Thing", "collection": ["874"]})
     assert out["results"][0]["_omitted_properties"] == sorted(BLOB_PROPS)
 
 
@@ -838,7 +842,7 @@ async def test_highlight_only_when_query_present(
     route = respx_mock.get("/api/2/entities").mock(
         return_value=httpx.Response(200, json={"results": [], "total": {"value": 0}})
     )
-    await client.search_entities(highlight=True)
+    await client.search_entities(collection="874", highlight=True)
     assert ("highlight", "true") not in _query(route.calls.last.request)
 
 
@@ -850,8 +854,8 @@ async def test_reachable_total_carries_no_note(
     respx_mock.get("/api/2/entities").mock(
         return_value=httpx.Response(200, json=raw_search_payload(total=500))
     )
-    out = await client.search_entities(q="a")
-    assert_search_envelope(out, searched={"schemata": "Thing"})
+    out = await client.search_entities(collection="874", q="a")
+    assert_search_envelope(out, searched={"schemata": "Thing", "collection": ["874"]})
     assert "_note" not in out
 
 
@@ -861,7 +865,7 @@ async def test_search_rejects_negative_paging(
 ) -> None:
     wire = respx_mock.route().mock(return_value=httpx.Response(200, json={}))
     with pytest.raises(ValueError, match="must be >= 0"):
-        await client.search_entities(**args)
+        await client.search_entities(collection="874", **args)
     assert wire.call_count == 0
 
 
@@ -871,7 +875,7 @@ async def test_highlight_is_sent_when_a_query_is_present(
     route = respx_mock.get("/api/2/entities").mock(
         return_value=httpx.Response(200, json=raw_search_payload(total=0))
     )
-    await client.search_entities(q="acme", highlight=True)
+    await client.search_entities(collection="874", q="acme", highlight=True)
     q = _query(route.calls.last.request)
     assert ("highlight", "true") in q
     assert ("highlight_count", "3") in q
@@ -992,7 +996,7 @@ async def test_dotted_ids_are_still_accepted(
 
 async def test_match_requires_schema(client: AlephClient) -> None:
     with pytest.raises(ValueError, match="schema"):
-        await client.match_entity(sample={"properties": {"name": ["x"]}})
+        await client.match_entity(sample={"properties": {"name": ["x"]}}, collection="874")
 
 
 async def test_match_posts_sample(client: AlephClient, respx_mock: respx.MockRouter) -> None:
@@ -1000,14 +1004,34 @@ async def test_match_posts_sample(client: AlephClient, respx_mock: respx.MockRou
         return_value=httpx.Response(200, json={"results": [], "total": {"value": 0}})
     )
     await client.match_entity(
-        sample={"schema": "Person", "properties": {"name": ["Jane"]}}, collection_ids=["42"]
+        sample={"schema": "Person", "properties": {"name": ["Jane"]}}, collection="42"
     )
+    # Aleph's wire spelling stays `collection_ids`; only the argument was renamed, so the
+    # request is unchanged and a rename that leaked to the wire fails here.
     assert ("collection_ids", "42") in _query(route.calls.last.request)
 
 
-async def test_collection_id_validation_rejects_foreign_id(client: AlephClient) -> None:
-    with pytest.raises(ValueError, match="get_collection"):
-        await client.xref_results(collection_id="my-case")
+async def test_an_unresolvable_foreign_id_is_refused_with_the_next_move(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """A foreign_id now resolves instead of being rejected, so the refusal moves rather
+    than disappearing: it is for a value the listing endpoint cannot find, and it has to
+    name the tool that shows what this key can read.
+
+    Asserted through xref_results rather than get_collection because every
+    collection-taking tool shares one resolver, and this is the arm a caller of the others
+    reaches — the endpoint that would have been addressed must not be called at all.
+    """
+    lookup = respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    xref = respx_mock.get("/api/2/collections/42/xref").mock(
+        return_value=httpx.Response(200, json={"total": 0, "results": []})
+    )
+    with pytest.raises(ValueError, match="list_collections"):
+        await client.xref_results(collection="my-case")
+    assert lookup.call_count == 1
+    assert xref.call_count == 0, "an unresolved scope must cost no second request"
 
 
 # -- profiles ------------------------------------------------------------------
@@ -1286,9 +1310,9 @@ async def test_search_applies_default_schemata_when_none_given(
     route = respx_mock.get("/api/2/entities").mock(
         return_value=httpx.Response(200, json={"results": [], "total": {"value": 0}})
     )
-    out = await client.search_entities(q="acme")
+    out = await client.search_entities(collection="874", q="acme")
     assert ("filter:schemata", "Thing") in _query(route.calls.last.request)
-    assert out["searched"] == {"schemata": "Thing"}
+    assert out["searched"] == {"schemata": "Thing", "collection": ["874"]}
 
 
 async def test_explicit_schemata_wins_over_the_default(
@@ -1297,11 +1321,11 @@ async def test_explicit_schemata_wins_over_the_default(
     route = respx_mock.get("/api/2/entities").mock(
         return_value=httpx.Response(200, json={"results": [], "total": {"value": 0}})
     )
-    out = await client.search_entities(schemata="Interval")
+    out = await client.search_entities(collection="874", schemata="Interval")
     q = _query(route.calls.last.request)
     assert ("filter:schemata", "Interval") in q
     assert ("filter:schemata", "Thing") not in q
-    assert out["searched"] == {"schemata": "Interval"}
+    assert out["searched"] == {"schemata": "Interval", "collection": ["874"]}
 
 
 async def test_exact_schema_suppresses_the_schemata_default(
@@ -1310,11 +1334,11 @@ async def test_exact_schema_suppresses_the_schemata_default(
     route = respx_mock.get("/api/2/entities").mock(
         return_value=httpx.Response(200, json={"results": [], "total": {"value": 0}})
     )
-    out = await client.search_entities(schema="Ownership")
+    out = await client.search_entities(collection="874", schema="Ownership")
     q = _query(route.calls.last.request)
     assert ("filter:schema", "Ownership") in q
     assert not [v for k, v in q if k == "filter:schemata"]
-    assert out["searched"] == {"schema": "Ownership"}
+    assert out["searched"] == {"schema": "Ownership", "collection": ["874"]}
 
 
 # -- caption / provenance (regression: live Aleph returns caption=null) ---------
@@ -1387,7 +1411,7 @@ async def test_search_derives_captions_from_the_instance_model(
             },
         )
     )
-    out = await client.search_entities(schema="Person")
+    out = await client.search_entities(collection="583", schema="Person")
     hit = out["results"][0]
     assert hit["caption"] == "Jane Doe"
     assert hit["collection_id"] == "583"
@@ -1547,7 +1571,7 @@ async def test_list_entitysets_filters_by_collection_and_type(
             },
         )
     )
-    out = await client.list_entitysets(collection_id="42", set_type="diagram")
+    out = await client.list_entitysets(collection="42", set_type="diagram")
     q = _query(route.calls.last.request)
     assert ("filter:collection_id", "42") in q
     assert ("filter:type", "diagram") in q
@@ -1556,9 +1580,24 @@ async def test_list_entitysets_filters_by_collection_and_type(
     assert hit["summary"] == "who pays whom"
 
 
-async def test_list_entitysets_rejects_a_foreign_id(client: AlephClient) -> None:
-    with pytest.raises(ValueError, match="numeric id"):
-        await client.list_entitysets(collection_id="my-case")
+async def test_list_entitysets_resolves_a_foreign_id_to_the_numeric_filter(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """A foreign_id was refused here with "call get_collection first", so the caller had to
+    convert an id by hand for this tool and not for that one. It resolves now — and what
+    reaches Aleph is still the numeric id, because `filter:collection_id` matches on the id
+    and a foreign_id forwarded verbatim would filter the listing down to nothing.
+    """
+    lookup = respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(200, json={"results": [{"id": "42", "foreign_id": "my-case"}]})
+    )
+    route = respx_mock.get("/api/2/entitysets").mock(
+        return_value=httpx.Response(200, json={"total": 0, "results": []})
+    )
+    await client.list_entitysets(collection="my-case")
+    assert ("filter:foreign_id", "my-case") in _query(lookup.calls.last.request)
+    q = _query(route.calls.last.request)
+    assert [v for k, v in q if k == "filter:collection_id"] == ["42"]
 
 
 async def test_entityset_items_slims_and_pages(
@@ -1611,7 +1650,7 @@ async def test_xref_results_pairs_both_sides_of_the_match(
             },
         )
     )
-    out = await client.xref_results(collection_id="42", limit=30)
+    out = await client.xref_results(collection="42", limit=30)
     assert ("limit", "30") in _query(route.calls.last.request)
     hit = out["results"][0]
     assert (hit["score"], hit["judgement"]) == (3.25, "unsure")
@@ -1623,6 +1662,21 @@ async def test_xref_results_pairs_both_sides_of_the_match(
     assert_slim_entity(hit["match"])
 
 
-async def test_xref_results_rejects_a_foreign_id(client: AlephClient) -> None:
-    with pytest.raises(ValueError, match="numeric id"):
-        await client.xref_results(collection_id="my-case")
+async def test_xref_results_resolves_a_foreign_id_before_fetching(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The collection interpolates into the xref path, which is why a foreign_id used to be
+    refused outright. It resolves first now, and the request that follows addresses the
+    numeric id — a foreign_id reaching the path would ask Aleph for a collection called
+    "my-case" and be answered 404.
+    """
+    lookup = respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(200, json={"results": [{"id": "42", "foreign_id": "my-case"}]})
+    )
+    xref = respx_mock.get("/api/2/collections/42/xref").mock(
+        return_value=httpx.Response(200, json={"total": 0, "results": []})
+    )
+    await client.xref_results(collection="my-case")
+    assert ("filter:foreign_id", "my-case") in _query(lookup.calls.last.request)
+    assert xref.call_count == 1
+    assert xref.calls.last.request.url.path == "/api/2/collections/42/xref"

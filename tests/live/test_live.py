@@ -28,7 +28,7 @@ import pytest
 from fastmcp import Client as MCPClient
 from fastmcp import FastMCP
 
-from aleph_mcp.client import MAX_PAGE, AlephClient
+from aleph_mcp.client import ALL_COLLECTIONS, MAX_PAGE, AlephClient
 from aleph_mcp.config import Settings
 from aleph_mcp.readonly import ReadOnlyViolation
 from aleph_mcp.server import build_server
@@ -70,14 +70,14 @@ async def test_can_authenticate_and_list_collections(live_client: AlephClient) -
 
 async def test_search_without_a_schema_is_accepted(live_client: AlephClient) -> None:
     """Regression: Aleph 400s with 'No schema is specified for the query.'"""
-    out = await live_client.search_entities(facets=["schema"], limit=0)
-    assert out["searched"] == {"schemata": "Thing"}
+    out = await live_client.search_entities(collection=ALL_COLLECTIONS, facets=["schema"], limit=0)
+    assert out["searched"] == {"schemata": "Thing", "collection": ALL_COLLECTIONS}
     assert "schema" in out["facets"]
 
 
 async def test_search_hits_carry_caption_and_collection(live_client: AlephClient) -> None:
     """Regression: live Aleph returns caption=null and nests `collection`."""
-    out = await live_client.search_entities(schema="Person", limit=5)
+    out = await live_client.search_entities(collection=ALL_COLLECTIONS, schema="Person", limit=5)
     if not out["results"]:
         pytest.skip("instance has no Person entities")
     hit = out["results"][0]
@@ -86,7 +86,7 @@ async def test_search_hits_carry_caption_and_collection(live_client: AlephClient
 
 
 async def test_expand_and_tags_accept_a_real_entity_id(live_client: AlephClient) -> None:
-    out = await live_client.search_entities(schema="Person", limit=1)
+    out = await live_client.search_entities(collection=ALL_COLLECTIONS, schema="Person", limit=1)
     if not out["results"]:
         pytest.skip("instance has no Person entities")
     entity_id = out["results"][0]["id"]
@@ -105,7 +105,9 @@ async def test_profile_tools_accept_a_real_profile_id(live_client: AlephClient) 
     """Profiles are opt-in per instance: an Aleph with no cross-referencing judged has
     none at all, so skip rather than fail. `profile_id` arrives on the search hit itself,
     which is the discovery path the tools rely on."""
-    out = await live_client.search_entities(schemata="LegalEntity", limit=50)
+    out = await live_client.search_entities(
+        collection=ALL_COLLECTIONS, schemata="LegalEntity", limit=50
+    )
     profile_id = next((hit["profile_id"] for hit in out["results"] if hit.get("profile_id")), None)
     if not profile_id:
         _no_fixture_data("no profile on the sampled entities; instance has no judged xref")
@@ -134,13 +136,15 @@ async def test_profile_tools_accept_a_real_profile_id(live_client: AlephClient) 
 
 async def test_deep_pagination_is_refused_before_the_request(live_client: AlephClient) -> None:
     with pytest.raises(ValueError, match=str(MAX_PAGE)):
-        await live_client.search_entities(limit=100, offset=MAX_PAGE - 1)
+        await live_client.search_entities(
+            collection=ALL_COLLECTIONS, limit=100, offset=MAX_PAGE - 1
+        )
 
 
 async def test_document_text_is_bounded_and_reports_truncation(
     live_client: AlephClient,
 ) -> None:
-    out = await live_client.search_entities(schema="Pages", limit=5)
+    out = await live_client.search_entities(collection=ALL_COLLECTIONS, schema="Pages", limit=5)
     if not out["results"]:
         _no_fixture_data("instance has no Pages documents")
     for hit in out["results"]:
@@ -210,7 +214,9 @@ async def ids(live_client: AlephClient) -> dict[str, str | None]:
     collection_ids = [c["id"] for c in collections["results"] if c.get("id")]
     collection_id = collection_ids[0] if collection_ids else None
 
-    entities = await live_client.search_entities(schemata="Thing", limit=50)
+    entities = await live_client.search_entities(
+        collection=ALL_COLLECTIONS, schemata="Thing", limit=50
+    )
     hits = entities["results"]
     entity_id = hits[0]["id"] if hits else None
 
@@ -218,7 +224,7 @@ async def ids(live_client: AlephClient) -> dict[str, str | None]:
     # collection that is not the first one listed.
     entityset_id = None
     for cid in collection_ids:
-        sets = await live_client.list_entitysets(collection_id=cid)
+        sets = await live_client.list_entitysets(collection=cid)
         if sets["results"]:
             entityset_id = sets["results"][0]["id"]
             break
@@ -229,7 +235,7 @@ async def ids(live_client: AlephClient) -> dict[str, str | None]:
     profile_id = next((h["profile_id"] for h in hits if h.get("profile_id")), None)
     if not profile_id:
         for cid in collection_ids:
-            sets = await live_client.list_entitysets(collection_id=cid, set_type="profile")
+            sets = await live_client.list_entitysets(collection=cid, set_type="profile")
             if sets["results"]:
                 profile_id = sets["results"][0]["id"]
                 break
@@ -237,7 +243,7 @@ async def ids(live_client: AlephClient) -> dict[str, str | None]:
     # Aleph returns no indexText/bodyText on search hits, so a live `Pages` row never carries
     # `_omitted_properties` and scanning general hits for one finds nothing. Ask for the
     # schema instead.
-    pages = await live_client.search_entities(schema="Pages", limit=1)
+    pages = await live_client.search_entities(collection=ALL_COLLECTIONS, schema="Pages", limit=1)
     document_id = pages["results"][0]["id"] if pages["results"] else None
 
     return {
@@ -268,7 +274,12 @@ def _tool_arguments(name: str, ids: dict[str, str | None]) -> dict[str, Any]:
         case "get_collection":
             return {"collection": need("collection_id")}
         case "search_entities":
-            return {"schemata": "Thing", "facets": ["schema"], "limit": 1}
+            return {
+                "collection": need("collection_id"),
+                "schemata": "Thing",
+                "facets": ["schema"],
+                "limit": 1,
+            }
         case "get_entity" | "entity_tags":
             return {"entity_id": need("entity_id")}
         case "expand_entity":
@@ -278,6 +289,7 @@ def _tool_arguments(name: str, ids: dict[str, str | None]) -> dict[str, Any]:
         case "match_entity":
             return {
                 "sample": {"schema": "Person", "properties": {"name": ["Jane Doe"]}},
+                "collection": need("collection_id"),
                 "limit": 3,
             }
         case "get_profile" | "profile_tags":
@@ -287,11 +299,11 @@ def _tool_arguments(name: str, ids: dict[str, str | None]) -> dict[str, Any]:
         case "expand_profile":
             return {"profile_id": need("profile_id"), "limit": 5}
         case "list_entitysets":
-            return {"collection_id": need("collection_id")}
+            return {"collection": need("collection_id")}
         case "get_entityset" | "entityset_items":
             return {"entityset_id": need("entityset_id")}
         case "xref_results":
-            return {"collection_id": need("collection_id")}
+            return {"collection": need("collection_id")}
         case "get_entity_text":
             return {"entity_id": need("document_id"), "limit": 500}
     raise AssertionError(f"no live arguments defined for tool {name!r}")
@@ -350,8 +362,8 @@ async def test_live_responses_match_the_shape_the_mocked_suite_asserts(
     mocks cannot grow the field on their own.
     """
     assert_search_envelope(
-        await live_client.search_entities(schemata="Thing", limit=5),
-        searched={"schemata": "Thing"},
+        await live_client.search_entities(collection=ALL_COLLECTIONS, schemata="Thing", limit=5),
+        searched={"schemata": "Thing", "collection": ALL_COLLECTIONS},
     )
 
     entityset_id = ids["entityset_id"]
