@@ -279,3 +279,157 @@ async def test_a_list_that_names_no_usable_scope_is_refused(
         f"the refusal must name the literal that does mean everything: {message}"
     )
     assert wire.call_count == 0, "a refused call must cost no request"
+
+
+@pytest.mark.parametrize("collection", ["", "   ", "\n"], ids=["empty", "spaces", "newline"])
+async def test_a_blank_collection_is_refused_before_any_request(
+    client: AlephClient, respx_mock: respx.MockRouter, collection: str
+) -> None:
+    """The worst possible value, because Aleph does not read it as naming nothing.
+
+    `sanitize_text` returns None for a blank string, so the filter set comes out empty
+    and `field_filter_query` emits `match_all`: the listing answers with the first
+    collection the key can read, `limit=1` takes it, and the search proceeds against a
+    collection nobody named — with `searched` reporting a plausible id. An empty string is
+    also the likeliest thing a model sends for a required argument it cannot fill, so this
+    is refused locally, before the cache and before any request.
+    """
+    wire = respx_mock.route().mock(return_value=httpx.Response(200, json={"results": []}))
+    with pytest.raises(ValueError, match="must not be empty"):
+        await client.search_entities(collection=collection, q="acme")
+    assert wire.call_count == 0, "a blank scope must not reach the wire"
+
+
+async def test_a_resolved_hit_must_be_the_collection_that_was_asked_for(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The resolver ties the answer back to the question.
+
+    Without this it trusts that the upstream applied the filter it was given, so any
+    leniency — a dropped filter, a loose match, a redirect answered by a different listing
+    — resolves to a plausible id for a collection nobody named and then caches it for the
+    process lifetime. Here the listing answers with a different collection; that must be a
+    refusal, not a search of collection 999.
+    """
+    lookup = respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(
+            200, json={"total": 1, "results": [{"id": "999", "foreign_id": "someone-else"}]}
+        )
+    )
+    entities = respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json=raw_search_payload(raw_entity(), total=1))
+    )
+    with pytest.raises(ValueError, match="list_collections"):
+        await client.search_entities(collection="my-case", q="acme")
+    assert lookup.call_count == 1
+    assert entities.call_count == 0, "an unverified resolution must not be searched"
+    assert client._foreign_ids == {}, "a rejected resolution must never be cached"
+
+
+async def test_a_non_dict_listing_row_is_a_tool_error_not_an_attribute_error(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """`_request` wraps a non-dict JSON body as `{"results": <body>}`, so a bare array
+    upstream makes `results[0]` a string. `.get` on it would raise AttributeError, which
+    no tool's `except ValueError` translates — the caller would see an unhandled exception
+    instead of a legible refusal."""
+    respx_mock.get("/api/2/collections").mock(return_value=httpx.Response(200, json=["x"]))
+    with pytest.raises(ValueError, match="list_collections"):
+        await client.search_entities(collection="my-case", q="acme")
+
+
+async def test_paging_is_refused_before_a_foreign_id_costs_a_lookup(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The spec promises an over-window or negative-paging call sends no request at all.
+    Resolution used to run first, so pairing a foreign_id with bad paging spent a lookup
+    before the free check refused it — and the suite missed it because every paging test
+    passed a numeric id."""
+    wire = respx_mock.route().mock(return_value=httpx.Response(200, json={"results": []}))
+    for kwargs in ({"limit": -1}, {"limit": 100, "offset": MAX_PAGE - 1}):
+        with pytest.raises(ValueError):
+            await client.search_entities(collection="fresh-case", q="acme", **kwargs)  # type: ignore[arg-type]
+    assert wire.call_count == 0, "a refused call must not pay for a collection lookup"
+
+
+async def test_a_scope_naming_too_many_collections_is_refused(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """Each uncached foreign id is a whole upstream request with its own retry budget, so
+    an unbounded list lets one tool call multiply that budget — the amplification the
+    per-request budget and the shrink loop's deadline both exist to prevent."""
+    wire = respx_mock.route().mock(return_value=httpx.Response(200, json={"results": []}))
+    with pytest.raises(ValueError, match="at most"):
+        await client.search_entities(collection=[f"case-{n}" for n in range(11)], q="acme")
+    assert wire.call_count == 0
+
+
+async def test_a_repeated_collection_costs_one_lookup(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """Deduplicated before resolving, so a caller repeating an id in one list does not pay
+    per occurrence, and the emitted filter set carries it once."""
+    lookup = respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(
+            200, json={"total": 1, "results": [{"id": "874", "foreign_id": "my-case"}]}
+        )
+    )
+    route = respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json=raw_search_payload(raw_entity(), total=1))
+    )
+    out = await client.search_entities(collection=["my-case", "my-case", "874"], q="acme")
+    assert lookup.call_count == 1
+    assert _scopes(route.calls.last.request) == ["874"]
+    assert out["searched"]["collection"] == ["874"]
+
+
+@pytest.mark.parametrize(
+    "tool, args",
+    [
+        ("get_collection", {}),
+        ("list_entitysets", {}),
+        ("xref_results", {}),
+    ],
+)
+async def test_the_all_collections_literal_is_refused_by_single_collection_tools(
+    client: AlephClient, respx_mock: respx.MockRouter, tool: str, args: dict[str, object]
+) -> None:
+    """`"*"` is the all-collections literal for the two search tools only. On a tool that
+    addresses exactly one collection it previously fell through to the foreign_id branch,
+    spent a lookup, and failed with 'no collection with foreign_id "*"' — which contradicts
+    the instruction paragraph teaching that `"*"` is this same argument's literal."""
+    wire = respx_mock.route().mock(return_value=httpx.Response(200, json={"results": []}))
+    with pytest.raises(ValueError, match="exactly one collection"):
+        await getattr(client, tool)(collection=ALL_COLLECTIONS, **args)
+    assert wire.call_count == 0
+
+
+async def test_a_lookup_failure_is_reported_against_the_tool_that_was_called(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """Before this, the resolver hard-coded `context="get_collection"`, so a failed lookup
+    during a search told the model to check an id for a tool it never invoked."""
+    respx_mock.get("/api/2/collections").mock(return_value=httpx.Response(503))
+    with pytest.raises(Exception) as excinfo:
+        await client.search_entities(collection="my-case", q="acme")
+    assert "search_entities" in str(excinfo.value), str(excinfo.value)
+
+
+async def test_an_upstream_id_echoed_into_an_error_is_bounded(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The `id` read out of a listing hit is upstream text, not caller text, and it reaches
+    a model-visible error. This repo caps upstream material that reaches the model
+    (`errors.py:_as_quoted_data`, `readonly.py:_describe`); an unbounded echo is a write
+    primitive into the model's context."""
+    respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(
+            200,
+            json={"total": 1, "results": [{"id": "n" * 5000, "foreign_id": "my-case"}]},
+        )
+    )
+    with pytest.raises(ValueError) as excinfo:
+        await client.search_entities(collection="my-case", q="acme")
+    message = str(excinfo.value)
+    assert len(message) < 500, f"upstream text echoed unbounded: {len(message)} chars"
+    assert "chars]" in message, "the clip must say it clipped"

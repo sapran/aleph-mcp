@@ -62,12 +62,26 @@ passed through; anything else is looked up by `filter:foreign_id` and its numeri
 the process lifetime.
 
 The cache is keyed on the foreign id and stores the numeric id. It is safe against the only
-mutation that matters — a collection's numeric id never changes — and a foreign id that resolves
-to nothing raises the same error `get_collection` already raises, naming `list_collections`.
+mutation that matters — a collection's numeric id never changes — and only a *verified*
+resolution is stored: the resolver checks that the record it got back carries the foreign id
+it asked for, so upstream filter leniency raises instead of caching a plausible wrong id. A
+foreign id that resolves to nothing raises the same error `get_collection` already raises,
+naming `list_collections`.
 
-Resolution runs before the paging validations, not after. A caller who passes both a bad
-collection and a bad `limit` learns about the collection first, because that is the argument this
-change is about and the one whose absence was silently tolerated.
+Resolution runs *after* the paging validations. The first draft had it first, on the reasoning
+that a caller passing both a bad collection and a bad `limit` should hear about the collection
+— but resolving a foreign id costs an upstream request, and this spec already promises that an
+over-window or negative-paging call sends none at all. Review caught that the promise held only
+because every paging test happened to pass a numeric id. The intent survives anyway: the scope's
+own refusals — blank, empty list, `"*"` mixed with ids, too many, wrong numeric form — are all
+local and run inside the resolver before it issues anything, so a scope that names nothing is
+still reported without I/O.
+
+A list is bounded and deduplicated, twice: once on the caller's spellings, so a repeated id
+costs one lookup, and once on the resolved ids, so two spellings of one collection do not emit
+the same filter twice. One deadline covers the whole resolution phase, mirroring the shrink
+loop — without it, N sequential lookups would multiply the per-request budget by N, which is
+the amplification that budget exists to prevent.
 
 ### The disclosure goes in `searched`, beside the schema scope
 

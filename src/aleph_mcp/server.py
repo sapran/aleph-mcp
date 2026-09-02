@@ -20,15 +20,19 @@ Working method that fits Aleph's limits:
 0. **Every search names its collection.** `collection` is a required argument on
    `search_entities` and `match_entity`, and it is the same argument — same name, same
    accepted forms — on `get_collection`, `list_entitysets` and `xref_results`. It takes a
-   numeric id ("874"), a `foreign_id` ("68c4558f...") or a list of either; you never need
-   to convert one into the other first. Searching everything is available only as the
-   exact literal `collection="*"`, and says so in the reply's `_note`.
+   numeric id ("874") or a `foreign_id` ("68c4558f..."), whichever you hold; you never
+   need to convert one into the other first. The two search tools also take a list, to
+   search several collections at once; the other three address exactly one. A value of
+   only digits is always read as a numeric id.
+   Searching everything is available only as the exact literal `collection="*"`, on the
+   two search tools, and `search_entities` says so in the reply's `_note`.
    This is required rather than defaulted because Aleph answers an unscoped search
    successfully: a query that meant one collection and did not say so returns another
-   collection's rows, ranked and plausible, with no error anywhere. Do not put
+   collection's rows, ranked and plausible, with no error anywhere. For the same reason an
+   empty or blank `collection` is refused rather than treated as "no scope". Do not put
    `collection_id` in `filters` — that is refused, so that one scope has one spelling.
-   Every reply states the scope it actually searched under `searched`; read it rather than
-   assuming it.
+   Every `search_entities` reply states the scope it actually searched under `searched`;
+   read it rather than assuming it.
 1. `list_collections` to see what this key can read, then `get_collection` for stats.
 2. `search_entities` with `facets=[...]` and `limit=0` FIRST, to learn how a result set
    breaks down before pulling rows. Useful facets: schema, collection_id, countries,

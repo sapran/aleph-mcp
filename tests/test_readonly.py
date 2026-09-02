@@ -418,7 +418,15 @@ async def test_refresh_is_emitted_only_by_get_collection(
         if "refresh" in query:
             refreshing.append(request.url.path)
         return httpx.Response(
-            200, json={"total": 0, "results": [{"id": "42"}], "id": "42", "properties": {}}
+            200,
+            json={
+                "total": 0,
+                # `foreign_id` must echo what the resolver asked for: it verifies the hit
+                # is the collection requested rather than trusting the upstream filter.
+                "results": [{"id": "42", "foreign_id": "my-case"}],
+                "id": "42",
+                "properties": {},
+            },
         )
 
     respx_mock.route(host="aleph.test").mock(side_effect=spy)
@@ -436,3 +444,40 @@ async def test_refresh_is_emitted_only_by_get_collection(
     await client.xref_results(collection="42")
 
     assert refreshing == ["/api/2/collections/42", "/api/2/collections/42"]
+
+
+async def test_a_hostile_foreign_id_stays_a_parameter_value(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The `read-only-guard` scenario names "a collection foreign id" as one of the
+    free-text values that must never become a parameter name, and the sweep above cannot
+    drive it: it passes numeric ids on purpose, because the resolver's own request would
+    displace the tool's in a spy that records one parameter list per request.
+
+    So this drives the resolver directly and inspects the LOOKUP request. Since the
+    resolution path became reachable from five tools rather than one, leaving that half of
+    the scenario asserted by reading rather than by test would let a future edit to the
+    resolver break the invariant without turning anything red.
+    """
+    from urllib.parse import parse_qsl, urlsplit
+
+    lookup = respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(
+            200, json={"total": 1, "results": [{"id": "42", "foreign_id": _HOSTILE}]}
+        )
+    )
+    respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json={"total": 0, "results": []})
+    )
+
+    await client.search_entities(collection=_HOSTILE, q="a")
+
+    assert lookup.call_count == 1
+    query = parse_qsl(urlsplit(str(lookup.calls.last.request.url)).query)
+    names = [k for k, _ in query]
+    for name in names:
+        assert name in _LITERAL_PARAMS or name.startswith(_NAMESPACES), name
+    assert "refresh" not in names and "sync" not in names, (
+        f"the hostile foreign_id escaped into a parameter name: {names}"
+    )
+    assert ("filter:foreign_id", _HOSTILE) in query, "the value must survive intact"

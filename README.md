@@ -165,13 +165,16 @@ always matches the schema version that instance indexes with — no pinned clien
 
 ### Design choices worth knowing
 
-- **A search must name its collection.** `collection` is a required argument, not a
-  defaulted one, and it is the same argument — same name, numeric id or `foreign_id` or a
-  list — on every tool that takes one. Aleph answers an unscoped search *successfully*, so
-  a query that meant one collection and failed to say so returns another collection's rows,
-  ranked and plausible, with no error anywhere. Searching everything is available only as
-  the exact literal `collection="*"`, which is annotated in the reply's `_note`. Passing
-  `collection_id` inside `filters` is refused, so one scope has exactly one spelling.
+- **A search must name its collection.** `collection` is a required argument on
+  `search_entities` and `match_entity`, not a defaulted one, and it is the same argument —
+  same name, numeric id or `foreign_id` — on every tool that takes one. The two search
+  tools also accept a list; the three that address one collection do not. Aleph answers an
+  unscoped search *successfully*, so a query that meant one collection and failed to say so
+  returns another collection's rows, ranked and plausible, with no error anywhere — and a
+  blank value is no safer, because Aleph sanitises the filter away and answers `match_all`.
+  Searching everything is available only as the exact literal `collection="*"`, which
+  `search_entities` annotates in the reply's `_note`. Passing `collection_id` inside
+  `filters` is refused, so one scope has exactly one spelling.
 - **No raw Elasticsearch DSL.** Aleph's `q` is not raw ES: it is a lenient `query_string`,
   with structured constraints arriving as repeated `filter:<field>` arguments. The tools
   expose Aleph's own grammar instead.
