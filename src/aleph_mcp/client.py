@@ -91,6 +91,13 @@ Query = list[tuple[str, str | int | float | bool | None]]
 _ENTITY_ID = re.compile(r"[A-Za-z0-9._:-]+")
 _COLLECTION_ID = re.compile(r"[0-9]+")
 
+# The only way to ask for an unscoped search. Deliberately not a natural-language word: a
+# caller that types it has chosen to search every readable collection, where a caller that
+# omits the argument entirely has chosen nothing and is refused. See
+# openspec/specs/mcp-tool-surface — an unscoped search returned in answer to a scoped
+# question contaminates a product with another collection's rows, silently.
+ALL_COLLECTIONS = "*"
+
 
 def _check_entity_id(value: str, *, field: str = "entity_id") -> str:
     if not isinstance(value, str) or not _ENTITY_ID.fullmatch(value):
@@ -108,8 +115,9 @@ def _check_collection_id(value: str | int) -> str:
     text = str(value)
     if not _COLLECTION_ID.fullmatch(text):
         raise ValueError(
-            f"invalid collection_id: expected the numeric id (got {text!r}). "
-            "If you have a foreign_id such as 'my-case', call get_collection first."
+            f"invalid collection: expected a numeric collection id (got {text!r}). "
+            "A foreign_id is accepted directly and resolved for you; this error means the "
+            "value is neither."
         )
     return text
 
@@ -284,6 +292,9 @@ class AlephClient:
 
     def __init__(self, settings: Settings):
         self._settings = settings
+        # foreign_id -> numeric collection id, for the process lifetime. See
+        # _resolve_collection_id for why this never needs invalidating.
+        self._foreign_ids: dict[str, str] = {}
         self._model: dict[str, Any] | None = None
         self._http = httpx.AsyncClient(
             base_url=settings.host,
@@ -508,33 +519,81 @@ class AlephClient:
     async def get_collection(self, *, collection: str) -> dict[str, Any]:
         """Fetch one collection by numeric id or by foreign_id.
 
-        The numeric branch interpolates into the path, so it goes through the shared
-        validator rather than trusting the branch test. The foreign_id branch is left
-        free-form on purpose: it becomes a url-encoded query parameter and cannot escape
-        the path, and foreign ids are not constrained to any charset.
+        Resolution is shared with every other collection-taking tool
+        (`_resolve_collection_id`), so one value form works everywhere on this surface.
 
-        The foreign_id branch resolves to the numeric id and then takes the same route as
-        the numeric one. The listing endpoint carries no `statistics` block, so answering
+        The listing endpoint carries no `statistics` block, so answering a foreign_id
         straight from the listing hit would return `statistics: null` and silently break
-        the one promise this tool makes over list_collections.
+        the one promise this tool makes over list_collections. Both branches therefore end
+        at the same by-id fetch.
+        """
+        return await self._get_collection_by_id(await self._resolve_collection_id(collection))
+
+    async def _resolve_collection_id(self, collection: str | int) -> str:
+        """Return the numeric id for a numeric id or a foreign_id.
+
+        The numeric branch interpolates into a path, so it goes through the shared
+        validator rather than trusting the branch test. The branch test reads "digits and
+        whitespace only" so that `"42\\n"` is understood as numeric *intent* and refused by
+        the validator, rather than falling through to the foreign_id branch and quietly
+        resolving to nothing.
+
+        A foreign_id is left free-form on purpose: it becomes a url-encoded query
+        parameter and cannot escape the path, and foreign ids are not constrained to any
+        charset.
         """
         text = str(collection)
         if text and not text.strip("0123456789 \t\r\n"):
-            return await self._get_collection_by_id(_check_collection_id(text))
+            return _check_collection_id(text)
+
+        cached = self._foreign_ids.get(text)
+        if cached is not None:
+            return cached
 
         listing = await self._request(
             "GET",
             "/api/2/collections",
             context="get_collection",
-            params=[("filter:foreign_id", str(collection)), ("limit", "1")],
+            params=[("filter:foreign_id", text), ("limit", "1")],
         )
         results = listing.get("results") or []
         if not results:
             raise ValueError(
-                f"no collection with foreign_id {collection!r} is readable with this API key; "
+                f"no collection with foreign_id {text!r} is readable with this API key; "
                 "call list_collections to see what is available"
             )
-        return await self._get_collection_by_id(_check_collection_id(results[0].get("id")))
+        resolved = _check_collection_id(results[0].get("id"))
+        # A collection's numeric id never changes, so this needs no invalidation. Cached for
+        # the process lifetime beside `_model`: a session works one or two collections and
+        # would otherwise pay a lookup on every scoped call.
+        self._foreign_ids[text] = resolved
+        return resolved
+
+    async def _resolve_collection_scope(
+        self, collection: str | list[str]
+    ) -> str | list[str]:
+        """Return `ALL_COLLECTIONS`, or the numeric ids for one or more collections.
+
+        Accepts the literal `"*"`, a single id in either form, or a list of them. A caller
+        that omits the argument never reaches here — the tool signature refuses first,
+        which is the point: see the required-scope requirement in the spec.
+        """
+        if isinstance(collection, str):
+            if collection == ALL_COLLECTIONS:
+                return ALL_COLLECTIONS
+            return [await self._resolve_collection_id(collection)]
+
+        if not collection:
+            raise ValueError(
+                "collection must name at least one collection, or the literal '*' to search "
+                "every readable collection"
+            )
+        if ALL_COLLECTIONS in collection:
+            raise ValueError(
+                "collection='*' searches every readable collection and cannot be combined "
+                "with named collections; pass either '*' or the ids you want"
+            )
+        return [await self._resolve_collection_id(c) for c in collection]
 
     async def _get_collection_by_id(self, collection_id: str) -> dict[str, Any]:
         payload = await self._request(
@@ -550,6 +609,7 @@ class AlephClient:
     async def search_entities(
         self,
         *,
+        collection: str | list[str],
         q: str | None = None,
         filters: dict[str, str | list[str]] | None = None,
         schema: str | None = None,
@@ -560,6 +620,21 @@ class AlephClient:
         offset: int = 0,
         highlight: bool = False,
     ) -> dict[str, Any]:
+        # Two spellings for one scope is how the ambiguity survives its own fix, so the
+        # second one is refused rather than merged. Checked before resolution: the caller
+        # needs to be told which argument to use, not which id won.
+        if filters and "collection_id" in filters:
+            raise ValueError(
+                "collection scope belongs in the `collection` argument, not in `filters`: "
+                f"pass collection={filters['collection_id']!r} and remove "
+                "filters['collection_id']. `collection` also accepts a foreign_id or a list, "
+                f"and {ALL_COLLECTIONS!r} searches every readable collection."
+            )
+        # Ahead of the paging checks on purpose: an unscoped or misspelt collection is the
+        # argument this validation exists for, and the one whose absence was silently
+        # tolerated before. A caller with two bad arguments hears about this one first.
+        scope = await self._resolve_collection_scope(collection)
+
         if limit < 0:
             raise ValueError("limit must be >= 0")
         if offset < 0:
@@ -593,6 +668,11 @@ class AlephClient:
                 params.append(("filter:schema", schema))
             if effective_schemata:
                 params.append(("filter:schemata", effective_schemata))
+            # Inside the closure so the shrink loop rebuilds the scope unchanged with each
+            # smaller page. A list ORs within the key, which is Aleph's filter semantics.
+            if scope != ALL_COLLECTIONS:
+                for cid in scope:
+                    params.append(("filter:collection_id", cid))
             for key, value in (filters or {}).items():
                 for item in value if isinstance(value, list) else [value]:
                     params.append((f"filter:{key}", str(item)))
@@ -641,9 +721,21 @@ class AlephClient:
 
         result = _slim_result(payload, await self._schemata())
         result["searched"] = {"schema": schema} if schema else {"schemata": effective_schemata}
+        # Beside the schema scope rather than in a second mechanism: `searched` already
+        # exists so a caller can tell "no matches" from "matched nothing in a scope I did
+        # not choose", and the collection is the scope that was silently wrong before.
+        result["searched"]["collection"] = scope
         # The notes compose rather than overwrite: a shrunk page in a result set past the
         # window is both truncated and unenumerated, and a caller needs to be told both.
         notes: list[str] = []
+        if scope == ALL_COLLECTIONS:
+            # A deliberate cross-collection search must still read as one in a transcript.
+            # Without this, `"*"` and a scoped search are indistinguishable in the rows.
+            notes.append(
+                "EVERY COLLECTION: this search was not scoped to a collection, so hits may "
+                "come from any dataset this key can read — check each hit's `collection_id` "
+                "before treating it as evidence about one subject."
+            )
         returned = len(result["results"])
         if page != limit and returned:
             resume = offset + returned
@@ -755,7 +847,7 @@ class AlephClient:
         self,
         *,
         sample: dict[str, Any],
-        collection_ids: list[str] | None = None,
+        collection: str | list[str],
         limit: int = 10,
     ) -> dict[str, Any]:
         if "schema" not in sample:
@@ -763,9 +855,14 @@ class AlephClient:
                 "sample must include a followthemoney 'schema' key, e.g. "
                 '{"schema": "Person", "properties": {"name": ["Jane Doe"]}}'
             )
+        scope = await self._resolve_collection_scope(collection)
         params = _page_params(limit, 0, cap=100)
-        for cid in collection_ids or []:
-            params.append(("collection_ids", _check_collection_id(cid)))
+        # Aleph's match endpoint spells this `collection_ids` on the wire; omitting it is
+        # its all-collections behaviour. The wire name stays, the argument does not — see
+        # the one-vocabulary requirement in openspec/specs/mcp-tool-surface.
+        if scope != ALL_COLLECTIONS:
+            for cid in scope:
+                params.append(("collection_ids", cid))
         payload = await self._request(
             "POST", "/api/2/match", context="match_entity", params=params, json=sample
         )
@@ -857,12 +954,12 @@ class AlephClient:
     async def list_entitysets(
         self,
         *,
-        collection_id: str,
+        collection: str,
         set_type: str | None = None,
         limit: int = 30,
     ) -> dict[str, Any]:
         params = _page_params(limit, 0, cap=100)
-        params.append(("filter:collection_id", _check_collection_id(collection_id)))
+        params.append(("filter:collection_id", await self._resolve_collection_id(collection)))
         if set_type:
             params.append(("filter:type", set_type))
         payload = await self._request(
@@ -918,9 +1015,9 @@ class AlephClient:
         return _slim_result(payload, await self._schemata())
 
     async def xref_results(
-        self, *, collection_id: str, limit: int = 30, offset: int = 0
+        self, *, collection: str, limit: int = 30, offset: int = 0
     ) -> dict[str, Any]:
-        cid = _check_collection_id(collection_id)
+        cid = await self._resolve_collection_id(collection)
         payload = await self._request(
             "GET",
             f"/api/2/collections/{cid}/xref",

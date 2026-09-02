@@ -17,6 +17,18 @@ Entities carry typed properties; properties whose type is `entity` are the graph
 
 Working method that fits Aleph's limits:
 
+0. **Every search names its collection.** `collection` is a required argument on
+   `search_entities` and `match_entity`, and it is the same argument — same name, same
+   accepted forms — on `get_collection`, `list_entitysets` and `xref_results`. It takes a
+   numeric id ("874"), a `foreign_id` ("68c4558f...") or a list of either; you never need
+   to convert one into the other first. Searching everything is available only as the
+   exact literal `collection="*"`, and says so in the reply's `_note`.
+   This is required rather than defaulted because Aleph answers an unscoped search
+   successfully: a query that meant one collection and did not say so returns another
+   collection's rows, ranked and plausible, with no error anywhere. Do not put
+   `collection_id` in `filters` — that is refused, so that one scope has one spelling.
+   Every reply states the scope it actually searched under `searched`; read it rather than
+   assuming it.
 1. `list_collections` to see what this key can read, then `get_collection` for stats.
 2. `search_entities` with `facets=[...]` and `limit=0` FIRST, to learn how a result set
    breaks down before pulling rows. Useful facets: schema, collection_id, countries,
@@ -91,6 +103,7 @@ def build_server(settings: Settings) -> tuple[FastMCP, AlephClient]:
 
     @mcp.tool
     async def search_entities(
+        collection: str | list[str],
         q: str | None = None,
         filters: dict[str, str | list[str]] | None = None,
         schema: str | None = None,
@@ -101,13 +114,22 @@ def build_server(settings: Settings) -> tuple[FastMCP, AlephClient]:
         offset: int = 0,
         highlight: bool = False,
     ) -> dict[str, Any]:
-        """Search entities across every readable collection.
+        """Search entities within one or more collections.
 
+        - `collection`: REQUIRED. The collection to search — a numeric id ("874"), a
+          foreign_id ("68c4558f..."), or a list of either. Pass the exact literal "*" to
+          search every readable collection; that is the only way to get an unscoped
+          search, and it is annotated in `_note` when you use it. There is no default,
+          because Aleph answers an unscoped search successfully: a query that meant one
+          collection and forgot to say so comes back full of another collection's rows
+          with no error anywhere.
         - `q`: Elasticsearch query_string. Quote phrases; AND/OR/NOT and wildcards work.
-        - `filters`: exact-match constraints, e.g.
-          {"collection_id": "42", "countries": ["ru", "cy"]}. Different keys are ANDed,
-          values within one list are ORed. Common keys: collection_id, countries,
+        - `filters`: exact-match constraints, e.g. {"countries": ["ru", "cy"]}. Different
+          keys are ANDed, values within one list are ORed. Common keys: countries,
           languages, emails, phones, names, addresses, mime_type, dates, file_name.
+          `collection_id` is NOT accepted here — it is the `collection` argument, and
+          passing it in `filters` is refused rather than merged, so that one scope has one
+          spelling.
         - `schema`: match one exact FtM schema ("Person"). `schemata`: match a schema and
           everything below it ("LegalEntity" also returns Company and Person).
           Aleph *requires* one of these — it selects the search index — so when you give
@@ -115,12 +137,16 @@ def build_server(settings: Settings) -> tuple[FastMCP, AlephClient]:
           `Thing` covers Person, Company, Address, Document, Email and similar. It does
           NOT cover relationships: Ownership, Directorship, Payment and UnknownLink
           descend from `Interval`, so ask for `schemata="Interval"` or name the schema.
-          Every result reports the scope it actually searched under `searched`.
         - `facets`: request bucket counts, e.g. ["schema", "collection_id", "countries"].
           Combine with limit=0 to survey a result set for free before pulling rows.
           `facet_size` is the buckets per facet, 1..200; a longer tail means the slice is
           too broad, so filter and facet again rather than asking for every bucket.
         - `highlight`: return matching snippets; only meaningful together with `q`.
+
+        `searched` reports the scope actually applied — both the schema scope and, under
+        `collection`, the resolved numeric collection ids (or "*"). Read it rather than
+        assuming: it is what distinguishes "no matches here" from "matched nothing in a
+        scope I did not choose".
 
         A page whose response would exceed the server's size ceiling is served smaller
         rather than failed: the reply then carries `truncated: true` and
@@ -133,6 +159,7 @@ def build_server(settings: Settings) -> tuple[FastMCP, AlephClient]:
         """
         try:
             return await client.search_entities(
+                collection=collection,
                 q=q,
                 filters=filters,
                 schema=schema,
@@ -205,19 +232,22 @@ def build_server(settings: Settings) -> tuple[FastMCP, AlephClient]:
     @mcp.tool
     async def match_entity(
         sample: dict[str, Any],
-        collection_ids: list[str] | None = None,
+        collection: str | list[str],
         limit: int = 10,
     ) -> dict[str, Any]:
         """Look up a person or company you describe, rather than one already in Aleph.
 
         `sample` is an FtM entity fragment, e.g.
         {"schema": "Person", "properties": {"name": ["Jane Doe"], "birthDate": ["1970"]}}.
-        Use this to check an externally-obtained name against the whole index.
+        Use this to check an externally-obtained name against the index.
+
+        `collection` is REQUIRED and takes a numeric id, a foreign_id, or a list of
+        either — the same argument as every other tool here. Pass the exact literal "*" to
+        match against every readable collection, which is the right choice when the
+        question is "does this person appear anywhere at all".
         """
         try:
-            return await client.match_entity(
-                sample=sample, collection_ids=collection_ids, limit=limit
-            )
+            return await client.match_entity(sample=sample, collection=collection, limit=limit)
         except ValueError as e:
             raise ToolError(str(e)) from e
 
@@ -285,17 +315,19 @@ def build_server(settings: Settings) -> tuple[FastMCP, AlephClient]:
 
     @mcp.tool
     async def list_entitysets(
-        collection_id: str, set_type: str | None = None, limit: int = 30
+        collection: str, set_type: str | None = None, limit: int = 30
     ) -> dict[str, Any]:
         """List the curated sets in a collection: lists, network diagrams and timelines.
 
         These encode what human investigators already decided matters. Read them before
         re-deriving the same structure yourself. `set_type` filters to one of
         "list", "diagram", "timeline".
+
+        `collection` takes a numeric id or a foreign_id.
         """
         try:
             return await client.list_entitysets(
-                collection_id=collection_id, set_type=set_type, limit=limit
+                collection=collection, set_type=set_type, limit=limit
             )
         except ValueError as e:
             raise ToolError(str(e)) from e
@@ -327,17 +359,17 @@ def build_server(settings: Settings) -> tuple[FastMCP, AlephClient]:
             raise ToolError(str(e)) from e
 
     @mcp.tool
-    async def xref_results(collection_id: str, limit: int = 30, offset: int = 0) -> dict[str, Any]:
+    async def xref_results(collection: str, limit: int = 30, offset: int = 0) -> dict[str, Any]:
         """Read existing cross-reference matches between this collection and others.
 
         Cross-referencing is how an investigation is linked to sanctions lists, company
         registries and other datasets. This reads results already computed on the server;
         it cannot start a new cross-reference run. Empty means none has been run.
+
+        `collection` takes a numeric id or a foreign_id.
         """
         try:
-            return await client.xref_results(
-                collection_id=collection_id, limit=limit, offset=offset
-            )
+            return await client.xref_results(collection=collection, limit=limit, offset=offset)
         except ValueError as e:
             raise ToolError(str(e)) from e
 
