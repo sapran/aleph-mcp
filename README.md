@@ -143,12 +143,12 @@ Seventeen tools, all reads:
 | --- | --- | --- |
 | `list_collections` | `GET /api/2/collections` | what this key can read |
 | `get_collection` | `GET /api/2/collections/<id>` | metadata + statistics; accepts a `foreign_id` |
-| `search_entities` | `GET /api/2/entities` | `q` + `filter:` + facets, the main entry point |
+| `search_entities` | `GET /api/2/entities` | `q` + `filter:` + facets, the main entry point; `collection` required |
 | `get_entity` | `GET /api/2/entities/<id>` | one entity |
 | `expand_entity` | `.../expand` | graph neighbours, grouped by property |
 | `entity_tags` | `.../tags` | who else shares this phone / email / address |
 | `similar_entities` | `.../similar` | probable duplicates, scored |
-| `match_entity` | `POST /api/2/match` | look up a name you supply, not one already indexed |
+| `match_entity` | `POST /api/2/match` | look up a name you supply, not one already indexed; `collection` required |
 | `get_profile` | `GET /api/2/profiles/<id>` | a resolved identity: constituent entities + the merged pseudo-entity |
 | `profile_tags` | `.../tags` | shared values across the merged identity, not one fragment |
 | `profile_similar` | `.../similar` | candidates the existing merge did not absorb |
@@ -165,6 +165,16 @@ always matches the schema version that instance indexes with — no pinned clien
 
 ### Design choices worth knowing
 
+- **A search must name its collection.** `collection` is a required argument on
+  `search_entities` and `match_entity`, not a defaulted one, and it is the same argument —
+  same name, numeric id or `foreign_id` — on every tool that takes one. The two search
+  tools also accept a list; the three that address one collection do not. Aleph answers an
+  unscoped search *successfully*, so a query that meant one collection and failed to say so
+  returns another collection's rows, ranked and plausible, with no error anywhere — and a
+  blank value is no safer, because Aleph sanitises the filter away and answers `match_all`.
+  Searching everything is available only as the exact literal `collection="*"`, which
+  `search_entities` annotates in the reply's `_note`. Passing `collection_id` inside
+  `filters` is refused, so one scope has exactly one spelling.
 - **No raw Elasticsearch DSL.** Aleph's `q` is not raw ES: it is a lenient `query_string`,
   with structured constraints arriving as repeated `filter:<field>` arguments. The tools
   expose Aleph's own grammar instead.

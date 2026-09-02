@@ -133,6 +133,7 @@ FORWARDING_CASES: tuple[tuple[str, dict[str, Any]], ...] = (
     (
         "search_entities",
         {
+            "collection": ["874", "42"],
             "q": "acme",
             "filters": {"countries": ["ru", "cy"]},
             "schema": "Person",
@@ -152,7 +153,7 @@ FORWARDING_CASES: tuple[tuple[str, dict[str, Any]], ...] = (
         "match_entity",
         {
             "sample": {"schema": "Person", "properties": {"name": ["Jane Doe"]}},
-            "collection_ids": ["42"],
+            "collection": ["42"],
             "limit": 6,
         },
     ),
@@ -160,10 +161,10 @@ FORWARDING_CASES: tuple[tuple[str, dict[str, Any]], ...] = (
     ("profile_tags", {"profile_id": "p1"}),
     ("profile_similar", {"profile_id": "p1", "limit": 4}),
     ("expand_profile", {"profile_id": "p1", "properties": ["ownershipOwner"], "limit": 9}),
-    ("list_entitysets", {"collection_id": "42", "set_type": "diagram", "limit": 8}),
+    ("list_entitysets", {"collection": "42", "set_type": "diagram", "limit": 8}),
     ("get_entityset", {"entityset_id": "es1"}),
     ("entityset_items", {"entityset_id": "es1", "limit": 11, "offset": 5}),
-    ("xref_results", {"collection_id": "42", "limit": 12, "offset": 3}),
+    ("xref_results", {"collection": "42", "limit": 12, "offset": 3}),
     ("get_entity_text", {"entity_id": "d1", "offset": 100, "limit": 500}),
 )
 
@@ -193,23 +194,39 @@ async def test_tool_forwards_every_argument_and_returns_the_payload(
 
 # Every refusal the client can raise, one per tool, with the phrase the caller is shown.
 # Together these execute all seventeen `except ValueError: raise ToolError` arms.
+#
+# Each argument set must reach the client and fail *there*: a set that FastMCP rejects on
+# the signature never enters the try block, so the arm this file exists to cover goes
+# unexecuted while the test still passes on the phrase. That is why every collection-taking
+# tool below is given a `collection` — and a numeric-looking one, so the refusal is the
+# client's own and costs no lookup request.
 ERROR_CASES: tuple[tuple[str, dict[str, Any], str, int], ...] = (
     ("list_collections", {"limit": 101}, "between 0 and 100", 0),
     ("get_collection", {"collection": "unknown-fid"}, "no collection with foreign_id", 1),
-    ("search_entities", {"limit": 100, "offset": 9999}, "9999", 0),
+    (
+        "search_entities",
+        {"collection": "874", "limit": 100, "offset": 9999},
+        "cannot page past result 9999",
+        0,
+    ),
     ("get_entity", {"entity_id": "../etc/passwd"}, "invalid entity_id", 0),
     ("expand_entity", {"entity_id": "e1", "limit": 201}, "200", 0),
     ("entity_tags", {"entity_id": "e1\n"}, "invalid entity_id", 0),
     ("similar_entities", {"entity_id": ".."}, "invalid entity_id", 0),
-    ("match_entity", {"sample": {"properties": {"name": ["x"]}}}, "schema", 0),
+    (
+        "match_entity",
+        {"sample": {"properties": {"name": ["x"]}}, "collection": "874"},
+        "must include a followthemoney 'schema' key",
+        0,
+    ),
     ("get_profile", {"profile_id": ".."}, "invalid profile_id", 0),
     ("profile_tags", {"profile_id": "p 1"}, "invalid profile_id", 0),
     ("profile_similar", {"profile_id": ".."}, "invalid profile_id", 0),
     ("expand_profile", {"profile_id": "p1", "limit": 201}, "200", 0),
-    ("list_entitysets", {"collection_id": "my-case"}, "numeric id", 0),
+    ("list_entitysets", {"collection": "42\n"}, "expected a numeric collection id", 0),
     ("get_entityset", {"entityset_id": ".."}, "invalid entityset_id", 0),
     ("entityset_items", {"entityset_id": "es1", "limit": 201}, "between 0 and 200", 0),
-    ("xref_results", {"collection_id": "my-case"}, "numeric id", 0),
+    ("xref_results", {"collection": "42\n"}, "expected a numeric collection id", 0),
     ("get_entity_text", {"entity_id": "d1", "limit": 200001}, "200000", 0),
 )
 
@@ -235,8 +252,15 @@ async def test_client_refusal_surfaces_as_a_tool_error(
     and nothing is sent to Aleph — a refused call must cost no request."""
     wire = respx_mock.route().mock(return_value=httpx.Response(200, json={"results": []}))
     async with MCPClient(server) as mcp:
-        with pytest.raises(ToolError, match=match):
+        with pytest.raises(ToolError, match=match) as excinfo:
             await mcp.call_tool(tool, args)
+    # The arm under test is the client's own `except ValueError`, so the refusal has to
+    # come from the client rather than from FastMCP's signature validation: an argument
+    # set the signature rejects never enters the try block at all, and the message it
+    # raises instead quotes the whole input dict — which can satisfy the expected phrase
+    # by accident. Measured: with `collection` missing, the search_entities case below
+    # passed on the 9999 echoed back inside that quoted input.
+    assert "validation error" not in str(excinfo.value)
     assert wire.call_count == wire_calls
     if wire_calls:
         # get_collection can only learn a foreign_id is unknown by asking the listing;
@@ -263,10 +287,17 @@ async def test_search_entities_end_to_end(server: FastMCP, respx_mock: respx.Moc
     )
     async with MCPClient(server) as mcp:
         result = await mcp.call_tool(
-            "search_entities", {"q": "acme", "facets": ["schema"], "highlight": True, "limit": 2}
+            "search_entities",
+            {
+                "collection": "874",
+                "q": "acme",
+                "facets": ["schema"],
+                "highlight": True,
+                "limit": 2,
+            },
         )
     out = result.data
-    assert_search_envelope(out, searched={"schemata": "Thing"})
+    assert_search_envelope(out, searched={"schemata": "Thing", "collection": ["874"]})
     assert out["results"][1]["_omitted_properties"] == sorted(BLOB_PROPS)
     assert out["facets"]["schema"]["values"][0]["count"] == 2
     assert "_note" not in out

@@ -261,7 +261,9 @@ async def test_307_redirect_cannot_replay_a_match_body_into_a_write(
         return_value=httpx.Response(200, json={})
     )
     with pytest.raises(ToolError, match="read-only"):
-        await client.match_entity(sample={"schema": "Person", "properties": {"name": ["x"]}})
+        await client.match_entity(
+            sample={"schema": "Person", "properties": {"name": ["x"]}}, collection="874"
+        )
     assert blocked.call_count == 0
 
 
@@ -365,12 +367,15 @@ async def _emitted_params(client: AlephClient, respx_mock: respx.MockRouter) -> 
 
     respx_mock.route(host="aleph.test").mock(side_effect=spy)
 
-    await client.search_entities(filters={_HOSTILE: "x"}, q="a")
-    await client.search_entities(facets=[_HOSTILE])
-    await client.search_entities(filters={"countries": [_HOSTILE]})
+    # Numeric collection ids throughout: a foreign_id makes each of these drivers issue a
+    # `/api/2/collections` lookup first, and the spy records one parameter list per request
+    # — so the sweep would be checking the resolver's own request rather than the tool's.
+    await client.search_entities(collection="874", filters={_HOSTILE: "x"}, q="a")
+    await client.search_entities(collection="874", facets=[_HOSTILE])
+    await client.search_entities(collection="874", filters={"countries": [_HOSTILE]})
     await client.list_collections(q=_HOSTILE)
     await client.expand_entity(entity_id="e1", properties=[_HOSTILE])
-    await client.list_entitysets(collection_id="42", set_type=_HOSTILE)
+    await client.list_entitysets(collection="42", set_type=_HOSTILE)
     return names
 
 
@@ -398,7 +403,12 @@ async def test_refresh_is_emitted_only_by_get_collection(
     """`refresh=true` asks Aleph to recompute statistics — the only request that asks
     the server to do work. Tripwire so the exception list cannot grow quietly. Both
     get_collection branches end on the same numeric route, so both refresh; nothing
-    else may."""
+    else may.
+
+    Every other driver is given a numeric collection so no foreign-id lookup is issued:
+    the resolver's own `/api/2/collections` request carries no `refresh`, but it would
+    make this sweep's request list depend on the resolver cache rather than on the tools.
+    """
     from urllib.parse import parse_qsl, urlsplit
 
     refreshing: list[str] = []
@@ -408,7 +418,15 @@ async def test_refresh_is_emitted_only_by_get_collection(
         if "refresh" in query:
             refreshing.append(request.url.path)
         return httpx.Response(
-            200, json={"total": 0, "results": [{"id": "42"}], "id": "42", "properties": {}}
+            200,
+            json={
+                "total": 0,
+                # `foreign_id` must echo what the resolver asked for: it verifies the hit
+                # is the collection requested rather than trusting the upstream filter.
+                "results": [{"id": "42", "foreign_id": "my-case"}],
+                "id": "42",
+                "properties": {},
+            },
         )
 
     respx_mock.route(host="aleph.test").mock(side_effect=spy)
@@ -416,13 +434,50 @@ async def test_refresh_is_emitted_only_by_get_collection(
     await client.list_collections()
     await client.get_collection(collection="42")
     await client.get_collection(collection="my-case")
-    await client.search_entities(q="x")
+    await client.search_entities(collection="874", q="x")
     await client.get_entity(entity_id="e1")
     await client.expand_entity(entity_id="e1")
     await client.entity_tags(entity_id="e1")
     await client.similar_entities(entity_id="e1")
-    await client.list_entitysets(collection_id="42")
+    await client.list_entitysets(collection="42")
     await client.entityset_items(entityset_id="es1")
-    await client.xref_results(collection_id="42")
+    await client.xref_results(collection="42")
 
     assert refreshing == ["/api/2/collections/42", "/api/2/collections/42"]
+
+
+async def test_a_hostile_foreign_id_stays_a_parameter_value(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The `read-only-guard` scenario names "a collection foreign id" as one of the
+    free-text values that must never become a parameter name, and the sweep above cannot
+    drive it: it passes numeric ids on purpose, because the resolver's own request would
+    displace the tool's in a spy that records one parameter list per request.
+
+    So this drives the resolver directly and inspects the LOOKUP request. Since the
+    resolution path became reachable from five tools rather than one, leaving that half of
+    the scenario asserted by reading rather than by test would let a future edit to the
+    resolver break the invariant without turning anything red.
+    """
+    from urllib.parse import parse_qsl, urlsplit
+
+    lookup = respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(
+            200, json={"total": 1, "results": [{"id": "42", "foreign_id": _HOSTILE}]}
+        )
+    )
+    respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json={"total": 0, "results": []})
+    )
+
+    await client.search_entities(collection=_HOSTILE, q="a")
+
+    assert lookup.call_count == 1
+    query = parse_qsl(urlsplit(str(lookup.calls.last.request.url)).query)
+    names = [k for k, _ in query]
+    for name in names:
+        assert name in _LITERAL_PARAMS or name.startswith(_NAMESPACES), name
+    assert "refresh" not in names and "sync" not in names, (
+        f"the hostile foreign_id escaped into a parameter name: {names}"
+    )
+    assert ("filter:foreign_id", _HOSTILE) in query, "the value must survive intact"
