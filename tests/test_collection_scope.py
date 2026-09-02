@@ -464,12 +464,9 @@ async def test_the_all_collections_literal_mixed_with_a_numeric_id_is_a_legible_
 ) -> None:
     """`["*", 874]` must be the ordinary refusal, with an int present in the list.
 
-    The docstring this replaces claimed the case guards a `TypeError` from shape dispatch.
-    It does not, and cannot: `"*" in ["*", 874]` is ordinary list membership and never
-    touches the int, so this test survived the mutation that reintroduced that bug — the
-    `[874, "874"]` case above is the one that catches it. What this pins is narrower and
-    still worth having: the mixed-scope refusal fires on element identity rather than on
-    every element being a string, and it costs no request.
+    The mixed-scope refusal fires on element identity rather than on every element being a
+    string, and it costs no request. It does not detect a shape-dispatch bug: the
+    `[874, "874"]` case above is the one that catches that.
     """
     wire = respx_mock.route().mock(return_value=httpx.Response(200, json={"results": []}))
     with pytest.raises(ValueError, match="cannot be combined"):
