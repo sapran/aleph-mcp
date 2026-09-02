@@ -18,3 +18,6 @@ build/
 # containing `*`; if that file is ever removed, session memory becomes committable.
 .remember/
 .claude/settings.local.json
+
+# Disposable worktrees for in-flight changes; never part of the shipped tree.
+.worktrees/
