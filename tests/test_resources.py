@@ -71,8 +71,13 @@ async def test_unknown_schema_resource_errors(
 ) -> None:
     respx_mock.get("/api/2/metadata").mock(return_value=httpx.Response(200, json=raw_model()))
     async with MCPClient(server) as mcp:
-        with pytest.raises(Exception, match="unknown followthemoney schema"):
+        with pytest.raises(Exception, match="unknown followthemoney schema") as excinfo:
             await mcp.read_resource("aleph://schema/Nonsense")
+    # The client's own message reaches the caller unprefixed, which is what the refusal
+    # seam is for. The phrase alone cannot see that: FastMCP turns a ResourceError into a
+    # protocol McpError either way, and an untranslated refusal arrives as the same
+    # McpError with the same phrase appended to "Error reading resource '<uri>': ".
+    assert not str(excinfo.value).startswith("Error reading resource")
 
 
 # -- coverage tripwire ---------------------------------------------------------
