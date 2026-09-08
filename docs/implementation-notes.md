@@ -86,6 +86,7 @@ Retired since the last prune:
   drift check (`dist/core/references.js`: "root resolution is never affected") — and the store is
   intentionally left unregistered so nothing is written into acordia. The tool-name expectation is
   therefore visible, not enforced; asserting it would invert the dependency.
+
 - `.github/workflows/ci.yml`, the `build` job's licence assertion: `tar tzf dist/*.tar.gz |
   grep -q '/LICENSE$'` runs under `set -o pipefail`, so it fails intermittently with `tar:
   stdout: write error` (exit 2). The sdist listing is 6373 bytes across 100 entries with
@@ -130,3 +131,53 @@ Retired since the last prune:
 - `pyproject.toml` sets `line-length = 100` while `[tool.ruff.lint]` ignores `E501`, so line
   length is enforced only by `ruff format`, never by `ruff check`. Harmless today; noted
   because the contributor-facing constraint reads as if `ruff check` enforces it.
+
+- **`test_search_derives_captions_from_the_instance_model` cannot fail.** Found while building
+  the shaping seam (T1). Its mocked model declares the caption order `["name"]`, which is also
+  the first entry of `_CAPTION_FALLBACK`, so the test passes whether or not the instance model
+  reaches the slimmer -- it was the only integration test claiming to pin that plumbing. Left
+  alone rather than rewritten: T1's `test_every_entity_returning_method_shapes_its_reply` now
+  covers the same path with a discriminating model, so this one is superseded, not load-bearing.
+  Deleting or strengthening it is a separate, purely-test change.
+
+- **`get_entity_text` derives no caption.** `client.py` reads `entity.get("caption")` straight
+  off the payload, where every slimmed path calls `derive_caption`. Live Aleph sends a null
+  caption, so this is the one tool that can return `caption: null` for an entity the other tools
+  would have captioned. Found during T1; fixing it changes a tool's output and so is a behaviour
+  change, not a refactor.
+
+- **`_schemata()` does not cache its failures.** `get_model` memoises only a success, and
+  `_schemata` swallows every exception, so a persistently broken `/api/2/metadata` costs the full
+  retry budget on *every* entity-returning call while still returning `None`. Found during T1 and
+  left alone: negative caching is a behaviour change. Note the test-suite side effect -- because
+  respx raises on an unmocked route and that raise is swallowed, almost every test in the suite
+  exercises the `schemata=None` path by accident. The sharper half: the degradation carries no
+  signal at all. Every other degradation in `client.py` announces itself -- `search_entities` emits
+  `TRUNCATED PAGE` / `EMPTY SLICE` / `EVERY COLLECTION` notes, `_slim_tags` attaches `_provenance`
+  -- but a caption derived from the fallback order is indistinguishable from one the instance's own
+  ontology produced. A `_note` when `schemata is None` would meet the standard the rest of the file
+  already sets.
+
+- **`get_profile` passes its `entities` field through unshaped.** It holds id strings in every
+  fixture and on the live instance, so nothing leaks today, but the "binds every entity-shaped
+  value in a response" requirement in `openspec/specs/mcp-tool-surface` would be violated by an
+  instance that serialised objects there. Since T1 this fails closed rather than leaking: `_shape`
+  refuses an unmarked entity-shaped dict. Read both halves of that trade -- on such an instance
+  `get_profile` does not degrade, it stops answering entirely, and the refusal is not something
+  the caller can act on. That is the right way round for unbounded document text reaching a model,
+  but it is a real availability cost on a version bump rather than a free win. Deciding whether to
+  mark the field is a spec question, not a refactor.
+
+- **`_slim_entityset` copies upstream `entities` verbatim, and nothing fails closed there.**
+  `get_entityset` and `list_entitysets` pass that field straight through, exactly as `get_profile`
+  does -- but both sit outside T1's shaping seam, so the `_shape` guard never runs on their replies
+  and the protection recorded in the note above does not extend to them. Found by review of the T1
+  branch; parked because T1's scope is the ten entity-returning methods and netting these two means
+  deciding whether an entityset's `entities` is entity-shaped at all, which is a spec question.
+
+- **The client-method partition is declared, never verified.** `test_every_client_method_is_classified`
+  forces every public attribute of `AlephClient` onto one of two lists, which stops a method joining
+  the class unclassified -- but nothing checks that a method listed in `NOT_ENTITY_RETURNING` really
+  returns no entities, and listing it there is the cheapest way to make the test go green. A
+  parametrised test over that list asserting each reply carries no entity-shaped dict would close
+  it. Parked from the T1 review: it asserts behaviour of eleven methods T1 does not touch.
