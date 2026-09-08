@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json as jsonlib
 import re
 import secrets
 import time
-from collections.abc import Callable
-from typing import Any, Final, Literal
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any, Concatenate, Final, Literal, cast
 
 import httpx
 
@@ -236,6 +238,69 @@ def slim_entity(entity: dict[str, Any], schemata: dict[str, Any] | None = None) 
     return slim
 
 
+# -- the shaping seam ----------------------------------------------------------
+#
+# Shaping is not a decision an endpoint method gets to make. Each one builds its reply and
+# marks every entity in it with `_Ent`; `@_shaped` fetches the instance model once and turns
+# each marker into a slimmed entity on the way out. Ten methods used to fetch the model and
+# call the slimmer themselves, so omitting it at one of them raised nothing, failed no test,
+# and silently fell back to _CAPTION_FALLBACK -- right often enough to go unnoticed.
+
+# Populated by the decorator at import time. A hand-kept list would drift; this one cannot,
+# which is what lets a test enumerate the shaped endpoints exactly.
+_SHAPED_ENDPOINTS: set[str] = set()
+
+
+@dataclass(frozen=True, slots=True)
+class _Ent:
+    """A raw upstream entity, marked to be shaped on the way out of this module."""
+
+    raw: dict[str, Any]
+
+
+def _shape(node: Any, schemata: dict[str, Any] | None, endpoint: str) -> Any:
+    """Replace every `_Ent` marker in a built reply with its slimmed entity.
+
+    Refuses on an entity-shaped dict carrying no marker rather than passing it through --
+    the same fail-closed stance readonly.py takes on the way out. `schema` plus `properties`
+    is the signature of an upstream entity and of nothing else these replies carry:
+    `searched` has a `schema` key but no `properties`, and get_schema has `properties` but
+    no `schema` and is not a shaped endpoint. A slimmed entity has both, which is why the
+    marker branch substitutes and does not descend into its own output.
+
+    The message names the endpoint and quotes nothing from upstream: the offending keys are
+    attacker-influenced, and bounding them is `errors.py`'s job, not this one's.
+    """
+    if isinstance(node, _Ent):
+        return slim_entity(node.raw, schemata)
+    if isinstance(node, dict):
+        if "schema" in node and "properties" in node:
+            raise RuntimeError(
+                f"{endpoint} built a reply carrying a raw upstream entity instead of "
+                "marking it with _Ent, so its document text would have reached the model."
+            )
+        return {key: _shape(value, schemata, endpoint) for key, value in node.items()}
+    if isinstance(node, list):
+        return [_shape(item, schemata, endpoint) for item in node]
+    return node
+
+
+def _shaped[**P](
+    method: Callable[Concatenate[AlephClient, P], Awaitable[Any]],
+) -> Callable[Concatenate[AlephClient, P], Awaitable[dict[str, Any]]]:
+    """Route an entity-bearing reply through the seam, and register the endpoint."""
+    _SHAPED_ENDPOINTS.add(method.__name__)
+
+    # `self, /` is load-bearing rather than stylistic: functools.wraps gives __call__ a
+    # *named* first parameter, which does not satisfy the positional slot Concatenate
+    # declares, and the decorated method would stop type-checking at its call sites.
+    @functools.wraps(method)
+    async def wrapper(self: AlephClient, /, *args: P.args, **kwargs: P.kwargs) -> dict[str, Any]:
+        return await self._reply(await method(self, *args, **kwargs), method.__name__)
+
+    return wrapper
+
+
 def _slim_facets(facets: Any) -> Any:
     """Bound a facets block the way slim_entity bounds properties.
 
@@ -294,13 +359,13 @@ def _slim_tags(payload: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _slim_result(payload: dict[str, Any], schemata: dict[str, Any] | None = None) -> dict[str, Any]:
+def _slim_result(payload: dict[str, Any]) -> dict[str, Any]:
     total = payload.get("total")
     out: dict[str, Any] = {
         "total": total,
         "limit": payload.get("limit"),
         "offset": payload.get("offset"),
-        "results": [slim_entity(e, schemata) for e in payload.get("results") or []],
+        "results": [_Ent(e) for e in payload.get("results") or []],
     }
     if payload.get("facets"):
         out["facets"] = _slim_facets(payload["facets"])
@@ -357,6 +422,14 @@ class AlephClient:
             )
             self._model = payload.get("model") or {}
         return self._model
+
+    async def _reply(self, built: Any, endpoint: str) -> dict[str, Any]:
+        """The one exit every entity-bearing reply leaves this class through.
+
+        The instance model is fetched once here, after the endpoint has made its own
+        request, so a call refused before that point still costs no upstream request.
+        """
+        return cast(dict[str, Any], _shape(built, await self._schemata(), endpoint))
 
     async def _schemata(self) -> dict[str, Any] | None:
         """Cached FtM schemata, used only to derive captions. Never fatal."""
@@ -702,6 +775,7 @@ class AlephClient:
 
     # -- entity search ---------------------------------------------------------
 
+    @_shaped
     async def search_entities(
         self,
         *,
@@ -818,7 +892,7 @@ class AlephClient:
                 page = _shrunk_page(page)
         assert payload is not None  # the loop either bound it or raised
 
-        result = _slim_result(payload, await self._schemata())
+        result = _slim_result(payload)
         result["searched"] = {"schema": schema} if schema else {"schemata": effective_schemata}
         # Beside the schema scope rather than in a second mechanism: `searched` already
         # exists so a caller can tell "no matches" from "matched nothing in a scope I did
@@ -878,11 +952,13 @@ class AlephClient:
             result["_note"] = " ".join(notes)
         return result
 
-    async def get_entity(self, *, entity_id: str) -> dict[str, Any]:
+    @_shaped
+    async def get_entity(self, *, entity_id: str) -> _Ent:
         _check_entity_id(entity_id)
         payload = await self._request("GET", f"/api/2/entities/{entity_id}", context="get_entity")
-        return slim_entity(payload, await self._schemata())
+        return _Ent(payload)
 
+    @_shaped
     async def expand_entity(
         self, *, entity_id: str, properties: list[str] | None = None, limit: int = 50
     ) -> dict[str, Any]:
@@ -901,19 +977,19 @@ class AlephClient:
             context="expand_entity",
             params=params,
         )
-        schemata = await self._schemata()
         return {
             "total": payload.get("total"),
             "results": [
                 {
                     "property": group.get("property"),
                     "count": group.get("count"),
-                    "entities": [slim_entity(e, schemata) for e in group.get("entities") or []],
+                    "entities": [_Ent(e) for e in group.get("entities") or []],
                 }
                 for group in payload.get("results") or []
             ],
         }
 
+    @_shaped
     async def similar_entities(self, *, entity_id: str, limit: int = 20) -> dict[str, Any]:
         _check_entity_id(entity_id)
         payload = await self._request(
@@ -922,14 +998,13 @@ class AlephClient:
             context="similar_entities",
             params=_page_params(limit, 0, cap=100),
         )
-        schemata = await self._schemata()
         return {
             "total": payload.get("total"),
             "results": [
                 {
                     "score": item.get("score"),
                     "judgement": item.get("judgement"),
-                    "entity": slim_entity(item.get("entity") or {}, schemata),
+                    "entity": _Ent(item.get("entity") or {}),
                 }
                 for item in payload.get("results") or []
             ],
@@ -942,6 +1017,7 @@ class AlephClient:
         )
         return _slim_tags(payload)
 
+    @_shaped
     async def match_entity(
         self,
         *,
@@ -969,10 +1045,11 @@ class AlephClient:
         payload = await self._request(
             "POST", "/api/2/match", context="match_entity", params=params, json=sample
         )
-        return _slim_result(payload, await self._schemata())
+        return _slim_result(payload)
 
     # -- profiles --------------------------------------------------------------
 
+    @_shaped
     async def get_profile(self, *, profile_id: str) -> dict[str, Any]:
         _check_entity_id(profile_id, field="profile_id")
         payload = await self._request("GET", f"/api/2/profiles/{profile_id}", context="get_profile")
@@ -988,7 +1065,7 @@ class AlephClient:
             "collection_id": _collection_id(payload),
             "updated_at": payload.get("updated_at"),
             "entities": payload.get("entities"),
-            "merged": slim_entity(payload.get("merged") or {}, await self._schemata()),
+            "merged": _Ent(payload.get("merged") or {}),
         }
 
     async def profile_tags(self, *, profile_id: str) -> dict[str, Any]:
@@ -998,6 +1075,7 @@ class AlephClient:
         )
         return _slim_tags(payload)
 
+    @_shaped
     async def profile_similar(self, *, profile_id: str, limit: int = 20) -> dict[str, Any]:
         _check_entity_id(profile_id, field="profile_id")
         payload = await self._request(
@@ -1006,19 +1084,19 @@ class AlephClient:
             context="profile_similar",
             params=_page_params(limit, 0, cap=100),
         )
-        schemata = await self._schemata()
         return {
             "total": payload.get("total"),
             "results": [
                 {
                     "score": item.get("score"),
                     "judgement": item.get("judgement"),
-                    "entity": slim_entity(item.get("entity") or {}, schemata),
+                    "entity": _Ent(item.get("entity") or {}),
                 }
                 for item in payload.get("results") or []
             ],
         }
 
+    @_shaped
     async def expand_profile(
         self, *, profile_id: str, properties: list[str] | None = None, limit: int = 50
     ) -> dict[str, Any]:
@@ -1039,14 +1117,13 @@ class AlephClient:
             context="expand_profile",
             params=params,
         )
-        schemata = await self._schemata()
         return {
             "total": payload.get("total"),
             "results": [
                 {
                     "property": group.get("property"),
                     "count": group.get("count"),
-                    "entities": [slim_entity(e, schemata) for e in group.get("entities") or []],
+                    "entities": [_Ent(e) for e in group.get("entities") or []],
                 }
                 for group in payload.get("results") or []
             ],
@@ -1110,6 +1187,7 @@ class AlephClient:
             return payload
         return _slim_entityset(payload, full=True)
 
+    @_shaped
     async def entityset_items(
         self, *, entityset_id: str, limit: int = 50, offset: int = 0
     ) -> dict[str, Any]:
@@ -1120,8 +1198,9 @@ class AlephClient:
             context="entityset_items",
             params=_page_params(limit, offset, cap=200),
         )
-        return _slim_result(payload, await self._schemata())
+        return _slim_result(payload)
 
+    @_shaped
     async def xref_results(
         self, *, collection: str, limit: int = 30, offset: int = 0
     ) -> dict[str, Any]:
@@ -1135,7 +1214,6 @@ class AlephClient:
             context="xref_results",
             params=params,
         )
-        schemata = await self._schemata()
         return {
             "total": payload.get("total"),
             "limit": payload.get("limit"),
@@ -1144,8 +1222,8 @@ class AlephClient:
                 {
                     "score": m.get("score"),
                     "judgement": m.get("judgement"),
-                    "entity": slim_entity(m.get("entity") or {}, schemata),
-                    "match": slim_entity(m.get("match") or {}, schemata),
+                    "entity": _Ent(m.get("entity") or {}),
+                    "match": _Ent(m.get("match") or {}),
                     "match_collection_id": m.get("match_collection_id"),
                 }
                 for m in payload.get("results") or []

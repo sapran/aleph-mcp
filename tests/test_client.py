@@ -1,7 +1,9 @@
 import asyncio
 import gzip
-from collections.abc import AsyncIterator, Callable
+import inspect
+from collections.abc import AsyncIterator, Callable, Iterator
 from itertools import pairwise
+from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 import httpx
@@ -10,6 +12,7 @@ import respx
 from fastmcp.exceptions import ToolError
 
 from aleph_mcp.client import (
+    _SHAPED_ENDPOINTS,
     MAX_CONNECT_SECS,
     MAX_EXPAND,
     MAX_FACET_SIZE,
@@ -1680,3 +1683,221 @@ async def test_xref_results_resolves_a_foreign_id_before_fetching(
     assert ("filter:foreign_id", "my-case") in _query(lookup.calls.last.request)
     assert xref.call_count == 1
     assert xref.calls.last.request.url.path == "/api/2/collections/42/xref"
+
+
+# -- the shaping seam ----------------------------------------------------------
+#
+# Ten endpoint methods return entities, and each used to fetch the instance model itself
+# and hand it to the slimmer. Omitting it at one of them raised nothing and failed no test:
+# the caption quietly fell back to _CAPTION_FALLBACK, which is right often enough to go
+# unnoticed. These three tests fail in the order the mistake actually gets made -- a method
+# nobody classified, a classified method nobody covered, a covered method that leaks.
+
+
+# Every public coroutine on AlephClient that returns no entities, and is therefore expected
+# to be absent from the seam's registry. An explicit list rather than a rule: adding a
+# method should force a decision, not inherit one.
+NOT_ENTITY_RETURNING = frozenset(
+    {
+        "aclose",
+        "get_model",  # the FtM model itself
+        "list_schemata",
+        "get_schema",
+        "list_collections",  # collections, via _slim_collection
+        "get_collection",
+        "list_entitysets",  # entitysets, via _slim_entityset
+        "get_entityset",
+        "entity_tags",  # tag aggregations, via _slim_tags
+        "profile_tags",
+        "get_entity_text",  # document text, deliberately not slimmed
+    }
+)
+
+_PROBE_MODEL = {"model": {"schemata": {"LegalEntity": {"caption": ["registrationNumber", "name"]}}}}
+
+
+def _probe_entity(id: str = "e1") -> dict[str, Any]:
+    """One entity that answers both questions this section asks.
+
+    The mocked model declares `registrationNumber` ahead of `name` for LegalEntity while
+    `_CAPTION_FALLBACK` prefers `name`, so the caption that comes back says which order was
+    used -- and therefore whether the instance model reached the slimmer at all. Every
+    BLOB_PROPS key is populated, so an entity that arrived unshaped reads as document text
+    rather than as a subtle difference in a key set.
+    """
+    props: dict[str, Any] = {"name": ["Acme"], "registrationNumber": ["RU-1"]}
+    props.update({prop: [f"<{prop} body>"] for prop in BLOB_PROPS})
+    return raw_entity(id=id, schema="LegalEntity", properties=props)
+
+
+def _entities_in(node: Any) -> Iterator[dict[str, Any]]:
+    """Every entity-shaped dict anywhere in a payload or a reply, slimmed or raw.
+
+    Over the mocked payload it names what should come back; over the reply it names what
+    did. `schema` plus `properties` is the signature of an entity and of nothing else
+    either side carries -- `_shape` in client.py refuses on exactly the same test.
+    """
+    if isinstance(node, dict):
+        if "schema" in node and "properties" in node:
+            yield node
+            return
+        for value in node.values():
+            yield from _entities_in(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _entities_in(item)
+
+
+# (client method, kwargs, verb, mocked path, payload). Every collection is numeric so no
+# row spends a foreign_id lookup, and every payload carries a _probe_entity in the position
+# that method's own reply shape puts entities in -- including xref_results, which is the
+# one row carrying two.
+SHAPING_CASES: tuple[tuple[str, dict[str, Any], str, str, dict[str, Any]], ...] = (
+    (
+        "search_entities",
+        {"collection": "42", "q": "acme"},
+        "GET",
+        "/api/2/entities",
+        raw_search_payload(_probe_entity()),
+    ),
+    ("get_entity", {"entity_id": "e1"}, "GET", "/api/2/entities/e1", _probe_entity()),
+    (
+        "expand_entity",
+        {"entity_id": "e1"},
+        "GET",
+        "/api/2/entities/e1/expand",
+        {
+            "total": 1,
+            "results": [
+                {"property": "directorshipDirector", "count": 1, "entities": [_probe_entity()]}
+            ],
+        },
+    ),
+    (
+        "similar_entities",
+        {"entity_id": "e1"},
+        "GET",
+        "/api/2/entities/e1/similar",
+        {"total": 1, "results": [{"score": 1.0, "judgement": None, "entity": _probe_entity()}]},
+    ),
+    (
+        "match_entity",
+        {
+            "sample": {"schema": "LegalEntity", "properties": {"name": ["Acme"]}},
+            "collection": "42",
+        },
+        "POST",
+        "/api/2/match",
+        raw_search_payload(_probe_entity()),
+    ),
+    (
+        "get_profile",
+        {"profile_id": "p1"},
+        "GET",
+        "/api/2/profiles/p1",
+        {"id": "p1", "type": "profile", "entities": ["e1"], "merged": _probe_entity()},
+    ),
+    (
+        "profile_similar",
+        {"profile_id": "p1"},
+        "GET",
+        "/api/2/profiles/p1/similar",
+        {"total": 1, "results": [{"score": 1.0, "judgement": None, "entity": _probe_entity()}]},
+    ),
+    (
+        "expand_profile",
+        {"profile_id": "p1"},
+        "GET",
+        "/api/2/profiles/p1/expand",
+        {
+            "total": 1,
+            "results": [
+                {"property": "directorshipDirector", "count": 1, "entities": [_probe_entity()]}
+            ],
+        },
+    ),
+    (
+        "entityset_items",
+        {"entityset_id": "es1"},
+        "GET",
+        "/api/2/entitysets/es1/entities",
+        raw_search_payload(_probe_entity()),
+    ),
+    (
+        "xref_results",
+        {"collection": "42"},
+        "GET",
+        "/api/2/collections/42/xref",
+        {
+            "total": 1,
+            "limit": 30,
+            "offset": 0,
+            "results": [
+                {
+                    "score": 1.0,
+                    "judgement": None,
+                    "entity": _probe_entity("e1"),
+                    "match": _probe_entity("m1"),
+                    "match_collection_id": "77",
+                }
+            ],
+        },
+    ),
+)
+
+
+def test_every_client_method_is_classified() -> None:
+    """A new endpoint method cannot quietly join the class without shaping its reply.
+
+    This is the check that catches an *added* method rather than an unhooked one, and it
+    needs nobody to have written a test that calls it: the method has to be declared either
+    shaped or not entity-returning before the suite goes green again.
+    """
+    public = {
+        name
+        for name, attr in vars(AlephClient).items()
+        if not name.startswith("_") and inspect.iscoroutinefunction(attr)
+    }
+    assert public == _SHAPED_ENDPOINTS | NOT_ENTITY_RETURNING
+
+
+def test_every_shaped_endpoint_has_a_shaping_case() -> None:
+    """Unhooking a method from the seam, or hooking one without covering it, fails here."""
+    assert {name for name, *_ in SHAPING_CASES} == _SHAPED_ENDPOINTS
+
+
+@pytest.mark.parametrize(
+    ("method", "kwargs", "verb", "path", "payload"),
+    SHAPING_CASES,
+    ids=[case[0] for case in SHAPING_CASES],
+)
+async def test_every_entity_returning_method_shapes_its_reply(
+    client: AlephClient,
+    respx_mock: respx.MockRouter,
+    method: str,
+    kwargs: dict[str, Any],
+    verb: str,
+    path: str,
+    payload: dict[str, Any],
+) -> None:
+    """Every entity handed to this method comes back slimmed, captioned from the model.
+
+    Nine of these ten paths had nothing pinning that the instance model reached the slimmer
+    at all. The tenth, search_entities, was pinned by a test whose declared caption order
+    matched the fallback's first entry, so it passed either way. `"RU-1"` is the answer only
+    the model can give; `"Acme"` is what the hard-coded fallback returns.
+    """
+    respx_mock.get("/api/2/metadata").mock(return_value=httpx.Response(200, json=_PROBE_MODEL))
+    respx_mock.request(verb, path).mock(return_value=httpx.Response(200, json=payload))
+
+    out = await getattr(client, method)(**kwargs)
+
+    returned = list(_entities_in(out))
+    assert sorted(e["id"] for e in returned) == sorted(e["id"] for e in _entities_in(payload))
+    for entity in returned:
+        assert_slim_entity(entity)
+        assert entity["_omitted_properties"] == sorted(BLOB_PROPS)
+        assert entity["caption"] == "RU-1", (
+            f"{method} derived the caption from the hard-coded fallback order, so the "
+            "instance model did not reach the slimmer on this path"
+        )
