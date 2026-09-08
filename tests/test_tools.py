@@ -1,16 +1,18 @@
+import inspect
 from collections.abc import AsyncIterator, Callable, Coroutine
 from typing import Any
 
+import fastmcp
 import httpx
 import pytest
 import respx
 from fastmcp import Client as MCPClient
 from fastmcp import FastMCP
-from fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ResourceError, ToolError
 
 from aleph_mcp.client import AlephClient
 from aleph_mcp.config import Settings
-from aleph_mcp.server import build_server
+from aleph_mcp.server import _as_resource_error, _as_tool_error, build_server
 from tests.shapes import (
     BLOB_PROPS,
     assert_search_envelope,
@@ -196,10 +198,10 @@ async def test_tool_forwards_every_argument_and_returns_the_payload(
 # Together these prove the refusal seam is applied to all seventeen tools.
 #
 # Each argument set must reach the client and fail *there*: a set that FastMCP rejects on
-# the signature never enters the try block, so the arm this file exists to cover goes
-# unexecuted while the test still passes on the phrase. That is why every collection-taking
-# tool below is given a `collection` — and a numeric-looking one, so the refusal is the
-# client's own and costs no lookup request.
+# the signature never reaches the seam at all, so the translation this file exists to cover
+# goes unexecuted while the test still passes on the phrase. That is why every
+# collection-taking tool below is given a `collection` — and a numeric-looking one, so the
+# refusal is the client's own and costs no lookup request.
 ERROR_CASES: tuple[tuple[str, dict[str, Any], str, int], ...] = (
     ("list_collections", {"limit": 101}, "between 0 and 100", 0),
     ("get_collection", {"collection": "unknown-fid"}, "no collection with foreign_id", 1),
@@ -254,9 +256,9 @@ async def test_client_refusal_surfaces_as_a_tool_error(
     async with MCPClient(server) as mcp:
         with pytest.raises(ToolError, match=match) as excinfo:
             await mcp.call_tool(tool, args)
-    # The arm under test is the client's own `except ValueError`, so the refusal has to
-    # come from the client rather than from FastMCP's signature validation: an argument
-    # set the signature rejects never enters the try block at all, and the message it
+    # What the seam translates is the client's own `except ValueError`, so the refusal has
+    # to come from the client rather than from FastMCP's signature validation: an argument
+    # set the signature rejects never reaches the seam at all, and the message it
     # raises instead quotes the whole input dict — which can satisfy the expected phrase
     # by accident. Measured: with `collection` missing, the search_entities case below
     # passed on the 9999 echoed back inside that quoted input.
@@ -265,13 +267,117 @@ async def test_client_refusal_surfaces_as_a_tool_error(
     # the refusal seam. `match` alone cannot see that job being done: with the seam
     # bypassed the refusal still arrives as a ToolError carrying the same phrase, because
     # FastMCP appends it to "Error calling tool '<name>': " and mask_error_details is off.
-    # Measured on main @ 1952232: deleting a tool's arm changed no test outcome.
+    # Measured on main @ 1952232: deleting all eighteen arms changed no test outcome.
+    #
+    # This assertion fails open — it is pinned to a FastMCP string literal that is not
+    # public API, so a reword upstream makes it vacuously true and silently unpins the
+    # seam again. test_a_refusal_survives_error_masking below is the fail-closed backstop;
+    # keep both.
     assert not str(excinfo.value).startswith("Error calling tool")
     assert wire.call_count == wire_calls
     if wire_calls:
         # get_collection can only learn a foreign_id is unknown by asking the listing;
         # the detail route must still never be reached.
         assert [call.request.url.path for call in wire.calls] == ["/api/2/collections"]
+
+
+@pytest.fixture
+async def masked_server(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[FastMCP]:
+    """A server built with FastMCP's error masking on.
+
+    FastMCP reads `mask_error_details` when the server is constructed, not when a tool is
+    called, so this has to be set before build_server rather than inside the test.
+    """
+    monkeypatch.setattr(fastmcp.settings, "mask_error_details", True)
+    mcp, client = build_server(settings)
+    try:
+        yield mcp
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.parametrize(
+    ("tool", "args", "match"),
+    [(name, args, match) for name, args, match, _ in ERROR_CASES],
+    ids=[case[0] for case in ERROR_CASES],
+)
+async def test_a_refusal_survives_error_masking(
+    masked_server: FastMCP,
+    respx_mock: respx.MockRouter,
+    tool: str,
+    args: dict[str, Any],
+    match: str,
+) -> None:
+    """The fail-closed backstop for the unprefixed-message assertion above.
+
+    That one is pinned to a FastMCP string literal, so an upstream reword would leave it
+    vacuously true and the seam unpinned. Masking removes the prefix question entirely:
+    FastMCP replaces the whole message with `Error calling tool '<name>'`, so the client's
+    own phrase can only arrive if the seam put it there. Any rewording still strips the
+    message, so this keeps discriminating.
+    """
+    respx_mock.route().mock(return_value=httpx.Response(200, json={"results": []}))
+    async with MCPClient(masked_server) as mcp:
+        with pytest.raises(ToolError, match=match):
+            await mcp.call_tool(tool, args)
+
+
+# -- the seam itself -----------------------------------------------------------
+#
+# Every tool and the schema resource now share one translation, and the tests above can
+# only see it through FastMCP, which rewrites what they observe. These reach it directly,
+# so the message can be pinned exactly rather than by phrase.
+
+
+@pytest.mark.parametrize(
+    ("translate", "expected"),
+    [(_as_tool_error, ToolError), (_as_resource_error, ResourceError)],
+    ids=["tool", "resource"],
+)
+async def test_the_seam_forwards_the_message_and_keeps_the_cause(
+    translate: Callable[..., Any], expected: type[Exception]
+) -> None:
+    """The caller is shown the client's message and nothing added to it."""
+
+    @translate
+    async def refuses() -> dict[str, Any]:
+        raise ValueError("limit must be between 0 and 100")
+
+    with pytest.raises(expected) as excinfo:
+        await refuses()
+    assert str(excinfo.value) == "limit must be between 0 and 100"
+    assert isinstance(excinfo.value.__cause__, ValueError)
+
+
+async def test_the_seam_leaves_a_non_refusal_alone() -> None:
+    """A ValueError is the client saying no. Anything else is a fault, and dressing it up
+    as a refusal would tell the model to fix its arguments and retry against a broken
+    upstream. This matters more than it looks: the translation wraps the whole function
+    body, so it is the only thing keeping a future in-body error from being relabelled."""
+
+    @_as_tool_error
+    async def breaks() -> dict[str, Any]:
+        raise RuntimeError("upstream fell over")
+
+    with pytest.raises(RuntimeError, match="upstream fell over"):
+        await breaks()
+
+
+def test_the_seam_carries_what_fastmcp_reads() -> None:
+    """Gate A in miniature. FastMCP builds a tool's description from __doc__ and its input
+    schema from the signature, so a wrapper that dropped either would change the product
+    while every behavioural test here stayed green."""
+
+    async def tool_fn(entity_id: str, limit: int = 20) -> dict[str, Any]:
+        """Fetch one entity by id, with its properties and caption."""
+        return {}
+
+    wrapped = _as_tool_error(tool_fn)
+    assert wrapped.__doc__ == "Fetch one entity by id, with its properties and caption."
+    assert wrapped.__name__ == "tool_fn"
+    assert inspect.signature(wrapped) == inspect.signature(tool_fn)
 
 
 # -- end to end ----------------------------------------------------------------
