@@ -9,6 +9,7 @@ import httpx
 import pytest
 import respx
 from fastmcp.exceptions import ToolError
+from pydantic import TypeAdapter
 
 from aleph_mcp.client import (
     _SHAPED_ENDPOINTS,
@@ -20,7 +21,9 @@ from aleph_mcp.client import (
     MAX_RETRY_SLEEP_SECS,
     MAX_SEARCH_SHRINKS,
     AlephClient,
+    _AsIs,
     _Ent,
+    _MarkerEscaped,
     _shape,
     _shrunk_page,
     _slim_result,
@@ -1862,7 +1865,160 @@ def test_every_client_method_is_classified() -> None:
     method inherited from a base class, which AlephClient does not have today.
     """
     public = {name for name in dir(AlephClient) if not name.startswith("_")}
-    assert public == _SHAPED_ENDPOINTS | NOT_ENTITY_RETURNING
+    classified = _SHAPED_ENDPOINTS | NOT_ENTITY_RETURNING
+    # A bare set inequality names neither the method nor the remedy, and of the two remedies
+    # the wrong one -- adding the name to NOT_ENTITY_RETURNING -- is a one-line test edit
+    # while the right one needs a decorator, a SHAPING_CASES row and a mock payload. Say
+    # which is which, because the cheap answer is the one that ships a leak.
+    assert public == classified, (
+        f"unclassified: {sorted(public - classified)}; "
+        f"classified but gone from the class: {sorted(classified - public)}. "
+        "A method that returns entities takes @_shaped and a SHAPING_CASES row. A method "
+        "that does not goes in NOT_ENTITY_RETURNING and takes a NOT_SHAPING_CASES row, "
+        "which is what proves it has nothing to shape."
+    )
+
+
+# Methods on NOT_ENTITY_RETURNING that are not endpoints at all, so no payload can be fed
+# to them. Spelled out rather than skipped by a rule, because "it takes no payload" is the
+# excuse that would let a real endpoint out of the check below.
+_NOT_AN_ENDPOINT = frozenset({"aclose"})
+
+# The mirror of SHAPING_CASES: (client method, kwargs, verb, mocked path, payload), where
+# every payload carries a raw_document() in a position that method's own reply could
+# surface it from. SHAPING_CASES proves the shaped methods shape; without these, nothing
+# proves the unshaped ones have nothing to shape, and the declaration in
+# NOT_ENTITY_RETURNING is an assertion no test ever checks.
+#
+# Measured: adding a plausible new entity-returning method on an already-allowlisted path
+# and declaring it here shipped a real leak with the suite green at 362 passed -- the caller
+# received bodyText and the whole housekeeping surface. readonly.py blocks a method on a
+# genuinely new path, so the leak needs a method reusing an allowlisted one: a second view
+# of expand, a raw-entity fetch helper, a paging variant. That is ordinary, not exotic.
+#
+# One position is deliberately not probed here: the `entities` list that _slim_entityset
+# copies through, which today does pass an entity object back. It is the sibling of the
+# get_profile trade recorded in docs/implementation-notes.md, it needs the same owner
+# decision, and pinning either answer to it inside this change would pre-empt that. Noted
+# in docs/implementation-notes.md.
+NOT_SHAPING_CASES: tuple[tuple[str, dict[str, Any], str, str, dict[str, Any]], ...] = (
+    ("get_model", {}, "GET", "/api/2/metadata", {**raw_model(), "results": [raw_document()]}),
+    ("list_schemata", {}, "GET", "/api/2/metadata", {**raw_model(), "results": [raw_document()]}),
+    (
+        "get_schema",
+        {"name": "Person"},
+        "GET",
+        "/api/2/metadata",
+        {**raw_model(), "results": [raw_document()]},
+    ),
+    (
+        "list_collections",
+        {},
+        "GET",
+        "/api/2/collections",
+        {"total": 1, "results": [{"id": "42", "label": "c", "entity": raw_document()}]},
+    ),
+    (
+        "get_collection",
+        {"collection": "42"},
+        "GET",
+        "/api/2/collections/42",
+        {"id": "42", "label": "c", "entity": raw_document()},
+    ),
+    (
+        "list_entitysets",
+        {"collection": "42"},
+        "GET",
+        "/api/2/entitysets",
+        {
+            "total": 1,
+            "results": [
+                {"id": "es1", "type": "list", "entities": ["e1"], "entity": raw_document()}
+            ],
+        },
+    ),
+    (
+        "get_entityset",
+        {"entityset_id": "es1"},
+        "GET",
+        "/api/2/entitysets/es1",
+        {"id": "es1", "type": "list", "entities": ["e1"], "entity": raw_document()},
+    ),
+    (
+        "entity_tags",
+        {"entity_id": "e1"},
+        "GET",
+        "/api/2/entities/e1/tags",
+        {
+            "total": 1,
+            "results": [{"field": "names", "value": "Acme", "count": 3}],
+            "entity": raw_document(),
+        },
+    ),
+    (
+        "profile_tags",
+        {"profile_id": "p1"},
+        "GET",
+        "/api/2/profiles/p1/tags",
+        {
+            "total": 1,
+            "results": [{"field": "names", "value": "Acme", "count": 3}],
+            "entity": raw_document(),
+        },
+    ),
+    # The whole upstream entity is this endpoint's payload. It returns document text on
+    # purpose, in a bounded fence -- what it must not return is the entity around it.
+    ("get_entity_text", {"entity_id": "d1"}, "GET", "/api/2/entities/d1", raw_document()),
+)
+
+
+def test_every_unshaped_endpoint_has_a_negative_case() -> None:
+    """Declaring a method entity-free is a claim, and this is what makes it checkable."""
+    covered = {name for name, *_ in NOT_SHAPING_CASES} | _NOT_AN_ENDPOINT
+    assert covered == NOT_ENTITY_RETURNING, (
+        f"declared to return no entities but never checked: "
+        f"{sorted(NOT_ENTITY_RETURNING - covered)}; "
+        f"checked but no longer declared: {sorted(covered - NOT_ENTITY_RETURNING)}. "
+        "Add a NOT_SHAPING_CASES row feeding the method a payload with an entity in it. "
+        "If the row cannot be made to pass, the method returns entities: decorate it with "
+        "@_shaped and give it a SHAPING_CASES row instead."
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "kwargs", "verb", "path", "payload"),
+    NOT_SHAPING_CASES,
+    ids=[case[0] for case in NOT_SHAPING_CASES],
+)
+async def test_a_method_declared_unshaped_returns_nothing_entity_shaped(
+    client: AlephClient,
+    respx_mock: respx.MockRouter,
+    method: str,
+    kwargs: dict[str, Any],
+    verb: str,
+    path: str,
+    payload: dict[str, Any],
+) -> None:
+    """Hand the method an entity and check none comes back.
+
+    `_entities_in` is the same walk `_shape` guards with, run over the reply instead of
+    inside it, so what this test calls an entity is what the seam calls one.
+    """
+    respx_mock.request(verb, path).mock(return_value=httpx.Response(200, json=payload))
+
+    out = await getattr(client, method)(**kwargs)
+
+    # Without this the case is satisfiable by finding nothing on both sides.
+    assert list(_entities_in(payload)), (
+        f"{method}: this case's payload carries no entity, so it proves nothing"
+    )
+    leaked = list(_entities_in(out))
+    assert not leaked, (
+        f"{method} is declared in NOT_ENTITY_RETURNING but returned "
+        f"{[e.get('id') for e in leaked]} unshaped. Either it belongs behind @_shaped with "
+        "a SHAPING_CASES row, or the field carrying the entity must stop being copied "
+        "through."
+    )
 
 
 def test_every_shaped_endpoint_has_a_shaping_case() -> None:
@@ -1923,7 +2079,7 @@ def test_the_seam_refuses_an_entity_it_was_not_asked_to_shape() -> None:
     than a bad request, but the cost of passing it on is unbounded document text in the
     model's context, so the seam refuses instead. The message names the endpoint and tells
     the caller not to retry, because a caller cannot make this one go away."""
-    with pytest.raises(RuntimeError, match="expand_entity cannot answer") as excinfo:
+    with pytest.raises(ToolError, match="expand_entity cannot answer") as excinfo:
         _shape({"total": 1, "results": [raw_document()]}, None, "expand_entity")
     assert "retrying will not help" in str(excinfo.value)
     # The offending keys are upstream's to choose, so none of them may be quoted back.
@@ -1972,5 +2128,91 @@ async def test_an_entity_in_a_passed_through_field_refuses_rather_than_leaking(
             200, json={"id": "p1", "entities": [raw_document()], "merged": _probe_entity()}
         )
     )
-    with pytest.raises(RuntimeError, match="get_profile cannot answer"):
+    with pytest.raises(ToolError, match="get_profile cannot answer"):
         await client.get_profile(profile_id="p1")
+
+
+# The seam watches one direction only. `_shape` refuses a raw dict left in a reply; the
+# inverse -- a marker that never reaches `_shape` because its method was never hooked to the
+# seam -- used to serialise as an ordinary success carrying the whole entity. Measured
+# through the MCP boundary with one method unhooked: `isError: False`, bodyText present,
+# housekeeping present. Not live today, because every marker is built inside a @_shaped
+# method -- but `_slim_result` is what an author copies when writing the next endpoint.
+
+
+def test_a_shaping_marker_refuses_to_be_serialised() -> None:
+    """A marker reaching a serialiser means a reply left the module unshaped. Both markers,
+    both routes to a serialiser, because either alone leaves half the mistake open.
+
+    The schema hook covers the marker as a declared return type, which is how an unhooked
+    `-> _Ent` method leaks. The string conversion covers it sitting inside a
+    `dict[str, Any]` reply -- the shape `_slim_result` produces -- where a serialiser infers
+    from the runtime type, never consults the hook, and falls back to `str`.
+    """
+    for marker in (_Ent(raw_document()), _AsIs(raw_document())):
+        with pytest.raises(_MarkerEscaped, match="reached the serialiser"):
+            TypeAdapter(type(marker))
+        with pytest.raises(_MarkerEscaped, match="reached a string conversion"):
+            str(marker)
+
+
+def test_a_shaping_marker_still_reprs_without_quoting_the_entity() -> None:
+    """The guard must not blind the next person debugging it.
+
+    `__repr__` is what a traceback, a log line and pytest's own assertion output call, so it
+    stays working -- and quotes nothing, because a marker holds exactly the unbounded
+    document text the seam exists to keep back.
+    """
+    marker = _Ent(raw_document())
+    assert "unshaped" in repr(marker)
+    for prop in BLOB_PROPS:
+        assert f"<{prop} body>" not in repr(marker)
+
+
+# The instance model is fetched once per reply, behind the seam, so every entity-returning
+# endpoint now depends on that one call. What happens when it fails was previously answered
+# by a bare `except Exception`, and no test in the suite made /api/2/metadata fail at all.
+
+
+async def test_an_upstream_metadata_fault_falls_back_instead_of_failing_the_call(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """A caption is a convenience. An instance that cannot answer for its own ontology is
+    not a reason to fail ten endpoints, so the fallback order stands in and the call
+    succeeds -- `"Acme"` is the answer only the hard-coded order gives."""
+    respx_mock.get("/api/2/metadata").mock(
+        return_value=httpx.Response(401, json={"status": "error"})
+    )
+    respx_mock.get("/api/2/entities/e1").mock(
+        return_value=httpx.Response(200, json=_probe_entity())
+    )
+
+    out = await client.get_entity(entity_id="e1")
+
+    assert out["caption"] == "Acme"
+
+
+async def test_a_read_only_refusal_fetching_the_model_is_not_swallowed(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """readonly.py refusing a request is this repo's safety boundary speaking, not a slow
+    model, and the two must never be indistinguishable.
+
+    A metadata route that redirects off-host is refused by the allowlist hook on the
+    redirect hop. Measured before this was narrowed: the call returned a successful answer
+    with a fallback-derived caption, and since there is no logging anywhere in the package,
+    the refusal left no trace at all. The message has to survive too -- it names the
+    redirect as the likely cause, which is the only clue the operator gets.
+    """
+    respx_mock.get("/api/2/metadata").mock(
+        return_value=httpx.Response(
+            302, headers={"Location": "https://elsewhere.invalid/api/2/metadata"}
+        )
+    )
+    respx_mock.get("/api/2/entities/e1").mock(
+        return_value=httpx.Response(200, json=_probe_entity())
+    )
+
+    with pytest.raises(ToolError, match="read-only allowlist") as excinfo:
+        await client.get_entity(entity_id="e1")
+    assert "elsewhere.invalid" in str(excinfo.value)

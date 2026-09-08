@@ -7,10 +7,10 @@ import re
 import secrets
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from typing import Any, Concatenate, Final, Literal, cast
 
 import httpx
+from fastmcp.exceptions import ResourceError, ToolError
 
 from .config import Settings
 from .errors import (
@@ -251,15 +251,68 @@ def slim_entity(entity: dict[str, Any], schemata: dict[str, Any] | None = None) 
 _SHAPED_ENDPOINTS: set[str] = set()
 
 
-@dataclass(frozen=True, slots=True)
-class _Ent:
+class _MarkerEscaped(RuntimeError):
+    """A shaping marker reached a serialiser, so a reply left this module unshaped."""
+
+
+class _Marker:
+    """Base for the two shaping markers. Refuses to serialise, on every path.
+
+    `_shape` replaces every marker on the way out, so a marker reaching a serialiser means
+    a reply left this module without passing the seam. That is the one direction the seam
+    itself cannot watch: `_shape` is fail-closed on a raw dict left in a reply and was
+    fail-*open* on the inverse. Measured through the MCP boundary before this guard, with
+    one method unhooked from the seam: `isError: False`, carrying the whole document body.
+
+    Two mechanisms, because either alone leaves half the mistake open, and both were
+    measured rather than reasoned about:
+
+    - `__get_pydantic_core_schema__` covers the marker as a declared return type, which is
+      how an unhooked `-> _Ent` method leaks.
+    - Not being a dataclass covers the marker sitting inside a `dict[str, Any]` reply --
+      the shape `_slim_result` produces, and therefore the shape an author copying it
+      produces. There pydantic infers a schema from the runtime type, never consults the
+      hook, and walks a dataclass's fields straight into the payload. With the hook alone,
+      that path still returned the entire body as a success.
+    """
+
+    __slots__ = ()
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: Any, handler: Any) -> Any:
+        raise _MarkerEscaped(
+            f"{cls.__name__} reached the serialiser: a reply left aleph_mcp.client without "
+            "passing the shaping seam. Every entity-returning method must be decorated "
+            "with @_shaped."
+        )
+
+    def __repr__(self) -> str:
+        return f"<{type(self).__name__}: unshaped, must not leave aleph_mcp.client>"
+
+    def __str__(self) -> str:
+        # Split from __repr__ deliberately. A serialiser that cannot build a schema for a
+        # value falls back to `str`, so raising here is what names the defect on the second
+        # shape rather than leaving FastMCP's generic "no structured output" to stand in.
+        # Debugging paths -- tracebacks, pytest assertion output, logging -- use __repr__,
+        # which stays safe and quotes nothing of what the seam exists to keep back.
+        raise _MarkerEscaped(
+            f"{type(self).__name__} reached a string conversion: a reply left "
+            "aleph_mcp.client without passing the shaping seam."
+        )
+
+
+class _Ent(_Marker):
     """A raw upstream entity, marked to be shaped on the way out of this module."""
+
+    __slots__ = ("raw",)
 
     raw: dict[str, Any]
 
+    def __init__(self, raw: dict[str, Any]) -> None:
+        self.raw = raw
 
-@dataclass(frozen=True, slots=True)
-class _AsIs:
+
+class _AsIs(_Marker):
     """A subtree another helper already bounded. `_shape` copies it without looking inside.
 
     The facets block is the one part of a reply whose *keys* come from the caller: a search
@@ -270,7 +323,12 @@ class _AsIs:
     key space the caller controls.
     """
 
+    __slots__ = ("value",)
+
     value: Any
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
 
 
 def _shape(node: Any, schemata: dict[str, Any] | None, endpoint: str) -> Any:
@@ -293,10 +351,19 @@ def _shape(node: Any, schemata: dict[str, Any] | None, endpoint: str) -> Any:
       strips rather than a body.
 
     The message quotes nothing from upstream -- the offending keys are attacker-influenced,
-    and bounding them is `errors.py`'s job -- and it tells the caller not to retry. It
-    reaches the model verbatim, because `server.py` translates ValueError only, so it has
-    to read like the other refusals: a fault the caller cannot act on is one it must be
-    told to stop paying upstream requests for. Same reasoning as `raise_unreachable`.
+    and bounding them is `errors.py`'s job -- and it tells the caller not to retry, because
+    a fault the caller cannot act on is one it must be told to stop paying upstream requests
+    for. Same reasoning as `raise_unreachable`.
+
+    Raised as `ToolError` so that it actually arrives. `server.py`'s refusal seam translates
+    ValueError only, so the RuntimeError this replaces missed the seam entirely: measured
+    through a real MCPClient round trip, it reached the caller as
+    `Error calling tool 'get_profile': ...` -- the exact prefix every other refusal in this
+    repo is asserted not to carry -- and with `mask_error_details` on, FastMCP replaced the
+    whole message with `Error calling tool 'get_profile'`, deleting the one sentence that
+    tells the caller retrying will not help. Not a layering violation: `errors.py` already
+    raises `ToolError` from this layer, and every `@_shaped` method is a tool, so the
+    tool/resource split that motivates the two flavours does not arise here.
     """
     if isinstance(node, _Ent):
         return slim_entity(node.raw, schemata)
@@ -304,7 +371,7 @@ def _shape(node: Any, schemata: dict[str, Any] | None, endpoint: str) -> Any:
         return node.value
     if isinstance(node, dict):
         if "schema" in node and "properties" in node:
-            raise RuntimeError(
+            raise ToolError(
                 f"{endpoint} cannot answer: a defect in this server left a raw upstream "
                 "entity in the reply, and returning it would put unbounded document text "
                 "in front of you. Nothing about the call can change this and retrying "
@@ -469,10 +536,41 @@ class AlephClient:
         return cast(dict[str, Any], _shape(built, await self._schemata(), endpoint))
 
     async def _schemata(self) -> dict[str, Any] | None:
-        """Cached FtM schemata, used only to derive captions. Never fatal."""
+        """Cached FtM schemata, used only to derive captions. An upstream fault is not fatal.
+
+        Falling back to `_CAPTION_FALLBACK` is the right answer to an instance that cannot
+        answer for its own ontology: the caption is a convenience, and failing ten endpoints
+        over it would be worse than deriving it from a fixed order.
+
+        A *local* refusal is not that. `get_model()` reaches the wire through
+        `_request(..., resource=True)`, which converts a `ReadOnlyViolation` into a
+        `ResourceError` -- so the bare `except Exception` this replaces also ate readonly.py
+        refusing to let a request leave the configured origin, and there is no logging in
+        this package, so it left no trace at all. Measured before this change: a metadata
+        route answering 302 to another host returned a successful answer whose caption came
+        from the fallback order, indistinguishable from a slow model.
+
+        Re-flavoured to `ToolError` rather than re-raised as-is. `_schemata` is reached only
+        from `_reply`, i.e. only on a tool call, and a `ResourceError` raised inside a tool
+        misses FastMCP's ToolError path: it arrives prefixed and is masked away entirely.
+        Same reasoning as the refusal in `_shape`.
+        """
         try:
             model = await self.get_model()
-        except Exception:
+        except ResourceError as e:
+            if isinstance(e.__cause__, ReadOnlyViolation):
+                raise ToolError(str(e)) from e
+            # Everything else this covers -- a non-2xx, an exhausted connect, a body over
+            # the ceiling -- is an upstream fault the caller cannot act on.
+            return None
+        except (httpx.HTTPError, jsonlib.JSONDecodeError):
+            # The read-side faults `_request` deliberately does not retry -- ReadTimeout,
+            # ReadError, RemoteProtocolError -- leave `get_model` as raw httpx errors, and a
+            # 200 carrying a non-JSON body leaves it as a decode error. A slow model is
+            # literally the ReadTimeout in that set, so this arm is the one the first
+            # paragraph describes. Named rather than left to a bare except, so a defect in
+            # this module -- an AttributeError, a TypeError -- reaches the caller instead of
+            # silently degrading every caption on the instance.
             return None
         schemata = model.get("schemata")
         return schemata if isinstance(schemata, dict) else None
