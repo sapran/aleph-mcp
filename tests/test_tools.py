@@ -193,7 +193,7 @@ async def test_tool_forwards_every_argument_and_returns_the_payload(
 
 
 # Every refusal the client can raise, one per tool, with the phrase the caller is shown.
-# Together these execute all seventeen `except ValueError: raise ToolError` arms.
+# Together these prove the refusal seam is applied to all seventeen tools.
 #
 # Each argument set must reach the client and fail *there*: a set that FastMCP rejects on
 # the signature never enters the try block, so the arm this file exists to cover goes
@@ -261,6 +261,12 @@ async def test_client_refusal_surfaces_as_a_tool_error(
     # by accident. Measured: with `collection` missing, the search_entities case below
     # passed on the 9999 echoed back inside that quoted input.
     assert "validation error" not in str(excinfo.value)
+    # The client's own message reaches the caller unprefixed, which is the whole job of
+    # the refusal seam. `match` alone cannot see that job being done: with the seam
+    # bypassed the refusal still arrives as a ToolError carrying the same phrase, because
+    # FastMCP appends it to "Error calling tool '<name>': " and mask_error_details is off.
+    # Measured on main @ 1952232: deleting a tool's arm changed no test outcome.
+    assert not str(excinfo.value).startswith("Error calling tool")
     assert wire.call_count == wire_calls
     if wire_calls:
         # get_collection can only learn a foreign_id is unknown by asking the listing;
