@@ -86,3 +86,12 @@ Retired since the last prune:
   drift check (`dist/core/references.js`: "root resolution is never affected") — and the store is
   intentionally left unregistered so nothing is written into acordia. The tool-name expectation is
   therefore visible, not enforced; asserting it would invert the dependency.
+- `.github/workflows/ci.yml`, the `build` job's licence assertion: `tar tzf dist/*.tar.gz |
+  grep -q '/LICENSE$'` runs under `set -o pipefail`, so it fails intermittently with `tar:
+  stdout: write error` (exit 2). The sdist listing is 6373 bytes across 100 entries with
+  `LICENSE` third from last, so `grep -q` exits on the match while `tar` may still have its
+  final chunk to flush, and the EPIPE fails the pipeline. Observed twice on PR #12 while the
+  same job re-run on `main @ 1952232` passed; PR #12 changes no path in the sdist, so the
+  piped bytes are identical on both sides. Parked: outside T3's scope. One-line fix is to
+  capture first, as the step already does for `meta` — `listing=$(tar tzf dist/*.tar.gz)`
+  then `grep -q '/LICENSE$' <<<"$listing"`.
