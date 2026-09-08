@@ -86,3 +86,31 @@ Retired since the last prune:
   drift check (`dist/core/references.js`: "root resolution is never affected") — and the store is
   intentionally left unregistered so nothing is written into acordia. The tool-name expectation is
   therefore visible, not enforced; asserting it would invert the dependency.
+
+- **`test_search_derives_captions_from_the_instance_model` cannot fail.** Found while building
+  the shaping seam (T1). Its mocked model declares the caption order `["name"]`, which is also
+  the first entry of `_CAPTION_FALLBACK`, so the test passes whether or not the instance model
+  reaches the slimmer -- it was the only integration test claiming to pin that plumbing. Left
+  alone rather than rewritten: T1's `test_every_entity_returning_method_shapes_its_reply` now
+  covers the same path with a discriminating model, so this one is superseded, not load-bearing.
+  Deleting or strengthening it is a separate, purely-test change.
+
+- **`get_entity_text` derives no caption.** `client.py` reads `entity.get("caption")` straight
+  off the payload, where every slimmed path calls `derive_caption`. Live Aleph sends a null
+  caption, so this is the one tool that can return `caption: null` for an entity the other tools
+  would have captioned. Found during T1; fixing it changes a tool's output and so is a behaviour
+  change, not a refactor.
+
+- **`_schemata()` does not cache its failures.** `get_model` memoises only a success, and
+  `_schemata` swallows every exception, so a persistently broken `/api/2/metadata` costs the full
+  retry budget on *every* entity-returning call while still returning `None`. Found during T1 and
+  left alone: negative caching is a behaviour change. Note the test-suite side effect -- because
+  respx raises on an unmocked route and that raise is swallowed, almost every test in the suite
+  exercises the `schemata=None` path by accident.
+
+- **`get_profile` passes its `entities` field through unshaped.** It holds id strings in every
+  fixture and on the live instance, so nothing leaks today, but the "binds every entity-shaped
+  value in a response" requirement in `openspec/specs/mcp-tool-surface` would be violated by an
+  instance that serialised objects there. Since T1 this fails closed rather than leaking: `_shape`
+  refuses an unmarked entity-shaped dict. Deciding whether to mark the field is a spec question,
+  not a refactor.
