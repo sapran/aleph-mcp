@@ -1,6 +1,5 @@
 import asyncio
 import gzip
-import inspect
 from collections.abc import AsyncIterator, Callable, Iterator
 from itertools import pairwise
 from typing import Any
@@ -21,7 +20,10 @@ from aleph_mcp.client import (
     MAX_RETRY_SLEEP_SECS,
     MAX_SEARCH_SHRINKS,
     AlephClient,
+    _Ent,
+    _shape,
     _shrunk_page,
+    _slim_result,
     derive_caption,
     slim_entity,
 )
@@ -1852,12 +1854,14 @@ def test_every_client_method_is_classified() -> None:
     This is the check that catches an *added* method rather than an unhooked one, and it
     needs nobody to have written a test that calls it: the method has to be declared either
     shaped or not entity-returning before the suite goes green again.
+
+    Deliberately no `iscoroutinefunction` filter, and `dir` rather than `vars`. Every way of
+    spelling a method other than `async def` -- an async generator that pages, a plain `def`
+    returning a cached entity, a staticmethod, a classmethod, a property -- reads as "not a
+    coroutine" and would have entered the class unclassified. `dir` additionally covers a
+    method inherited from a base class, which AlephClient does not have today.
     """
-    public = {
-        name
-        for name, attr in vars(AlephClient).items()
-        if not name.startswith("_") and inspect.iscoroutinefunction(attr)
-    }
+    public = {name for name in dir(AlephClient) if not name.startswith("_")}
     assert public == _SHAPED_ENDPOINTS | NOT_ENTITY_RETURNING
 
 
@@ -1893,7 +1897,12 @@ async def test_every_entity_returning_method_shapes_its_reply(
     out = await getattr(client, method)(**kwargs)
 
     returned = list(_entities_in(out))
-    assert sorted(e["id"] for e in returned) == sorted(e["id"] for e in _entities_in(payload))
+    expected = [entity["id"] for entity in _entities_in(payload)]
+    # Without this the case is satisfiable by finding nothing: `[] == []` holds and every
+    # assertion below sits in a loop body that never runs. A row copied from another and
+    # left without a _probe_entity would assert nothing at all.
+    assert expected, f"{method}: this case's payload carries no entity, so it proves nothing"
+    assert sorted(entity["id"] for entity in returned) == sorted(expected)
     for entity in returned:
         assert_slim_entity(entity)
         assert entity["_omitted_properties"] == sorted(BLOB_PROPS)
@@ -1901,3 +1910,67 @@ async def test_every_entity_returning_method_shapes_its_reply(
             f"{method} derived the caption from the hard-coded fallback order, so the "
             "instance model did not reach the slimmer on this path"
         )
+
+
+# The guard is the only branch here that can turn a working call into a failing one, and
+# the only new statement in the seam that no other test reaches. Left uncovered it could be
+# inert -- a typo in the condition, an inverted `and` -- with the whole suite still green,
+# which is fail-open in a change whose point is to fail closed.
+
+
+def test_the_seam_refuses_an_entity_it_was_not_asked_to_shape() -> None:
+    """An endpoint that builds a reply around a raw entity is a defect in this repo rather
+    than a bad request, but the cost of passing it on is unbounded document text in the
+    model's context, so the seam refuses instead. The message names the endpoint and tells
+    the caller not to retry, because a caller cannot make this one go away."""
+    with pytest.raises(RuntimeError, match="expand_entity cannot answer") as excinfo:
+        _shape({"total": 1, "results": [raw_document()]}, None, "expand_entity")
+    assert "retrying will not help" in str(excinfo.value)
+    # The offending keys are upstream's to choose, so none of them may be quoted back.
+    assert "bodyText" not in str(excinfo.value)
+
+
+def test_the_seam_does_not_refuse_the_entity_it_just_shaped() -> None:
+    """A slimmed entity carries `schema` and `properties` too, so a walk that descended into
+    its own output would refuse every reply ever built. Substitution has to be terminal."""
+    out = _shape({"merged": _Ent(raw_document())}, None, "get_profile")
+    assert_slim_entity(out["merged"])
+    assert out["merged"]["_omitted_properties"] == sorted(BLOB_PROPS)
+
+
+def test_a_facet_named_after_an_entity_key_does_not_refuse_the_search() -> None:
+    """Facet names are the caller's to choose, so `facets=["schema", "properties"]` builds a
+    container carrying both of the keys the guard reads as an entity. Sealing the block with
+    _AsIs is what stops a caller picking facet names that refuse their own request."""
+    payload = {
+        "total": 0,
+        "limit": 0,
+        "offset": 0,
+        "results": [],
+        "facets": {
+            "schema": {"total": 1, "values": [{"id": "Person", "count": 3}]},
+            "properties": {"total": 1, "values": [{"id": "name", "count": 2}]},
+        },
+    }
+    out = _shape(_slim_result(payload), None, "search_entities")
+    assert set(out["facets"]) == {"schema", "properties"}
+    assert out["facets"]["schema"]["values"][0]["id"] == "Person"
+
+
+async def test_an_entity_in_a_passed_through_field_refuses_rather_than_leaking(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """get_profile copies `entities` through raw. It holds id strings on every instance seen
+    so far, but an instance serialising objects there would be a hole in the "binds every
+    entity-shaped value" requirement in openspec/specs/mcp-tool-surface. The seam closes it
+    -- at the cost of the whole call, which is the trade this design accepts and the reason
+    the behaviour is recorded in docs/implementation-notes.md rather than left implicit.
+    """
+    respx_mock.get("/api/2/metadata").mock(return_value=httpx.Response(200, json=_PROBE_MODEL))
+    respx_mock.get("/api/2/profiles/p1").mock(
+        return_value=httpx.Response(
+            200, json={"id": "p1", "entities": [raw_document()], "merged": _probe_entity()}
+        )
+    )
+    with pytest.raises(RuntimeError, match="get_profile cannot answer"):
+        await client.get_profile(profile_id="p1")

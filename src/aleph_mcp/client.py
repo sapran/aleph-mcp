@@ -258,26 +258,57 @@ class _Ent:
     raw: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class _AsIs:
+    """A subtree another helper already bounded. `_shape` copies it without looking inside.
+
+    The facets block is the one part of a reply whose *keys* come from the caller: a search
+    asking for `facets=["schema", "properties"]` produces a container carrying both, which
+    the entity signature in `_shape` would otherwise read as an unshaped entity and refuse.
+    The block holds no entities and `_slim_facets` has already bounded it, so the seam has
+    no business inspecting it -- and a guard condition must never be evaluated against a
+    key space the caller controls.
+    """
+
+    value: Any
+
+
 def _shape(node: Any, schemata: dict[str, Any] | None, endpoint: str) -> Any:
     """Replace every `_Ent` marker in a built reply with its slimmed entity.
 
     Refuses on an entity-shaped dict carrying no marker rather than passing it through --
     the same fail-closed stance readonly.py takes on the way out. `schema` plus `properties`
-    is the signature of an upstream entity and of nothing else these replies carry:
-    `searched` has a `schema` key but no `properties`, and get_schema has `properties` but
-    no `schema` and is not a shaped endpoint. A slimmed entity has both, which is why the
-    marker branch substitutes and does not descend into its own output.
+    is the signature of an upstream entity and of very little else: `searched` has a
+    `schema` key but no `properties`, and get_schema has `properties` but no `schema` and is
+    not a shaped endpoint. A slimmed entity has both, which is why the marker branch
+    substitutes and does not descend into its own output.
 
-    The message names the endpoint and quotes nothing from upstream: the offending keys are
-    attacker-influenced, and bounding them is `errors.py`'s job, not this one's.
+    Two limits, stated here rather than left to be discovered:
+
+    - It is a signature, not a proof. Any subtree whose keys the caller chooses must be
+      wrapped in `_AsIs` so it is never tested at all -- otherwise a caller can pick keys
+      that refuse their own request.
+    - An entity arriving with no `properties` key is not recognised. That entity carries no
+      document text either, so what escapes is the housekeeping surface `slim_entity`
+      strips rather than a body.
+
+    The message quotes nothing from upstream -- the offending keys are attacker-influenced,
+    and bounding them is `errors.py`'s job -- and it tells the caller not to retry. It
+    reaches the model verbatim, because `server.py` translates ValueError only, so it has
+    to read like the other refusals: a fault the caller cannot act on is one it must be
+    told to stop paying upstream requests for. Same reasoning as `raise_unreachable`.
     """
     if isinstance(node, _Ent):
         return slim_entity(node.raw, schemata)
+    if isinstance(node, _AsIs):
+        return node.value
     if isinstance(node, dict):
         if "schema" in node and "properties" in node:
             raise RuntimeError(
-                f"{endpoint} built a reply carrying a raw upstream entity instead of "
-                "marking it with _Ent, so its document text would have reached the model."
+                f"{endpoint} cannot answer: a defect in this server left a raw upstream "
+                "entity in the reply, and returning it would put unbounded document text "
+                "in front of you. Nothing about the call can change this and retrying "
+                "will not help -- report it against aleph-mcp."
             )
         return {key: _shape(value, schemata, endpoint) for key, value in node.items()}
     if isinstance(node, list):
@@ -298,6 +329,10 @@ def _shaped[**P](
     async def wrapper(self: AlephClient, /, *args: P.args, **kwargs: P.kwargs) -> dict[str, Any]:
         return await self._reply(await method(self, *args, **kwargs), method.__name__)
 
+    # wraps copies the inner method's annotations, and get_entity's says `-> _Ent` --
+    # true of the method, false of what a caller receives. Correct it so anything that
+    # introspects these methods is told the type they actually return.
+    wrapper.__annotations__ = {**method.__annotations__, "return": "dict[str, Any]"}
     return wrapper
 
 
@@ -368,7 +403,9 @@ def _slim_result(payload: dict[str, Any]) -> dict[str, Any]:
         "results": [_Ent(e) for e in payload.get("results") or []],
     }
     if payload.get("facets"):
-        out["facets"] = _slim_facets(payload["facets"])
+        # Bounded here and sealed: its keys are the facet names the caller asked for, so
+        # the seam must not read them. See _AsIs.
+        out["facets"] = _AsIs(_slim_facets(payload["facets"]))
     return out
 
 
