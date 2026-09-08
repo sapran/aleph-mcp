@@ -175,9 +175,11 @@ Retired since the last prune:
   branch; parked because T1's scope is the ten entity-returning methods and netting these two means
   deciding whether an entityset's `entities` is entity-shaped at all, which is a spec question.
 
-- **The client-method partition is declared, never verified.** `test_every_client_method_is_classified`
-  forces every public attribute of `AlephClient` onto one of two lists, which stops a method joining
-  the class unclassified -- but nothing checks that a method listed in `NOT_ENTITY_RETURNING` really
-  returns no entities, and listing it there is the cheapest way to make the test go green. A
-  parametrised test over that list asserting each reply carries no entity-shaped dict would close
-  it. Parked from the T1 review: it asserts behaviour of eleven methods T1 does not touch.
+- **`_slim_tags` copies each aggregation row through, so a row that is an entity survives it.**
+  `entity_tags` and `profile_tags` truncate a row's string values and pass every other value on
+  unchanged, so an entity object in the `results` list arrives with its properties intact. Aleph
+  returns `{field, value, count}` rows there, so this needs the same upstream contract change as the
+  two notes above and leaks nothing today. Recorded from the T1-FIX work, where the new
+  `NOT_SHAPING_CASES` row for these two methods probes the position beside the aggregation rather
+  than inside it; parked with its two siblings because netting all three is one spec question about
+  what counts as entity-shaped, not three refactors.
