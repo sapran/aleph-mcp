@@ -92,7 +92,9 @@ Retired since the last prune:
   `LICENSE` third from last, so `grep -q` exits on the match while `tar` may still have its
   final chunk to flush, and the EPIPE fails the pipeline. Observed twice on PR #12 while the
   same job re-run on `main @ 1952232` passed; PR #12 changes no path in the sdist, so the
-  piped bytes are identical on both sides. Parked: outside T3's scope. One-line fix is to
+  piped bytes are identical on both sides. It then went green on the same branch once the
+  test commits changed the archive's size — timing, not content, decides it, which is what
+  makes it a latent bug rather than a fixed one. Parked: outside T3's scope. One-line fix is to
   capture first, as the step already does for `meta` — `listing=$(tar tzf dist/*.tar.gz)`
   then `grep -q '/LICENSE$' <<<"$listing"`.
 - `client.py:496` decodes the body with an unguarded `jsonlib.loads`. `json.JSONDecodeError`
