@@ -95,3 +95,36 @@ Retired since the last prune:
   piped bytes are identical on both sides. Parked: outside T3's scope. One-line fix is to
   capture first, as the step already does for `meta` — `listing=$(tar tzf dist/*.tar.gz)`
   then `grep -q '/LICENSE$' <<<"$listing"`.
+- `client.py:496` decodes the body with an unguarded `jsonlib.loads`. `json.JSONDecodeError`
+  and `UnicodeDecodeError` are both `ValueError` subclasses, so a 2xx whose body is not JSON
+  — an HTML maintenance page, a proxy interstitial, a truncated body — reaches the model as a
+  refusal reading `Expecting value: line 1 column 1 (char 0)`, indistinguishable from "you
+  passed a bad id". The rational reply to a refusal is to change arguments and retry, against
+  an upstream that is down. Run-verified identical on `main @ 1952232`, so the T3 seam
+  relocates this and does not widen it; `errors.py:74` already guards the analogous connect
+  case. The fix that also closes the note below: a dedicated `Refusal(ValueError)` raised at
+  `client.py`'s own refusal sites, caught in place of bare `ValueError` — the pattern
+  `errors.py:97` already sets for `ResponseTooLarge`. Parked: `client.py` is out of T3's
+  scope; belongs with T2, which is already about error text.
+- The T3 seam wraps the whole tool body, where the arms it replaced wrapped only the
+  `await client.X(...)` call. Equivalent today — every body is one forwarding call — but a
+  future in-body `int()`, `datetime.fromisoformat()` or nested `json.loads` would be
+  relabelled as a client refusal with nothing to catch it. Same `Refusal` type fixes it.
+  Parked: needs `client.py`.
+- Resources have no counterpart to the fused `tool` helper: `@mcp.resource` is still reachable
+  raw, and `schema_resource`'s translation is a hand-applied decorator nothing enforces. Two
+  consequences, neither live today — a future *parameterised* resource would silently regress
+  to FastMCP's `Error reading resource '<uri>': ` wrapping, and the decorator order is
+  load-bearing but fails silently (`@_as_resource_error` above `@mcp.resource` imports,
+  registers and serves the untranslated message). `collections_resource` and
+  `schemata_resource` cannot raise `ValueError` at all, so decorating them now would be dead
+  code. Fix is a ~4-line local `resource(uri, **kw)` factory mirroring `tool`. Parked: beyond
+  T3's stated files and criteria.
+- Comment drift naming the structure T3 deleted: `client.py:619` and
+  `tests/test_collection_scope.py:334` and `:446` still say "each tool's `except ValueError`"
+  or "no tool's `except ValueError` translates". The claims stay true of the single seam, but
+  send a reader looking for per-tool arms that no longer exist. Parked: both files are outside
+  T3's scope.
+- `pyproject.toml` sets `line-length = 100` while `[tool.ruff.lint]` ignores `E501`, so line
+  length is enforced only by `ruff format`, never by `ruff check`. Harmless today; noted
+  because the contributor-facing constraint reads as if `ruff check` enforces it.
