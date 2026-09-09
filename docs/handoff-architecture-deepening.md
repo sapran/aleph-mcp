@@ -21,7 +21,15 @@ Update this table as tasks land; it is the single source of truth for what is do
 | T1-FIX-2 | Close the two PR #14 regressions | **ACCEPTED** | #14 (same branch), merged `3b3059c` | Both blockers + all five recommendations closed; reviewed by all three pr-review-toolkit agents, one substantive finding found and fixed |
 | T2 | Give the bounded-echo rule a module | **ACCEPTED** | #15, merged `9a894fa` | New `echo.py`; four contexts verified byte-identical to `develop`; all three scope traps respected |
 | T5 | Collection scope module | **ACCEPTED** | #16, merged `7063627` | New `scope.py`; behaviour byte-identical to `develop` across a 21-refusal/9-spelling probe; reviewed by all three pr-review-toolkit agents, one latent fail-open closed |
-| **T4** | **Lift the transport** | **NEXT — unblocked** | — | Base `develop` @ `7063627`; refresh this task's header before starting. Run last |
+| T4 | Lift the transport | **ACCEPTED** | #17, merged `c366624` | New `transport.py`; behaviour byte-identical to `develop` across a 57-outcome probe, and the moved code textually identical modulo four renames; reviewed by all three pr-review-toolkit agents, one critical found and fixed (the live read-only tripwire had stopped asserting) |
+
+**All five tasks are landed and accepted as of 2026-09-09.** `develop` is at `c366624` with
+**440 passed, 31 skipped, 5 xfailed**. `AlephClient` went from one 1306-line class holding four
+concerns to a 1272-line coordinator over four modules it does not implement: `echo.py` (T2),
+`scope.py` (T5), `transport.py` (T4) and the shaping seam (T1), with `server.py`'s seventeen
+refusal arms collapsed to one (T3). What remains open is the parked-findings list in
+`docs/implementation-notes.md`, which is a queue of behaviour changes, not refactors — each needs
+its own change and its own spec question answered.
 
 Out-of-band, not blocking any task: `.github/workflows/ci.yml` still triggers `push: branches: [main]`,
 so merges landing on `develop` get no post-merge build; and the `build` job's licence assertion pipes
