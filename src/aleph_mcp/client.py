@@ -461,12 +461,13 @@ def _slim_result(payload: dict[str, Any]) -> dict[str, Any]:
 class AlephClient:
     """Async, read-only wrapper around the Aleph HTTP API.
 
-    Owns one httpx.AsyncClient; the caller closes it with aclose(). Only GET requests
-    are issued, with the single exception of POST /api/2/match, which is a read
-    operation that takes a JSON body. Every outgoing request is checked against the
-    allowlist in `readonly.py` before it is sent, so no endpoint that creates, mutates
-    or deletes Aleph state is reachable through this class regardless of what the API
-    key is permitted to do.
+    Owns one `Transport`, which owns the one httpx.AsyncClient; the caller closes both
+    with aclose(). Only GET requests are issued, with the single exception of POST
+    /api/2/match, which is a read operation that takes a JSON body. Every outgoing
+    request is checked against the allowlist in `readonly.py` before it is sent — the
+    transport installs that guard and is the only thing here that reaches the network —
+    so no endpoint that creates, mutates or deletes Aleph state is reachable through
+    this class regardless of what the API key is permitted to do.
     """
 
     def __init__(self, settings: Settings):
@@ -545,22 +546,22 @@ class AlephClient:
         except (httpx.HTTPError, ValueError):
             # Two families, both upstream's fault and neither the caller's.
             #
-            # httpx.HTTPError covers the read-side faults `_request` deliberately does not
-            # retry -- ReadTimeout, ReadError, RemoteProtocolError. A slow model is literally
-            # the ReadTimeout in that set, so this is the arm the first paragraph describes.
+            # httpx.HTTPError covers the read-side faults `Transport.request` deliberately does
+            # not retry -- ReadTimeout, ReadError, RemoteProtocolError. A slow model is
+            # literally the ReadTimeout in that set, so this is the arm the first paragraph
+            # describes.
             #
-            # ValueError covers the body not parsing, and it has to be the base class rather
-            # than JSONDecodeError. `_request` ends at `jsonlib.loads(body)` where body is
-            # *bytes*: json.loads runs detect_encoding and decodes first, so a body that is
-            # not valid UTF-8 raises UnicodeDecodeError -- a sibling of JSONDecodeError under
+            # ValueError covers the body not parsing, and it has to be the base class rather than
+            # JSONDecodeError. `Transport.request` ends at `jsonlib.loads(body)` where body is
+            # *bytes*: json.loads runs detect_encoding and decodes first, so a body that is not
+            # valid UTF-8 raises UnicodeDecodeError -- a sibling of JSONDecodeError under
             # ValueError, not a subclass. Measured with JSONDecodeError here: a metadata route
             # answering 200 with a PNG, a raw gzip or a latin-1 error page hard-failed all ten
-            # shaped tools, permanently (only a success is cached, so every later call
-            # refetched and failed the same way), and UnicodeDecodeError being a ValueError
-            # meant `server.py`'s seam handed the model
-            # "'utf-8' codec can't decode byte 0x89..." unprefixed and surviving masking --
-            # the shape of a deliberate, caller-actionable refusal, naming nothing the caller
-            # can act on.
+            # shaped tools, permanently (only a success is cached, so every later call refetched and
+            # failed the same way), and UnicodeDecodeError being a ValueError meant `server.py`'s
+            # seam handed the model "'utf-8' codec can't decode byte 0x89..." unprefixed and
+            # surviving masking -- the shape of a deliberate, caller-actionable refusal, naming
+            # nothing the caller can act on.
             #
             # Still named rather than a bare except: a defect in this module -- an
             # AttributeError, a TypeError -- reaches the caller instead of silently degrading
@@ -775,10 +776,10 @@ class AlephClient:
 
         page = limit
         payload: dict[str, Any] | None = None
-        # One tool call, one deadline. `_request` bounds each request on its own budget, but
-        # a shrink issues a whole fresh one: without this, four hops against a slow or
-        # 5xx-ing upstream multiply that budget by MAX_SEARCH_SHRINKS + 1, which is the same
-        # amplification the per-request budget exists to prevent, one level up.
+        # One tool call, one deadline. `Transport.request` bounds each request on its own budget,
+        # but a shrink issues a whole fresh one: without this, four hops against a slow or 5xx-ing
+        # upstream multiply that budget by MAX_SEARCH_SHRINKS + 1, which is the same amplification
+        # the per-request budget exists to prevent, one level up.
         deadline = _monotonic() + self._settings.timeout_secs
         for shrink in range(MAX_SEARCH_SHRINKS + 1):
             try:
