@@ -105,3 +105,13 @@ def test_the_payload_cannot_close_the_quoted_region_or_carry_control_characters(
     assert "\x1b" not in rendered
     assert "\x00" not in rendered
     assert "\u202e" not in rendered
+
+
+def test_the_upstream_echo_is_capped_at_the_length_this_path_chose() -> None:
+    """Which policy this call site names is now a one-word choice, so pin the number it has
+    to produce. Every policy bounds something, so a swapped one still yields a plausible
+    message \u2014 the cap is what tells them apart."""
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(_json_resp(400, {"message": "z" * 201}), context="ctx")
+    quoted = str(exc.value).split('(untrusted upstream text): "', 1)[1].rstrip('"')
+    assert quoted == "z" * 200 + "\u2026"

@@ -76,6 +76,14 @@ def test_slim_entity_truncates_long_values() -> None:
     assert len(value) < 600
 
 
+def test_slim_entity_truncates_at_the_length_this_path_chose() -> None:
+    """Which policy the slimmer names is now a one-word choice, and the test above passes
+    under any cap below 600 — including the 120 and 200 the refusal paths use. Pin the
+    number: a property value cut to an error message's length is silent data loss."""
+    out = slim_entity(raw_entity(properties={"summary": ["z" * 501]}))
+    assert out["properties"]["summary"][0] == "z" * 500 + "… [+1 chars]"
+
+
 def test_slim_entity_keeps_highlight_and_score() -> None:
     out = slim_entity(raw_entity(highlight=["…hit…"], score=3.5))
     assert out["highlight"] == ["…hit…"]

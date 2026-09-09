@@ -12,7 +12,7 @@ this file when it becomes a spec requirement or is fixed — not when someone re
   C0 control except NUL, `ESC` included — decoded with `errors="ignore"`. FastMCP then renders
   it verbatim, because `mask_error_details` defaults false. So a hostile or MITM'd forward
   proxy can write multi-kilobyte ASCII with ANSI escapes into a model-visible tool error,
-  bypassing both the 200-char cap and the non-printable stripping in `_as_quoted_data`. A
+  bypassing both the 200-char cap and the non-printable stripping of `echo.UPSTREAM_ERROR`. A
   forward proxy is a live deployment shape here, so this is worth a change of its own: catch
   `httpx.TransportError` at the top of `_request` and route the non-retryable members through
   `raise_unreachable`. Do **not** simply add `ProxyError` to `_CONNECT_ERRORS` — a `CONNECT`
@@ -213,3 +213,12 @@ Retired since the last prune:
   `statistics` -- are one spec question about what counts as entity-shaped, not four refactors.
   Since T1-FIX-2 each is pinned by a `strict` xfail row in `NOT_SHAPING_CASES`, so the behaviour
   cannot change without the suite saying so, and fixing any of them forces this note to be closed.
+
+- **`echo.COLLECTION_ECHO` leaves control characters to its call site's `!r`.** Found while
+  building the policy module (T2); it is the behaviour the four helpers had, preserved deliberately
+  rather than a new gap. `_check_collection_id` is the only caller and formats the result with
+  `!r`, which escapes controls -- so the policy does not strip them itself. A second caller that
+  interpolates the rendering plainly would put upstream control characters into a model-visible
+  message. Recorded because the coupling is now between two files rather than inside one function.
+  Closing it means either stripping in the policy (a behaviour change to the existing message, so
+  its own change) or asserting the `!r` at the call site.
