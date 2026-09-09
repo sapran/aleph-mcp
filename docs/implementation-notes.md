@@ -277,3 +277,9 @@ Retired since the last prune:
   scope message -- "cannot be combined with named collections" -- for a list that names no other
   collection. Unchanged from `develop`, untested anywhere. Correcting it changes a refusal
   message, so it is a behaviour change rather than a move.
+
+- **`openspec/config.yaml`'s layout paragraph is three modules stale.** It lists `server.py`,
+  `client.py`, `readonly.py`, `config.py` and `errors.py` and names none of `echo.py` (T2),
+  `scope.py` (T5) or `transport.py` (T4). Documentation only -- no spec assertion depends on it --
+  so it is parked rather than corrected inside a behaviour-preserving refactor. One paragraph to
+  fix, and cheapest to do once rather than once per task.
