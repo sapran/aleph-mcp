@@ -127,6 +127,20 @@ jobs:
           grep -qx 'Metadata-Version: 2.4' <<<"$meta" || grep -qx 'Metadata-Version: 2.5' <<<"$meta"
           grep -qx 'License-Expression: MIT' <<<"$meta"
           grep -qx 'License-File: LICENSE' <<<"$meta"
-          unzip -l "$wheel" | grep -q 'licenses/LICENSE'
-          tar tzf dist/*.tar.gz | grep -q '/LICENSE$'
+          # Each listing is captured before it is matched, rather than piped into `grep -q`.
+          # `-q` exits at the first match and closes the pipe; the producer's next write
+          # then fails, and `pipefail` makes that failure the step's — so the check failed
+          # precisely when the licence WAS present. GNU tar reports "tar: stdout: write
+          # error" and exits 2 (run 34342272374); killed by the signal instead it exits 141.
+          # How often it fires depends on how much the producer still has to write after
+          # LICENSE, so it tracks the tree rather than being random: measured on this sdist
+          # with GNU tar, 16 of 20 runs, and 20 of 20 once more entries follow LICENSE.
+          # A failed capture is still fatal, via `set -e`, so a corrupt archive is not
+          # mistaken for a missing licence.
+          wheel_listing=$(unzip -l "$wheel")
+          sdist_listing=$(tar tzf dist/*.tar.gz)
+          grep -q 'licenses/LICENSE' <<<"$wheel_listing" || {
+            echo "::error::the wheel ships no licenses/LICENSE"; exit 1; }
+          grep -q '/LICENSE$' <<<"$sdist_listing" || {
+            echo "::error::the sdist ships no LICENSE"; exit 1; }
           echo "licence expression, header and file all present"
