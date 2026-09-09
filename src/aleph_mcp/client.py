@@ -7,10 +7,10 @@ import re
 import secrets
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from typing import Any, Concatenate, Final, Literal, cast
 
 import httpx
+from fastmcp.exceptions import ResourceError, ToolError
 
 from .config import Settings
 from .errors import (
@@ -251,15 +251,84 @@ def slim_entity(entity: dict[str, Any], schemata: dict[str, Any] | None = None) 
 _SHAPED_ENDPOINTS: set[str] = set()
 
 
-@dataclass(frozen=True, slots=True)
-class _Ent:
+class _MarkerEscaped(ToolError):
+    """A shaping marker reached a serialiser, so a reply left this module unshaped.
+
+    A `ToolError` for the same reason `_shape`'s refusal is one: it is a refusal, and
+    anything else is prefixed by FastMCP and erased under `mask_error_details`. That alone
+    is not enough on the path that actually fires -- see `find_marker`.
+    """
+
+
+class _Marker:
+    """Base for the two shaping markers. Refuses to serialise, on every path.
+
+    `_shape` replaces every marker on the way out, so a marker reaching a serialiser means
+    a reply left this module without passing the seam. That is the one direction the seam
+    itself cannot watch: `_shape` is fail-closed on a raw dict left in a reply and was
+    fail-*open* on the inverse. Measured through the MCP boundary before this guard, with
+    one method unhooked from the seam: `isError: False`, carrying the whole document body.
+
+    Three mechanisms, in the order they fire. `find_marker` at the refusal seam is the one
+    that decides what the caller is told; the two here are what make a marker unable to
+    serialise if it ever gets past that, and they were measured rather than reasoned about:
+
+    - Not being a dataclass is the live one. It covers the marker sitting inside a
+      `dict[str, Any]` reply -- the shape `_slim_result` produces, and therefore the shape
+      an author copying it produces. There pydantic infers a schema from the runtime type
+      and would walk a dataclass's fields straight into the payload; with a raising
+      `__str__` instead, the serialiser's fallback refuses. Measured with the schema hook
+      alone: that path still returned the entire body as a success.
+    - `__get_pydantic_core_schema__` covers the marker as a *declared* return type. In this
+      architecture nothing declares one -- `_shaped` rewrites `__annotations__["return"]` to
+      `dict[str, Any]`, and every `server.py` tool declares its own return type, so FastMCP
+      never sees a `-> _Ent`. Measured: removing this hook fails its own unit test and
+      nothing at the boundary. Kept because the property it asserts is what makes the class
+      unserialisable by construction rather than by the accident of no one declaring it.
+
+    `__repr__` names the defect instead of dumping the payload, so no diagnostic path -- a
+    traceback, a log line, pytest's assertion output -- can print what the seam keeps back.
+    """
+
+    __slots__ = ()
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: Any, handler: Any) -> Any:
+        raise _MarkerEscaped(
+            f"{cls.__name__} reached the serialiser: a reply left aleph_mcp.client without "
+            "passing the shaping seam. Every entity-returning method must be decorated with "
+            "@_shaped. Nothing about the call can change this and retrying will not help -- "
+            "report it against aleph-mcp."
+        )
+
+    def __repr__(self) -> str:
+        return f"<{type(self).__name__}: unshaped, must not leave aleph_mcp.client>"
+
+    def __str__(self) -> str:
+        # Split from __repr__ deliberately. A serialiser that cannot build a schema for a
+        # value falls back to `str`, so raising here is what names the defect on the second
+        # shape rather than leaving FastMCP's generic "no structured output" to stand in.
+        # Debugging paths -- tracebacks, pytest assertion output, logging -- use __repr__,
+        # which stays safe and quotes nothing of what the seam exists to keep back.
+        raise _MarkerEscaped(
+            f"{type(self).__name__} reached a string conversion: a reply left "
+            "aleph_mcp.client without passing the shaping seam. Nothing about the call can "
+            "change this and retrying will not help -- report it against aleph-mcp."
+        )
+
+
+class _Ent(_Marker):
     """A raw upstream entity, marked to be shaped on the way out of this module."""
+
+    __slots__ = ("raw",)
 
     raw: dict[str, Any]
 
+    def __init__(self, raw: dict[str, Any]) -> None:
+        self.raw = raw
 
-@dataclass(frozen=True, slots=True)
-class _AsIs:
+
+class _AsIs(_Marker):
     """A subtree another helper already bounded. `_shape` copies it without looking inside.
 
     The facets block is the one part of a reply whose *keys* come from the caller: a search
@@ -270,7 +339,12 @@ class _AsIs:
     key space the caller controls.
     """
 
+    __slots__ = ("value",)
+
     value: Any
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
 
 
 def _shape(node: Any, schemata: dict[str, Any] | None, endpoint: str) -> Any:
@@ -293,10 +367,19 @@ def _shape(node: Any, schemata: dict[str, Any] | None, endpoint: str) -> Any:
       strips rather than a body.
 
     The message quotes nothing from upstream -- the offending keys are attacker-influenced,
-    and bounding them is `errors.py`'s job -- and it tells the caller not to retry. It
-    reaches the model verbatim, because `server.py` translates ValueError only, so it has
-    to read like the other refusals: a fault the caller cannot act on is one it must be
-    told to stop paying upstream requests for. Same reasoning as `raise_unreachable`.
+    and bounding them is `errors.py`'s job -- and it tells the caller not to retry, because
+    a fault the caller cannot act on is one it must be told to stop paying upstream requests
+    for. Same reasoning as `raise_unreachable`.
+
+    Raised as `ToolError` so that it actually arrives. `server.py`'s refusal seam translates
+    ValueError only, so the RuntimeError this replaces missed the seam entirely: measured
+    through a real MCPClient round trip, it reached the caller as
+    `Error calling tool 'get_profile': ...` -- the exact prefix every other refusal in this
+    repo is asserted not to carry -- and with `mask_error_details` on, FastMCP replaced the
+    whole message with `Error calling tool 'get_profile'`, deleting the one sentence that
+    tells the caller retrying will not help. Not a layering violation: `errors.py` already
+    raises `ToolError` from this layer, and every `@_shaped` method is a tool, so the
+    tool/resource split that motivates the two flavours does not arise here.
     """
     if isinstance(node, _Ent):
         return slim_entity(node.raw, schemata)
@@ -304,7 +387,7 @@ def _shape(node: Any, schemata: dict[str, Any] | None, endpoint: str) -> Any:
         return node.value
     if isinstance(node, dict):
         if "schema" in node and "properties" in node:
-            raise RuntimeError(
+            raise ToolError(
                 f"{endpoint} cannot answer: a defect in this server left a raw upstream "
                 "entity in the reply, and returning it would put unbounded document text "
                 "in front of you. Nothing about the call can change this and retrying "
@@ -334,6 +417,42 @@ def _shaped[**P](
     # introspects these methods is told the type they actually return.
     wrapper.__annotations__ = {**method.__annotations__, "return": "dict[str, Any]"}
     return wrapper
+
+
+def find_marker(node: Any) -> _Marker | None:
+    """The first shaping marker anywhere in a built reply, or None.
+
+    The seam in `server.py` calls this on every reply so that a marker which never reached
+    `_shape` -- because the method building it was never decorated with `@_shaped` -- is
+    refused where the refusal can still be phrased, rather than deep inside a serialiser.
+
+    That distinction is the whole reason this exists. The markers already refuse to
+    serialise, so nothing leaks either way; but pydantic wraps whatever the fallback raises
+    in `PydanticSerializationError`, and FastMCP sees only that. Measured, with
+    `_MarkerEscaped` made a `ToolError` and a method unhooked from the seam:
+
+        masked=False -> Error calling tool 'get_entity': Error serializing to JSON: ...
+        masked=True  -> Error calling tool 'get_entity'
+
+    Prefixed, erased under masking, and reading as a transient hiccup -- so a model retries
+    a permanently broken endpoint, paying the upstream request each time, because the
+    endpoint's own fetch completes before the seam. Subclassing alone cannot fix that: the
+    exception FastMCP inspects is pydantic's, not ours. Catching the value before it is
+    serialised can, which is what this is for.
+    """
+    if isinstance(node, _Marker):
+        return node
+    if isinstance(node, dict):
+        for value in node.values():
+            found = find_marker(value)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = find_marker(item)
+            if found is not None:
+                return found
+    return None
 
 
 def _slim_facets(facets: Any) -> Any:
@@ -469,10 +588,64 @@ class AlephClient:
         return cast(dict[str, Any], _shape(built, await self._schemata(), endpoint))
 
     async def _schemata(self) -> dict[str, Any] | None:
-        """Cached FtM schemata, used only to derive captions. Never fatal."""
+        """Cached FtM schemata, used only to derive captions. An upstream fault is not fatal.
+
+        Falling back to `_CAPTION_FALLBACK` is the right answer to an instance that cannot
+        answer for its own ontology: the caption is a convenience, and failing ten endpoints
+        over it would be worse than deriving it from a fixed order.
+
+        A *local* refusal is not that. `get_model()` reaches the wire through
+        `_request(..., resource=True)`, which converts a `ReadOnlyViolation` into a
+        `ResourceError` -- so the bare `except Exception` this replaces also ate readonly.py
+        refusing to let a request leave the configured origin, and there is no logging in
+        this package, so it left no trace at all. Measured before this change: a metadata
+        route answering 302 to another host returned a successful answer whose caption came
+        from the fallback order, indistinguishable from a slow model.
+
+        Re-flavoured to `ToolError` rather than re-raised as-is. `_schemata` is reached only
+        from `_reply`, i.e. only on a tool call, and a `ResourceError` raised inside a tool
+        misses FastMCP's ToolError path: it arrives prefixed and is masked away entirely.
+        Same reasoning as the refusal in `_shape`.
+        """
         try:
             model = await self.get_model()
-        except Exception:
+        except ResourceError as e:
+            if isinstance(e.__cause__, ReadOnlyViolation):
+                raise ToolError(str(e)) from e
+            # Everything else this covers -- a non-2xx, an exhausted connect, a body over
+            # the ceiling -- is an upstream fault the caller cannot act on.
+            return None
+        except (httpx.HTTPError, ValueError):
+            # Two families, both upstream's fault and neither the caller's.
+            #
+            # httpx.HTTPError covers the read-side faults `_request` deliberately does not
+            # retry -- ReadTimeout, ReadError, RemoteProtocolError. A slow model is literally
+            # the ReadTimeout in that set, so this is the arm the first paragraph describes.
+            #
+            # ValueError covers the body not parsing, and it has to be the base class rather
+            # than JSONDecodeError. `_request` ends at `jsonlib.loads(body)` where body is
+            # *bytes*: json.loads runs detect_encoding and decodes first, so a body that is
+            # not valid UTF-8 raises UnicodeDecodeError -- a sibling of JSONDecodeError under
+            # ValueError, not a subclass. Measured with JSONDecodeError here: a metadata route
+            # answering 200 with a PNG, a raw gzip or a latin-1 error page hard-failed all ten
+            # shaped tools, permanently (only a success is cached, so every later call
+            # refetched and failed the same way), and UnicodeDecodeError being a ValueError
+            # meant `server.py`'s seam handed the model
+            # "'utf-8' codec can't decode byte 0x89..." unprefixed and surviving masking --
+            # the shape of a deliberate, caller-actionable refusal, naming nothing the caller
+            # can act on.
+            #
+            # Still named rather than a bare except: a defect in this module -- an
+            # AttributeError, a TypeError -- reaches the caller instead of silently degrading
+            # every caption on the instance. That property is pinned by a test, because
+            # deleting this arm entirely, or appending `except Exception` after it, both left
+            # the suite green at 380 passed.
+            #
+            # One live counterexample to that reading, pre-existing and recorded in
+            # docs/implementation-notes.md rather than fixed here: `model.get("schemata")`
+            # below is outside this try, so an upstream `model` that is truthy but not a dict
+            # raises AttributeError there and means "upstream sent nonsense", not "this module
+            # has a bug".
             return None
         schemata = model.get("schemata")
         return schemata if isinstance(schemata, dict) else None

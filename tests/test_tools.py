@@ -10,9 +10,10 @@ from fastmcp import Client as MCPClient
 from fastmcp import FastMCP
 from fastmcp.exceptions import ResourceError, ToolError
 
-from aleph_mcp.client import AlephClient
+from aleph_mcp.client import AlephClient, _Ent
 from aleph_mcp.config import Settings
 from aleph_mcp.server import _as_resource_error, _as_tool_error, build_server
+from tests.conftest import assert_model_not_fetched
 from tests.shapes import (
     BLOB_PROPS,
     assert_search_envelope,
@@ -275,6 +276,7 @@ async def test_client_refusal_surfaces_as_a_tool_error(
     # keep both.
     assert not str(excinfo.value).startswith("Error calling tool")
     assert wire.call_count == wire_calls
+    assert_model_not_fetched(respx_mock)
     if wire_calls:
         # get_collection can only learn a foreign_id is unknown by asking the listing;
         # the detail route must still never be reached.
@@ -296,6 +298,39 @@ async def masked_server(
         yield mcp
     finally:
         await client.aclose()
+
+
+async def test_the_masked_session_is_actually_masking(
+    masked_server: FastMCP, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The positive control for every masking test below, and the one they cannot be.
+
+    Each of those asserts that a refusal's own words survive masking. All of them also pass
+    when masking never happens at all, because an unmasked message contains its own words
+    too -- so the whole group degenerates the moment `mask_error_details` stops taking
+    effect. The fixture's `monkeypatch.setattr` catches the setting being *renamed*; it
+    cannot catch it being deprecated to a no-op. Measured: setting the fixture to `False`
+    and simultaneously reverting `_shape` to `RuntimeError` -- the exact defect those tests
+    exist to catch -- left all 18 of them green.
+
+    This one fails in that world instead of passing. A non-refusal raised inside a tool must
+    have its message replaced, so the sentinel can only arrive if masking is off.
+    """
+    sentinel = "SENTINEL-8c4f1a2e-masking-is-off"
+
+    @masked_server.tool
+    async def masking_probe() -> dict[str, Any]:
+        """A fault, not a refusal: FastMCP replaces its message when masking is on."""
+        raise RuntimeError(sentinel)
+
+    async with MCPClient(masked_server) as mcp:
+        with pytest.raises(ToolError) as excinfo:
+            await mcp.call_tool("masking_probe", {})
+
+    assert sentinel not in str(excinfo.value), (
+        "the masked session let a non-refusal's own message through, so masking is not in "
+        "effect and every masking test in this file is passing vacuously"
+    )
 
 
 @pytest.mark.parametrize(
@@ -322,6 +357,133 @@ async def test_a_refusal_survives_error_masking(
     async with MCPClient(masked_server) as mcp:
         with pytest.raises(ToolError, match=match):
             await mcp.call_tool(tool, args)
+
+
+# -- the one refusal that is not a client ValueError ---------------------------
+#
+# The shaping seam in client.py refuses a reply carrying a raw upstream entity. It is a
+# refusal like any other on this surface and has to clear the same two bars, but it reaches
+# the caller by a different route: it is raised at the seam rather than translated from a
+# ValueError by the adapter above, so neither table covers it. Measured before it was
+# raised as a ToolError: it arrived as `Error calling tool 'get_profile': ...` unmasked, and
+# with masking on, the whole message -- including the sentence telling the caller that
+# retrying cannot help -- was replaced by `Error calling tool 'get_profile'`.
+
+
+def _profile_with_a_raw_entity() -> dict[str, Any]:
+    """A profile whose `entities` holds an object rather than an id string.
+
+    The one payload that reaches the seam's guard through a real tool call: get_profile
+    copies `entities` through raw, so an entity there is never marked and never shaped.
+    """
+    return {"id": "p1", "entities": [raw_document()], "merged": raw_entity(id="e1")}
+
+
+async def test_the_shaping_refusal_reaches_the_caller_unprefixed(
+    server: FastMCP, respx_mock: respx.MockRouter
+) -> None:
+    """The seam's own refusal clears the bar every other refusal on this surface clears.
+
+    `Error calling tool '<name>': ` is what FastMCP prepends to an exception it does not
+    recognise as a refusal, and the seventeen rows above assert no refusal carries it.
+    """
+    respx_mock.get("/api/2/profiles/p1").mock(
+        return_value=httpx.Response(200, json=_profile_with_a_raw_entity())
+    )
+    async with MCPClient(server) as mcp:
+        with pytest.raises(ToolError, match="get_profile cannot answer") as excinfo:
+            await mcp.call_tool("get_profile", {"profile_id": "p1"})
+    assert not str(excinfo.value).startswith("Error calling tool")
+    # The offending keys are upstream's to choose, so none of them may be quoted back.
+    assert "bodyText" not in str(excinfo.value)
+
+
+async def test_the_shaping_refusal_survives_error_masking(
+    masked_server: FastMCP, respx_mock: respx.MockRouter
+) -> None:
+    """The fail-closed backstop, and the half that matters most here.
+
+    Masking replaces the whole message of anything that is not a ToolError, so the sentence
+    telling the caller that nothing about the call can change this outcome is exactly the
+    text that disappeared. It is also the text that most needs to survive: this refusal is
+    the one a caller can never clear by retrying or by changing its arguments.
+    """
+    respx_mock.get("/api/2/profiles/p1").mock(
+        return_value=httpx.Response(200, json=_profile_with_a_raw_entity())
+    )
+    async with MCPClient(masked_server) as mcp:
+        with pytest.raises(ToolError, match="get_profile cannot answer") as excinfo:
+            await mcp.call_tool("get_profile", {"profile_id": "p1"})
+    assert "retrying will not help" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("masked", [False, True], ids=["unmasked", "masked"])
+async def test_a_marker_that_missed_the_seam_refuses_actionably(
+    settings: Settings, respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, masked: bool
+) -> None:
+    """A marker reaching the boundary is a permanent server defect, and must say so.
+
+    The markers already refuse to serialise, so nothing leaks either way -- but that refusal
+    is raised inside pydantic, which wraps it in `PydanticSerializationError`, and FastMCP
+    sees only the wrapper. Measured before the seam checked for markers, with
+    `_MarkerEscaped` already made a ToolError:
+
+        masked=False -> Error calling tool 'get_entity': Error serializing to JSON: ...
+        masked=True  -> Error calling tool 'get_entity'
+
+    Prefixed, erased under masking, and reading as a transient hiccup -- so a model retries
+    an endpoint that can never work, paying the upstream request every time, because the
+    endpoint's own fetch completes before the seam. The refusal has to be phrased where the
+    reply is still ours, which is the adapter in server.py.
+
+    The client method is unhooked here rather than a probe tool being built by hand, because
+    forgetting `@_shaped` on a new endpoint is the mistake this guards, and going through
+    `build_server` is what proves the adapter and not the serialiser produced the answer.
+    """
+    monkeypatch.setattr(fastmcp.settings, "mask_error_details", masked)
+    monkeypatch.setattr(AlephClient, "get_entity", AlephClient.get_entity.__wrapped__, raising=True)
+    mcp, client = build_server(settings)
+    respx_mock.get("/api/2/entities/d1").mock(return_value=httpx.Response(200, json=raw_document()))
+    try:
+        async with MCPClient(mcp) as session:
+            with pytest.raises(ToolError) as excinfo:
+                await session.call_tool("get_entity", {"entity_id": "d1"})
+    finally:
+        await client.aclose()
+
+    message = str(excinfo.value)
+    assert not message.startswith("Error calling tool"), message
+    assert "retrying will not help" in message, message
+    for prop in BLOB_PROPS:
+        assert f"<{prop} body>" not in message
+
+
+async def test_a_marker_that_missed_the_seam_cannot_reach_the_caller() -> None:
+    """The inverse mistake, measured at the boundary that decides whether it matters.
+
+    `_shape` refuses a raw dict left in a reply. The other direction -- a marker that never
+    reached `_shape`, because the method building it was never hooked to the seam -- was
+    fail-open: measured through this same boundary, it returned `isError: False` carrying
+    the entire document body. The tool here is built by hand rather than by unhooking a real
+    one, so the check keeps working whatever the client's method set becomes; the reply is
+    shaped exactly the way `_slim_result` shapes one, which is what an author writing the
+    next endpoint copies.
+    """
+    probe = FastMCP("marker-probe")
+
+    @probe.tool
+    async def forgot_to_shape() -> dict[str, Any]:
+        """A reply built with markers by a method that never went through the seam."""
+        return {"merged": _Ent(raw_document())}
+
+    async with MCPClient(probe) as mcp:
+        with pytest.raises(ToolError) as excinfo:
+            await mcp.call_tool("forgot_to_shape", {})
+
+    message = str(excinfo.value)
+    assert "shaping seam" in message
+    for prop in BLOB_PROPS:
+        assert f"<{prop} body>" not in message
 
 
 # -- the seam itself -----------------------------------------------------------

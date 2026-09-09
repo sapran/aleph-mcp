@@ -2,13 +2,14 @@ import asyncio
 import gzip
 from collections.abc import AsyncIterator, Callable, Iterator
 from itertools import pairwise
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 import pytest
 import respx
 from fastmcp.exceptions import ToolError
+from pydantic import TypeAdapter
 
 from aleph_mcp.client import (
     _SHAPED_ENDPOINTS,
@@ -20,13 +21,16 @@ from aleph_mcp.client import (
     MAX_RETRY_SLEEP_SECS,
     MAX_SEARCH_SHRINKS,
     AlephClient,
+    _AsIs,
     _Ent,
+    _MarkerEscaped,
     _shape,
     _shrunk_page,
     _slim_result,
     derive_caption,
     slim_entity,
 )
+from tests.conftest import assert_model_not_fetched
 from tests.shapes import (
     BLOB_PROPS,
     assert_search_envelope,
@@ -405,6 +409,7 @@ async def test_negative_offset_is_refused(
     with pytest.raises(ValueError, match="offset must be >= 0"):
         await client.list_collections(offset=-1)
     assert wire.call_count == 0
+    assert_model_not_fetched(respx_mock)
 
 
 async def test_numeric_collection_id_is_validated_before_interpolation(
@@ -417,6 +422,7 @@ async def test_numeric_collection_id_is_validated_before_interpolation(
     with pytest.raises(ValueError, match="expected a numeric collection id"):
         await client.get_collection(collection="42\n")
     assert wire.call_count == 0
+    assert_model_not_fetched(respx_mock)
 
 
 # -- search --------------------------------------------------------------------
@@ -464,6 +470,7 @@ async def test_search_rejects_an_unbounded_facet_size(
     with pytest.raises(ValueError, match="facet_size must be between"):
         await client.search_entities(collection="874", facets=["schema"], facet_size=facet_size)
     assert wire.call_count == 0
+    assert_model_not_fetched(respx_mock)
 
 
 async def test_facet_buckets_are_bounded_and_their_labels_truncated(
@@ -872,6 +879,7 @@ async def test_search_rejects_negative_paging(
     with pytest.raises(ValueError, match="must be >= 0"):
         await client.search_entities(collection="874", **args)
     assert wire.call_count == 0
+    assert_model_not_fetched(respx_mock)
 
 
 async def test_highlight_is_sent_when_a_query_is_present(
@@ -954,6 +962,7 @@ async def test_ids_with_trailing_whitespace_are_refused(
     with pytest.raises(ValueError, match="invalid entity_id"):
         await client.get_entity(entity_id=entity_id)
     assert wire.call_count == 0
+    assert_model_not_fetched(respx_mock)
 
 
 # Every method that interpolates a caller id into a path. An id of only dot segments
@@ -983,6 +992,7 @@ async def test_id_that_addresses_nothing_is_refused(
     with pytest.raises(ValueError, match=f"invalid {field}"):
         await getattr(client, method)(**{field: bad})
     assert wire.call_count == 0
+    assert_model_not_fetched(respx_mock)
 
 
 async def test_dotted_ids_are_still_accepted(
@@ -1276,6 +1286,7 @@ async def test_text_slice_bounds(
     with pytest.raises(ValueError, match=match):
         await client.get_entity_text(entity_id="d1", **args)
     assert wire.call_count == 0
+    assert_model_not_fetched(respx_mock)
 
 
 # -- ontology ------------------------------------------------------------------
@@ -1862,7 +1873,223 @@ def test_every_client_method_is_classified() -> None:
     method inherited from a base class, which AlephClient does not have today.
     """
     public = {name for name in dir(AlephClient) if not name.startswith("_")}
-    assert public == _SHAPED_ENDPOINTS | NOT_ENTITY_RETURNING
+    classified = _SHAPED_ENDPOINTS | NOT_ENTITY_RETURNING
+    # A bare set inequality names neither the method nor the remedy, and of the two remedies
+    # the wrong one -- adding the name to NOT_ENTITY_RETURNING -- is a one-line test edit
+    # while the right one needs a decorator, a SHAPING_CASES row and a mock payload. Say
+    # which is which, because the cheap answer is the one that ships a leak.
+    assert public == classified, (
+        f"unclassified: {sorted(public - classified)}; "
+        f"classified but gone from the class: {sorted(classified - public)}. "
+        "A method that returns entities takes @_shaped and a SHAPING_CASES row. A method "
+        "that does not goes in NOT_ENTITY_RETURNING and takes a NOT_SHAPING_CASES row, "
+        "which is what proves it has nothing to shape."
+    )
+
+
+# Methods on NOT_ENTITY_RETURNING that are not endpoints at all, so no payload can be fed
+# to them. Spelled out rather than skipped by a rule, because "it takes no payload" is the
+# excuse that would let a real endpoint out of the check below.
+class NotShaping(NamedTuple):
+    """One declared-entity-free method, and the payload that tries to prove it wrong."""
+
+    method: str
+    kwargs: dict[str, Any]
+    # None means the member takes no payload at all: it must issue no request and return
+    # None. Spelled as a row rather than as a name on an exemption list, because an
+    # exemption list is a one-line test edit and that is exactly the bypass this table
+    # exists to close -- measured: a plausible `get_entity_raw` listed in both
+    # NOT_ENTITY_RETURNING and the old `_NOT_AN_ENDPOINT` left the suite green at 380.
+    path: str | None
+    payload: dict[str, Any] | None
+    # Where the probe sits, and why that is the position worth probing for this method.
+    position: str
+    # Set when the method copies the probe straight through today. The behaviour is parked
+    # in docs/implementation-notes.md as one spec question about what counts as
+    # entity-shaped; these rows pin it as an expected failure so the note cannot rot and so
+    # fixing it forces the note to be closed.
+    parked: str | None = None
+    # get_entity_text returns document text on purpose, in a bounded fence.
+    text_is_the_answer: bool = False
+
+
+# The mirror of SHAPING_CASES. SHAPING_CASES proves the shaped methods shape; without these,
+# nothing proves the unshaped ones have nothing to shape, and the declaration in
+# NOT_ENTITY_RETURNING is an assertion no test ever checks.
+#
+# Measured: adding a plausible new entity-returning method on an already-allowlisted path
+# and declaring it there shipped a real leak with the suite green at 362 passed -- the caller
+# received bodyText and the whole housekeeping surface. readonly.py blocks a method on a
+# genuinely new path, so the leak needs a method reusing an allowlisted one: a second view of
+# expand, a raw-entity fetch helper, a paging variant. That is ordinary, not exotic.
+#
+# Every probe sits where that method would surface it if it stopped selecting and started
+# copying -- not merely somewhere in the payload. That distinction was measured to matter
+# twice: with probes parked in a field the method structurally drops, five of these rows
+# could not have failed whatever the code did, and moving each into its real copy-through
+# field made all five return a complete document; a second pass found two more rows with the
+# same defect among the ontology methods below.
+NOT_SHAPING_CASES: tuple[NotShaping, ...] = (
+    # The three ontology methods select rather than copy, and each selects from a different
+    # depth -- so the probe has to go at that method's own depth or the row cannot fail for
+    # any defect confined to it. Measured: with all three probing top-level `results`,
+    # `get_schema` stayed green even when rewritten to return `{**model, **schema}`, and
+    # `list_schemata` only went red when `get_model` was broken too -- which `get_model`'s
+    # own row already catches.
+    NotShaping(
+        "get_model",
+        {},
+        "/api/2/metadata",
+        {**raw_model(), "results": [raw_document()]},
+        "beside the `model` key it selects out of the payload",
+    ),
+    NotShaping(
+        "list_schemata",
+        {},
+        "/api/2/metadata",
+        {"model": {**raw_model()["model"], "leaked": raw_document()}},
+        "inside the `model` it reduces to counts and name lists",
+    ),
+    NotShaping(
+        "get_schema",
+        {"name": "Person"},
+        "/api/2/metadata",
+        {
+            "model": {
+                **raw_model()["model"],
+                "schemata": {
+                    **raw_model()["model"]["schemata"],
+                    "Person": {
+                        **raw_model()["model"]["schemata"]["Person"],
+                        "leaked": raw_document(),
+                    },
+                },
+            }
+        },
+        "inside the `Person` schema it builds a fixed key set from",
+    ),
+    NotShaping(
+        "list_collections",
+        {},
+        "/api/2/collections",
+        {"total": 1, "results": [{"id": "42", "label": "c", "entity": raw_document()}]},
+        "an extra key on a collection object; _slim_collection builds a fixed key set",
+    ),
+    NotShaping(
+        "get_collection",
+        {"collection": "42"},
+        "/api/2/collections/42",
+        {"id": "42", "label": "c", "statistics": {"byEntity": raw_document()}},
+        "inside `statistics`, which _slim_collection(full=True) copies verbatim",
+        parked="`statistics` is copied through unread -- see docs/implementation-notes.md",
+    ),
+    NotShaping(
+        "list_entitysets",
+        {"collection": "42"},
+        "/api/2/entitysets",
+        {"total": 1, "results": [{"id": "es1", "type": "list", "entities": [raw_document()]}]},
+        "inside `entities`, which _slim_entityset copies verbatim",
+        parked="`entities` is copied through unread -- see docs/implementation-notes.md",
+    ),
+    NotShaping(
+        "get_entityset",
+        {"entityset_id": "es1"},
+        "/api/2/entitysets/es1",
+        {"id": "es1", "type": "list", "entities": [raw_document()]},
+        "inside `entities`, which _slim_entityset copies verbatim",
+        parked="`entities` is copied through unread -- see docs/implementation-notes.md",
+    ),
+    NotShaping(
+        "entity_tags",
+        {"entity_id": "e1"},
+        "/api/2/entities/e1/tags",
+        {"total": 1, "results": [{"field": "names", "value": raw_document(), "count": 3}]},
+        "a tag row's `value`; _slim_tags bounds strings and copies everything else",
+        parked="a non-string tag value is copied through -- see docs/implementation-notes.md",
+    ),
+    NotShaping(
+        "profile_tags",
+        {"profile_id": "p1"},
+        "/api/2/profiles/p1/tags",
+        {"total": 1, "results": [{"field": "names", "value": raw_document(), "count": 3}]},
+        "a tag row's `value`; _slim_tags bounds strings and copies everything else",
+        parked="a non-string tag value is copied through -- see docs/implementation-notes.md",
+    ),
+    NotShaping(
+        "get_entity_text",
+        {"entity_id": "d1"},
+        "/api/2/entities/d1",
+        raw_document(),
+        "the whole upstream entity; the text is what this endpoint is for",
+        text_is_the_answer=True,
+    ),
+    NotShaping("aclose", {}, None, None, "takes no payload and issues no request"),
+)
+
+NOT_SHAPING_PARAMS = [
+    pytest.param(
+        case,
+        id=case.method,
+        marks=[pytest.mark.xfail(strict=True, reason=case.parked)] if case.parked else [],
+    )
+    for case in NOT_SHAPING_CASES
+]
+
+
+def test_every_unshaped_endpoint_has_a_negative_case() -> None:
+    """Declaring a method entity-free is a claim, and this is what makes it checkable."""
+    covered = {case.method for case in NOT_SHAPING_CASES}
+    assert covered == NOT_ENTITY_RETURNING, (
+        f"declared to return no entities but never checked: "
+        f"{sorted(NOT_ENTITY_RETURNING - covered)}; "
+        f"checked but no longer declared: {sorted(covered - NOT_ENTITY_RETURNING)}. "
+        "Add a NOT_SHAPING_CASES row feeding the method a payload with an entity in the "
+        "position it copies through. If the row cannot be made to pass, the method returns "
+        "entities: decorate it with @_shaped and give it a SHAPING_CASES row instead."
+    )
+
+
+@pytest.mark.parametrize("case", NOT_SHAPING_PARAMS)
+async def test_a_method_declared_unshaped_returns_nothing_entity_shaped(
+    client: AlephClient, respx_mock: respx.MockRouter, case: NotShaping
+) -> None:
+    """Hand the method a document where it would copy one through, and check none survives.
+
+    Two assertions, because either alone is escapable. `_entities_in` is the same walk
+    `_shape` guards with, so what this calls an entity is what the seam calls one -- but it
+    only recognises a dict carrying both `schema` and `properties`, so an entity taken apart
+    on the way through would slip past it. The document-text check is position-independent
+    and shape-independent: `raw_document()` populates every blob property, and none of those
+    bodies has any business in a reply from a method that claims to return no entities.
+    """
+    if case.path is None:
+        wire = respx_mock.route().mock(return_value=httpx.Response(200, json={}))
+        assert await getattr(client, case.method)(**case.kwargs) is None
+        assert wire.call_count == 0, f"{case.method} issued a request: {case.position}"
+        assert_model_not_fetched(respx_mock)
+        return
+
+    respx_mock.get(case.path).mock(return_value=httpx.Response(200, json=case.payload))
+
+    out = await getattr(client, case.method)(**case.kwargs)
+
+    # Without this the case is satisfiable by finding nothing on both sides.
+    assert list(_entities_in(case.payload)), (
+        f"{case.method}: this case's payload carries no entity, so it proves nothing"
+    )
+    leaked = list(_entities_in(out))
+    assert not leaked, (
+        f"{case.method} is declared in NOT_ENTITY_RETURNING but returned "
+        f"{[e.get('id') for e in leaked]} unshaped, from {case.position}. Either it belongs "
+        "behind @_shaped with a SHAPING_CASES row, or that field must stop being copied "
+        "through."
+    )
+    if not case.text_is_the_answer:
+        bodies = [prop for prop in BLOB_PROPS if f"<{prop} body>" in repr(out)]
+        assert not bodies, (
+            f"{case.method} returned document text ({', '.join(bodies)}) from "
+            f"{case.position}, which is the cost the shaping seam exists to prevent"
+        )
 
 
 def test_every_shaped_endpoint_has_a_shaping_case() -> None:
@@ -1923,7 +2150,7 @@ def test_the_seam_refuses_an_entity_it_was_not_asked_to_shape() -> None:
     than a bad request, but the cost of passing it on is unbounded document text in the
     model's context, so the seam refuses instead. The message names the endpoint and tells
     the caller not to retry, because a caller cannot make this one go away."""
-    with pytest.raises(RuntimeError, match="expand_entity cannot answer") as excinfo:
+    with pytest.raises(ToolError, match="expand_entity cannot answer") as excinfo:
         _shape({"total": 1, "results": [raw_document()]}, None, "expand_entity")
     assert "retrying will not help" in str(excinfo.value)
     # The offending keys are upstream's to choose, so none of them may be quoted back.
@@ -1972,5 +2199,174 @@ async def test_an_entity_in_a_passed_through_field_refuses_rather_than_leaking(
             200, json={"id": "p1", "entities": [raw_document()], "merged": _probe_entity()}
         )
     )
-    with pytest.raises(RuntimeError, match="get_profile cannot answer"):
+    with pytest.raises(ToolError, match="get_profile cannot answer"):
         await client.get_profile(profile_id="p1")
+
+
+# The seam watches one direction only. `_shape` refuses a raw dict left in a reply; the
+# inverse -- a marker that never reaches `_shape` because its method was never hooked to the
+# seam -- used to serialise as an ordinary success carrying the whole entity. Measured
+# through the MCP boundary with one method unhooked: `isError: False`, bodyText present,
+# housekeeping present. Not live today, because every marker is built inside a @_shaped
+# method -- but `_slim_result` is what an author copies when writing the next endpoint.
+
+
+def test_a_shaping_marker_refuses_to_be_serialised() -> None:
+    """A marker reaching a serialiser means a reply left the module unshaped. Both markers,
+    both routes to a serialiser, because either alone leaves half the mistake open.
+
+    The schema hook covers the marker as a declared return type, which is how an unhooked
+    `-> _Ent` method leaks. The string conversion covers it sitting inside a
+    `dict[str, Any]` reply -- the shape `_slim_result` produces -- where a serialiser infers
+    from the runtime type, never consults the hook, and falls back to `str`.
+    """
+    for marker in (_Ent(raw_document()), _AsIs(raw_document())):
+        with pytest.raises(_MarkerEscaped, match="reached the serialiser"):
+            TypeAdapter(type(marker))
+        with pytest.raises(_MarkerEscaped, match="reached a string conversion"):
+            str(marker)
+
+
+def test_a_shaping_marker_still_reprs_without_quoting_the_entity() -> None:
+    """The guard must not blind the next person debugging it.
+
+    `__repr__` is what a traceback, a log line and pytest's own assertion output call, so it
+    stays working -- and quotes nothing, because a marker holds exactly the unbounded
+    document text the seam exists to keep back.
+    """
+    marker = _Ent(raw_document())
+    assert "unshaped" in repr(marker)
+    for prop in BLOB_PROPS:
+        assert f"<{prop} body>" not in repr(marker)
+
+
+# The instance model is fetched once per reply, behind the seam, so every entity-returning
+# endpoint now depends on that one call. What happens when it fails was previously answered
+# by a bare `except Exception`, and no test in the suite made /api/2/metadata fail at all.
+
+
+async def test_an_upstream_metadata_fault_falls_back_instead_of_failing_the_call(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """A caption is a convenience. An instance that cannot answer for its own ontology is
+    not a reason to fail ten endpoints, so the fallback order stands in and the call
+    succeeds -- `"Acme"` is the answer only the hard-coded order gives."""
+    respx_mock.get("/api/2/metadata").mock(
+        return_value=httpx.Response(401, json={"status": "error"})
+    )
+    respx_mock.get("/api/2/entities/e1").mock(
+        return_value=httpx.Response(200, json=_probe_entity())
+    )
+
+    out = await client.get_entity(entity_id="e1")
+
+    assert out["caption"] == "Acme"
+
+
+async def test_a_read_only_refusal_fetching_the_model_is_not_swallowed(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """readonly.py refusing a request is this repo's safety boundary speaking, not a slow
+    model, and the two must never be indistinguishable.
+
+    A metadata route that redirects off-host is refused by the allowlist hook on the
+    redirect hop. Measured before this was narrowed: the call returned a successful answer
+    with a fallback-derived caption, and since there is no logging anywhere in the package,
+    the refusal left no trace at all. The message has to survive too -- it names the
+    redirect as the likely cause, which is the only clue the operator gets.
+    """
+    respx_mock.get("/api/2/metadata").mock(
+        return_value=httpx.Response(
+            302, headers={"Location": "https://elsewhere.invalid/api/2/metadata"}
+        )
+    )
+    respx_mock.get("/api/2/entities/e1").mock(
+        return_value=httpx.Response(200, json=_probe_entity())
+    )
+
+    with pytest.raises(ToolError, match="read-only allowlist") as excinfo:
+        await client.get_entity(entity_id="e1")
+    assert "elsewhere.invalid" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("label", "body"),
+    [
+        ("a PNG", b"\x89PNG\r\n\x1a\n"),
+        ("raw gzip with no Content-Encoding", b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03"),
+        ("a latin-1 error page", "<h1>Fehler: ung\xfcltig</h1>".encode("latin-1")),
+        ("plain non-JSON UTF-8", b"upstream is having a bad day"),
+    ],
+    ids=["png", "gzip", "latin-1", "utf-8-text"],
+)
+async def test_a_metadata_body_that_does_not_parse_degrades_rather_than_failing(
+    client: AlephClient, respx_mock: respx.MockRouter, label: str, body: bytes
+) -> None:
+    """A body that is not JSON is upstream's fault, whatever it fails to be.
+
+    Three of these four are not valid UTF-8, and that distinction used to decide the
+    outcome: `_request` ends at `jsonlib.loads(body)` on *bytes*, so json decodes first and
+    raises `UnicodeDecodeError` -- a sibling of `JSONDecodeError` under `ValueError`, not a
+    subclass. With only `JSONDecodeError` caught, all ten shaped tools hard-failed on these
+    three and kept failing, because only a success is cached. Worse, `UnicodeDecodeError` is
+    a `ValueError`, so `server.py`'s seam dressed it up as a caller-actionable refusal
+    naming nothing the caller could act on.
+    """
+    respx_mock.get("/api/2/metadata").mock(
+        return_value=httpx.Response(200, headers={"Content-Type": "application/json"}, content=body)
+    )
+    respx_mock.get("/api/2/entities/e1").mock(
+        return_value=httpx.Response(200, json=_probe_entity())
+    )
+
+    out = await client.get_entity(entity_id="e1")
+
+    assert out["caption"] == "Acme", f"{label}: the call should degrade, not fail"
+
+
+async def test_a_metadata_read_timeout_degrades_rather_than_failing(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The arm most likely to fire on a real instance, and nothing reached it.
+
+    `_request` retries connect failures only -- read-side faults are deliberately excluded,
+    because they cannot be told apart from a request Aleph did receive -- so a `ReadTimeout`
+    leaves `get_model` as a raw httpx error. "The model was slow" is literally this case,
+    and it is the one the fallback exists for. Measured: deleting the whole arm left the
+    suite green at 380 passed.
+    """
+    respx_mock.get("/api/2/metadata").mock(side_effect=httpx.ReadTimeout("too slow"))
+    respx_mock.get("/api/2/entities/e1").mock(
+        return_value=httpx.Response(200, json=_probe_entity())
+    )
+
+    out = await client.get_entity(entity_id="e1")
+
+    assert out["caption"] == "Acme"
+
+
+@pytest.mark.parametrize("defect", [AttributeError("no such attribute"), TypeError("bad call")])
+async def test_a_defect_in_this_module_is_not_swallowed_as_a_slow_model(
+    client: AlephClient,
+    respx_mock: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+    defect: Exception,
+) -> None:
+    """The whole point of naming the caught types, pinned.
+
+    A bare `except Exception` here would silently degrade every caption on the instance
+    rather than surfacing a bug in this file, and nothing would ever say so. Measured:
+    appending `except Exception: return None` after the narrow arms left the suite green at
+    380 passed, so the narrowing was load-bearing and unpinned at the same time.
+    """
+
+    async def broken(self: AlephClient) -> dict[str, Any]:
+        raise defect
+
+    monkeypatch.setattr(AlephClient, "get_model", broken)
+    respx_mock.get("/api/2/entities/e1").mock(
+        return_value=httpx.Response(200, json=_probe_entity())
+    )
+
+    with pytest.raises(type(defect)):
+        await client.get_entity(entity_id="e1")

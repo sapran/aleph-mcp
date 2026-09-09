@@ -146,6 +146,29 @@ Retired since the last prune:
   would have captioned. Found during T1; fixing it changes a tool's output and so is a behaviour
   change, not a refactor.
 
+- **A non-dict `model` from `/api/2/metadata` is a permanent hard failure.** `get_model` caches
+  `payload.get("model") or {}` with no type check, and `_schemata` reads `model.get("schemata")`
+  outside its own try, so a metadata body like `{"model": "https://..."}`, `{"model": [..]}`,
+  `{"model": 3}` or `{"model": NaN}` (Python's json accepts bare NaN) raises `AttributeError`
+  there. It reaches the caller as `Error calling tool '<name>': 'str' object has no attribute
+  'get'` — prefixed, erased under masking — and because the bad value *is* cached it never
+  refetches, so all ten shaped tools plus `list_schemata`, `get_schema` and the `aleph://schemata`
+  resource stay broken for the process lifetime. Pre-existing and unchanged by T1-FIX-2, verified
+  identical at `1e8e74c`; parked because fixing it is a behaviour change outside that brief. It is
+  also the one live counterexample to the "an AttributeError here means a defect in this module"
+  reading that `_schemata`'s comment states. One line in `get_model` closes it:
+  `model = payload.get("model"); self._model = model if isinstance(model, dict) else {}`.
+
+- **The marker guard covers every tool but only one of three resources.** `find_marker` runs inside
+  `_refusing`, so `collections_resource` and `schemata_resource` — which are not decorated with
+  `@_as_resource_error` — return without it. Inert today: both call unshaped client methods that
+  build no markers. It becomes real only if a resource is ever pointed at a `@_shaped` method.
+
+- **`find_marker` does not traverse tuples, sets or dict keys.** A marker in one of those positions
+  is not found. No client method builds a tuple, a set or a non-string key into a reply, so nothing
+  reaches those branches today, and the markers' own serialisation refusal still fires there — the
+  outcome degrades to the pre-T1-FIX-2 message rather than leaking.
+
 - **`_schemata()` does not cache its failures.** `get_model` memoises only a success, and
   `_schemata` swallows every exception, so a persistently broken `/api/2/metadata` costs the full
   retry budget on *every* entity-returning call while still returning `None`. Found during T1 and
@@ -175,9 +198,18 @@ Retired since the last prune:
   branch; parked because T1's scope is the ten entity-returning methods and netting these two means
   deciding whether an entityset's `entities` is entity-shaped at all, which is a spec question.
 
-- **The client-method partition is declared, never verified.** `test_every_client_method_is_classified`
-  forces every public attribute of `AlephClient` onto one of two lists, which stops a method joining
-  the class unclassified -- but nothing checks that a method listed in `NOT_ENTITY_RETURNING` really
-  returns no entities, and listing it there is the cheapest way to make the test go green. A
-  parametrised test over that list asserting each reply carries no entity-shaped dict would close
-  it. Parked from the T1 review: it asserts behaviour of eleven methods T1 does not touch.
+- **`_slim_tags` copies a tag row's non-string values through.** `entity_tags` and `profile_tags`
+  truncate a row's *string* values and pass every other value on unchanged, so an entity object as a
+  row's `value` arrives with all five blob properties intact. Aleph returns `{field, value, count}`
+  rows there, so this needs the same upstream contract change as the notes above and leaks nothing
+  today.
+
+- **`_slim_collection(full=True)` copies `statistics` verbatim.** `get_collection` returns whatever
+  that block holds, unread and unbounded; `list_collections` does not, because it slims with
+  `full=False`. Same class as the three notes above: an aggregation slot that is copied rather than
+  rebuilt.
+
+  All four of these -- `get_profile.entities`, `_slim_entityset.entities`, a tag row's `value`, and
+  `statistics` -- are one spec question about what counts as entity-shaped, not four refactors.
+  Since T1-FIX-2 each is pinned by a `strict` xfail row in `NOT_SHAPING_CASES`, so the behaviour
+  cannot change without the suite saying so, and fixing any of them forces this note to be closed.

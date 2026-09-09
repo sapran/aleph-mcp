@@ -26,6 +26,7 @@ from fastmcp.exceptions import ToolError
 from aleph_mcp.client import ALL_COLLECTIONS, MAX_PAGE, AlephClient
 from aleph_mcp.config import Settings
 from aleph_mcp.server import build_server
+from tests.conftest import assert_model_not_fetched
 from tests.shapes import raw_entity, raw_model, raw_search_payload
 
 # The spellings this change exists to remove. `collection` is the one name for the scope
@@ -69,6 +70,7 @@ async def test_a_search_with_no_collection_is_refused_before_any_request(
     assert "collection" in message, f"the refusal must name the missing argument: {message}"
     assert "Missing required argument" in message, message
     assert wire.call_count == 0, "an unscoped call must cost no request"
+    assert_model_not_fetched(respx_mock)
 
 
 async def test_a_numeric_collection_emits_one_filter_and_is_reported(
@@ -229,6 +231,7 @@ async def test_a_collection_id_in_filters_is_refused_rather_than_merged(
     assert "`collection` argument" in message, message
     assert "42" in message, f"the message must name the value to move: {message}"
     assert wire.call_count == 0, "a refused call must cost no request"
+    assert_model_not_fetched(respx_mock)
 
 
 async def test_no_tool_advertises_a_second_spelling_of_the_scope(server: FastMCP) -> None:
@@ -279,6 +282,7 @@ async def test_a_list_that_names_no_usable_scope_is_refused(
         f"the refusal must name the literal that does mean everything: {message}"
     )
     assert wire.call_count == 0, "a refused call must cost no request"
+    assert_model_not_fetched(respx_mock)
 
 
 @pytest.mark.parametrize("collection", ["", "   ", "\n"], ids=["empty", "spaces", "newline"])
@@ -298,6 +302,7 @@ async def test_a_blank_collection_is_refused_before_any_request(
     with pytest.raises(ValueError, match="must not be empty"):
         await client.search_entities(collection=collection, q="acme")
     assert wire.call_count == 0, "a blank scope must not reach the wire"
+    assert_model_not_fetched(respx_mock)
 
 
 async def test_a_resolved_hit_must_be_the_collection_that_was_asked_for(
@@ -350,6 +355,7 @@ async def test_paging_is_refused_before_a_foreign_id_costs_a_lookup(
         with pytest.raises(ValueError):
             await client.search_entities(collection="fresh-case", q="acme", **kwargs)  # type: ignore[arg-type]
     assert wire.call_count == 0, "a refused call must not pay for a collection lookup"
+    assert_model_not_fetched(respx_mock)
 
 
 async def test_a_scope_naming_too_many_collections_is_refused(
@@ -362,6 +368,7 @@ async def test_a_scope_naming_too_many_collections_is_refused(
     with pytest.raises(ValueError, match="at most"):
         await client.search_entities(collection=[f"case-{n}" for n in range(11)], q="acme")
     assert wire.call_count == 0
+    assert_model_not_fetched(respx_mock)
 
 
 async def test_a_repeated_collection_costs_one_lookup(
@@ -402,6 +409,7 @@ async def test_the_all_collections_literal_is_refused_by_single_collection_tools
     with pytest.raises(ValueError, match="exactly one collection"):
         await getattr(client, tool)(collection=ALL_COLLECTIONS, **args)
     assert wire.call_count == 0
+    assert_model_not_fetched(respx_mock)
 
 
 async def test_a_lookup_failure_is_reported_against_the_tool_that_was_called(
@@ -472,6 +480,7 @@ async def test_the_all_collections_literal_mixed_with_a_numeric_id_is_a_legible_
     with pytest.raises(ValueError, match="cannot be combined"):
         await client.search_entities(collection=[ALL_COLLECTIONS, 874], q="acme")
     assert wire.call_count == 0
+    assert_model_not_fetched(respx_mock)
 
 
 async def test_an_upstream_id_echoed_into_an_error_is_bounded(
