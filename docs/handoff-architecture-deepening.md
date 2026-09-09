@@ -20,8 +20,8 @@ Update this table as tasks land; it is the single source of truth for what is do
 | T1-FIX | Close the T1 review findings | **ACCEPTED** | #14, merged `3b3059c` | All four findings closed and mutation-verified |
 | T1-FIX-2 | Close the two PR #14 regressions | **ACCEPTED** | #14 (same branch), merged `3b3059c` | Both blockers + all five recommendations closed; reviewed by all three pr-review-toolkit agents, one substantive finding found and fixed |
 | T2 | Give the bounded-echo rule a module | **ACCEPTED** | #15, merged `9a894fa` | New `echo.py`; four contexts verified byte-identical to `develop`; all three scope traps respected |
-| **T5** | **Collection scope module** | **NEXT — unblocked** | — | Base `develop` @ `9a894fa`; refresh this task's header before starting |
-| T4 | Lift the transport | blocked by T5 | — | Run last |
+| T5 | Collection scope module | **ACCEPTED** | #16, merged `7063627` | New `scope.py`; behaviour byte-identical to `develop` across a 21-refusal/9-spelling probe; reviewed by all three pr-review-toolkit agents, one latent fail-open closed |
+| **T4** | **Lift the transport** | **NEXT — unblocked** | — | Base `develop` @ `7063627`; refresh this task's header before starting. Run last |
 
 Out-of-band, not blocking any task: `.github/workflows/ci.yml` still triggers `push: branches: [main]`,
 so merges landing on `develop` get no post-merge build; and the `build` job's licence assertion pipes
