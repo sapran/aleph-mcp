@@ -13,6 +13,7 @@ import httpx
 from fastmcp.exceptions import ResourceError, ToolError
 
 from .config import Settings
+from .echo import COLLECTION_ECHO, PROPERTY_VALUE, render
 from .errors import (
     ResponseTooLarge,
     raise_for_status,
@@ -71,8 +72,6 @@ MAX_CONNECT_SECS = 10.0
 # search hit; get_entity_text exists to read them deliberately and in bounded slices.
 _TEXT_BLOB_PROPS = frozenset({"bodyText", "bodyHtml", "safeHtml", "indexText", "translatedText"})
 
-_MAX_VALUE_CHARS = 500
-
 # Document text is third-party content: anyone able to get a file ingested into a
 # readable collection controls it. It is returned inside a nonce-delimited fence so a
 # payload cannot forge the end marker and pass itself off as server-authored context.
@@ -125,37 +124,21 @@ def _check_entity_id(value: str, *, field: str = "entity_id") -> str:
     return value
 
 
-# A collection id echoed into an error message. Bounded because on one path the value is
-# upstream text rather than caller text, and this repo's rule is that upstream material
-# reaching the model is capped — see `errors.py:_as_quoted_data` and `readonly.py:_describe`.
-_MAX_ECHO_CHARS = 120
-
-
-def _clip(value: str) -> str:
-    if len(value) <= _MAX_ECHO_CHARS:
-        return value
-    return value[:_MAX_ECHO_CHARS] + f"… [+{len(value) - _MAX_ECHO_CHARS} chars]"
-
-
 def _check_collection_id(value: object) -> str:
     text = str(value)
     if not _COLLECTION_ID.fullmatch(text):
         raise ValueError(
             # `value` is caller input on every path but one: the id read out of a
-            # foreign_id lookup is upstream text. Bounded and labelled for the same reason
-            # errors.py bounds a refused body — an unbounded echo is a write primitive
-            # into the model's context. `!r` additionally escapes control characters.
-            f"invalid collection: expected a numeric collection id (got {_clip(text)!r}). "
+            # foreign_id lookup is upstream text, so it is bounded under the shared rule
+            # in echo.py — an unbounded echo is a write primitive into the model's
+            # context. `!r` additionally escapes control characters, which is why
+            # COLLECTION_ECHO does not strip them itself.
+            f"invalid collection: expected a numeric collection id "
+            f"(got {render(text, COLLECTION_ECHO)!r}). "
             "A foreign_id is accepted directly and resolved for you; this error means the "
             "value is neither."
         )
     return text
-
-
-def _truncate(value: str) -> str:
-    if len(value) <= _MAX_VALUE_CHARS:
-        return value
-    return value[:_MAX_VALUE_CHARS] + f"… [+{len(value) - _MAX_VALUE_CHARS} chars]"
 
 
 # Aleph does not always serialise a `caption`; on the instances tested it is null on both
@@ -219,7 +202,7 @@ def slim_entity(entity: dict[str, Any], schemata: dict[str, Any] | None = None) 
             dropped.append(name)
             continue
         if isinstance(values, list):
-            props[name] = [_truncate(v) if isinstance(v, str) else v for v in values]
+            props[name] = [render(v, PROPERTY_VALUE) if isinstance(v, str) else v for v in values]
         else:
             props[name] = values
 
@@ -474,7 +457,10 @@ def _slim_facets(facets: Any) -> Any:
         values = facet.get("values")
         if isinstance(values, list):
             slim["values"] = [
-                {k: _truncate(v) if isinstance(v, str) else v for k, v in bucket.items()}
+                {
+                    k: render(v, PROPERTY_VALUE) if isinstance(v, str) else v
+                    for k, v in bucket.items()
+                }
                 if isinstance(bucket, dict)
                 else bucket
                 for bucket in values[:MAX_FACET_SIZE]
@@ -495,7 +481,7 @@ def _slim_tags(payload: dict[str, Any]) -> dict[str, Any]:
     """
     results = payload.get("results") or []
     kept = [
-        {k: _truncate(v) if isinstance(v, str) else v for k, v in tag.items()}
+        {k: render(v, PROPERTY_VALUE) if isinstance(v, str) else v for k, v in tag.items()}
         if isinstance(tag, dict)
         else tag
         for tag in results[:MAX_FACET_SIZE]

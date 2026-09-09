@@ -5,6 +5,8 @@ from collections.abc import Awaitable, Callable
 
 import httpx
 
+from .echo import REQUEST_TARGET, render
+
 # Every request this server may issue, as (method, path) pairs, where path is relative to
 # the Aleph API root. Enforced on every outgoing httpx request, redirect hops included, so
 # a mutating call cannot reach Aleph even when the API key would permit it. Extending this
@@ -81,24 +83,6 @@ def _origin(url: httpx.URL) -> tuple[str, str, int | None]:
     )
 
 
-# On a redirect hop the request URL is built from the upstream's Location header, so the
-# refusal message is a path by which an upstream writes into the model's context. Emit a
-# bounded rendering: no userinfo (an f-string on httpx.URL yields the unmasked form), no
-# query string (it carries the analyst's own search terms), no control characters, and a
-# length cap — the same treatment errors.py gives upstream error text.
-_MAX_TARGET_CHARS = 120
-
-
-def _describe(url: httpx.URL) -> str:
-    """A bounded, credential-free rendering of a URL that may be upstream-controlled."""
-    port = f":{url.port}" if url.port is not None else ""
-    target = f"{url.scheme}://{url.host}{port}{url.path}"
-    target = "".join(ch if ch.isprintable() else "\ufffd" for ch in target)
-    if len(target) > _MAX_TARGET_CHARS:
-        target = target[:_MAX_TARGET_CHARS] + "…"
-    return target
-
-
 def read_only_hook(host: str) -> Callable[[httpx.Request], Awaitable[None]]:
     """Build the httpx request hook that pins every request to `host` and the allowlist.
 
@@ -118,7 +102,14 @@ def read_only_hook(host: str) -> Callable[[httpx.Request], Awaitable[None]]:
     prefix = base.path.rstrip("/")
 
     async def enforce_read_only(request: httpx.Request) -> None:
-        target = _describe(request.url)
+        # On a redirect hop the request URL is built from the upstream's Location header,
+        # so the refusal message is a path by which an upstream writes into the model's
+        # context. Drop what this module knows must not be quoted — userinfo, because an
+        # f-string on httpx.URL yields the unmasked form, and the query string, because it
+        # carries the analyst's own search terms — then hand the rest to the shared rule.
+        url = request.url
+        shown_port = f":{url.port}" if url.port is not None else ""
+        target = render(f"{url.scheme}://{url.host}{shown_port}{url.path}", REQUEST_TARGET)
         if _origin(request.url) != expected:
             scheme, name, port = expected
             raise ReadOnlyViolation(

@@ -76,6 +76,14 @@ def test_slim_entity_truncates_long_values() -> None:
     assert len(value) < 600
 
 
+def test_slim_entity_truncates_at_the_length_this_path_chose() -> None:
+    """Which policy the slimmer names is now a one-word choice, and the test above passes
+    under any cap below 600 — including the 120 and 200 the refusal paths use. Pin the
+    number: a property value cut to an error message's length is silent data loss."""
+    out = slim_entity(raw_entity(properties={"summary": ["z" * 501]}))
+    assert out["properties"]["summary"][0] == "z" * 500 + "… [+1 chars]"
+
+
 def test_slim_entity_keeps_highlight_and_score() -> None:
     out = slim_entity(raw_entity(highlight=["…hit…"], score=3.5))
     assert out["highlight"] == ["…hit…"]
@@ -172,7 +180,7 @@ async def test_a_persistent_connection_failure_names_the_attempt_count(
 async def test_the_unreachable_message_labels_the_transport_text_as_untrusted(
     client: AlephClient, respx_mock: respx.MockRouter, no_sleep: None
 ) -> None:
-    """`_as_quoted_data` calls the label the mitigation on this path, not the quoting — so
+    """`echo.UPSTREAM_ERROR` calls the label the mitigation on this path, not the quoting —
     a call site that sanitises without labelling uses half a control. Every other message
     in errors.py that embeds foreign text carries one.
 
@@ -495,6 +503,10 @@ async def test_facet_buckets_are_bounded_and_their_labels_truncated(
     assert names["_omitted_values"] == 5
     assert names["total"] == MAX_FACET_SIZE + 5, "the true bucket count must survive clipping"
     assert names["values"][0]["label"].endswith("chars]")
+    # Pin the cap, not just the overflow style: `endswith("chars]")` holds for any cap, so
+    # a facet label silently swapped to a refusal-sized policy would go unnoticed. Bucket
+    # labels are upstream text lifted out of ingested documents.
+    assert names["values"][0]["label"] == "z" * 500 + "… [+1500 chars]"
 
 
 async def test_a_response_over_the_ceiling_is_refused_before_decoding(
@@ -1518,6 +1530,8 @@ async def test_entity_tags_is_bounded_and_labelled(
     assert out["_omitted_values"] == 3
     assert out["total"] == len(tags), "the true count must survive the clipping"
     assert out["results"][0]["value"].endswith("chars]")
+    # As above: pin the number in force at this site, not merely that something was cut.
+    assert out["results"][0]["value"] == "z" * 500 + "… [+1500 chars]"
     assert out["_provenance"]["trust"] == "untrusted"
     assert "status" not in out, "upstream envelope keys are not passed through"
     assert route.call_count == 1

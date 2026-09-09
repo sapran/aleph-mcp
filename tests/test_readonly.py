@@ -177,6 +177,18 @@ async def test_a_refusal_does_not_echo_the_query_or_a_hostile_redirect_target() 
     assert len(message) < 300
 
 
+async def test_the_refusal_target_is_capped_at_the_length_this_path_chose() -> None:
+    """Which policy this call site names is now a one-word choice, and the test above
+    passes under any cap below 300. Pin the number, and pin that the target is what is cut:
+    the guidance after it is server-authored and must not be spent on an upstream URL."""
+    hook = read_only_hook("https://aleph.test")
+    long_path = "/" + "z" * 400
+    with pytest.raises(ReadOnlyViolation) as exc:
+        await hook(httpx.Request("GET", f"https://evil.example{long_path}"))
+    target = str(exc.value).split("blocked GET ", 1)[1].split(": this request", 1)[0]
+    assert target == ("https://evil.example" + long_path)[:120] + "…"
+
+
 async def test_a_refusal_never_prints_host_userinfo() -> None:
     """httpx renders userinfo unmasked in str(), and config refuses such a host outright —
     but the guard is reachable with a redirect target that carries one."""

@@ -488,7 +488,7 @@ async def test_an_upstream_id_echoed_into_an_error_is_bounded(
 ) -> None:
     """The `id` read out of a listing hit is upstream text, not caller text, and it reaches
     a model-visible error. This repo caps upstream material that reaches the model
-    (`errors.py:_as_quoted_data`, `readonly.py:_describe`); an unbounded echo is a write
+    (the named policies in `echo.py`); an unbounded echo is a write
     primitive into the model's context."""
     respx_mock.get("/api/2/collections").mock(
         return_value=httpx.Response(
@@ -501,3 +501,6 @@ async def test_an_upstream_id_echoed_into_an_error_is_bounded(
     message = str(excinfo.value)
     assert len(message) < 500, f"upstream text echoed unbounded: {len(message)} chars"
     assert "chars]" in message, "the clip must say it clipped"
+    # Which policy this call site names is now a one-word choice, and the two assertions
+    # above hold under any cap below ~440. Pin the number the echo path actually uses.
+    assert f"'{'n' * 120}… [+4880 chars]'" in message

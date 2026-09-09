@@ -12,7 +12,7 @@ this file when it becomes a spec requirement or is fixed — not when someone re
   C0 control except NUL, `ESC` included — decoded with `errors="ignore"`. FastMCP then renders
   it verbatim, because `mask_error_details` defaults false. So a hostile or MITM'd forward
   proxy can write multi-kilobyte ASCII with ANSI escapes into a model-visible tool error,
-  bypassing both the 200-char cap and the non-printable stripping in `_as_quoted_data`. A
+  bypassing both the 200-char cap and the non-printable stripping of `echo.UPSTREAM_ERROR`. A
   forward proxy is a live deployment shape here, so this is worth a change of its own: catch
   `httpx.TransportError` at the top of `_request` and route the non-retryable members through
   `raise_unreachable`. Do **not** simply add `ProxyError` to `_CONNECT_ERRORS` — a `CONNECT`
@@ -213,3 +213,37 @@ Retired since the last prune:
   `statistics` -- are one spec question about what counts as entity-shaped, not four refactors.
   Since T1-FIX-2 each is pinned by a `strict` xfail row in `NOT_SHAPING_CASES`, so the behaviour
   cannot change without the suite saying so, and fixing any of them forces this note to be closed.
+
+- **`get_schema` echoes upstream schema names into a refusal, unbounded and un-neutralised.**
+  `client.py:657` builds `f"Did you mean one of: {', '.join(close[:10])}?"` from the keys of
+  `model["schemata"]`, which is upstream text from `/api/2/metadata` — no cap, no `!r`, and no
+  `echo` policy, while `name!r` beside it is caller input and *is* escaped. Found by security
+  review during T2 and reproduced against pristine `develop @ 01a48c4`, so it predates that
+  change and is not introduced by it: a schema key carrying `ESC`, `NUL`, `U+202E` and a raw `"`
+  arrives in the message with all four intact, and one 20,000-character key produced a
+  20,104-character refusal. It reaches the model through `aleph://schema/{name}`, which
+  `server.py`'s `_as_resource_error` seam forwards with `str(e)` — so unprefixed and surviving
+  `mask_error_details`, the shape this repo reserves for caller-actionable refusals. Needs its
+  own policy (a plain strip, since the names are interpolated without `!r`) plus a bound on the
+  joined list rather than only on each name. Kept out of T2 because it is a behaviour change to
+  a tool's output, not a move. Related and lower: `list_schemata` (`client.py:646`) returns
+  `sorted(schemata)` — every upstream key, unbounded in count and length — into
+  `aleph://schemata`, bounded only by `MAX_RESPONSE_BYTES` and carrying no `_provenance` label.
+
+- **A policy built inline at a call site escapes both of `echo.py`'s guards.**
+  `test_every_policy_has_a_cap_row` enumerates `vars(echo)`, so it sees only module-level
+  policies declared in `echo.py`. `render(v, replace(PROPERTY_VALUE, max_chars=77))` at a call
+  site is invisible to it and to every cap row, which defeats the "each site asks for the
+  treatment by name" property the module exists to establish. Found by test review during T2.
+  No such call site exists today — all seven name one of the four — so this is a missing
+  enforcement, not a live defect. Closing it means either forbidding non-module policies at
+  runtime or asserting the seven call sites against the four names.
+
+- **`echo.COLLECTION_ECHO` leaves control characters to its call site's `!r`.** Found while
+  building the policy module (T2); it is the behaviour the four helpers had, preserved deliberately
+  rather than a new gap. `_check_collection_id` is the only caller and formats the result with
+  `!r`, which escapes controls -- so the policy does not strip them itself. A second caller that
+  interpolates the rendering plainly would put upstream control characters into a model-visible
+  message. Recorded because the coupling is now between two files rather than inside one function.
+  Closing it means either stripping in the policy (a behaviour change to the existing message, so
+  its own change) or asserting the `!r` at the call site.
