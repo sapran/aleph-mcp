@@ -38,7 +38,7 @@ from typing import Any, Final
 
 from .echo import COLLECTION_ECHO, render
 
-# Query parameters this module emits. Deliberately narrower than `client.Query` — every
+# Query parameters this module emits. Deliberately narrower than `transport.Query` — every
 # collection filter value is a numeric id, already a string — so the module that owns the
 # scope needs no import from the module that owns HTTP.
 Filters = list[tuple[str, str]]

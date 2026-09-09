@@ -95,7 +95,7 @@ async def test_direct_write_through_the_client_never_reaches_the_wire(
         return_value=httpx.Response(200, json={})
     )
     with pytest.raises(ReadOnlyViolation):
-        await client._http.post("/api/2/collections/42/reingest", json={})
+        await client._transport._http.post("/api/2/collections/42/reingest", json={})
     assert route.call_count == 0
 
 
@@ -233,13 +233,13 @@ async def test_guard_runs_on_every_redirect_hop(
     """A chain that only turns mutating on its third hop. Asserting on the final error
     alone would pass even if the guard ran once, so count the hops it actually saw."""
     seen: list[str] = []
-    enforce = client._http._event_hooks["request"][0]
+    enforce = client._transport._http._event_hooks["request"][0]
 
     async def spy(request: httpx.Request) -> None:
         seen.append(f"{request.method} {request.url.path}")
         await enforce(request)
 
-    client._http._event_hooks["request"] = [spy]
+    client._transport._http._event_hooks["request"] = [spy]
 
     respx_mock.get("/api/2/entities/e1").mock(
         return_value=httpx.Response(302, headers={"Location": "/api/2/entities/e2"})

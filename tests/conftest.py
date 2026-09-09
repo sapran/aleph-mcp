@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator, Iterator
 
 import httpx
@@ -58,6 +59,23 @@ def assert_model_not_fetched(router: respx.MockRouter) -> None:
         "only after the endpoint has made its own request, or a refusal starts costing an "
         "upstream request -- see _reply's docstring."
     )
+
+
+@pytest.fixture
+def no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise the retry path without paying its backoff in wall-clock time.
+
+    Patched on the `asyncio` module rather than through the module under test. The retry
+    sleep moved from `client.py` to `transport.py`, and both spellings reach the same
+    function object anyway -- `aleph_mcp.client.asyncio` *is* `asyncio` -- so naming the
+    module directly is the spelling that cannot go stale when the caller moves again. It
+    is also what the two budget tests that patch `asyncio.sleep` inline already do.
+    """
+
+    async def _sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
 
 
 @pytest.fixture

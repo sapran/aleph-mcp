@@ -1,31 +1,27 @@
 from __future__ import annotations
 
-import asyncio
 import functools
-import json as jsonlib
 import re
 import secrets
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any, Concatenate, Literal, cast
+from typing import Any, Concatenate, cast
 
 import httpx
 from fastmcp.exceptions import ResourceError, ToolError
 
 from .config import Settings
 from .echo import PROPERTY_VALUE, render
-from .errors import (
-    ResponseTooLarge,
-    raise_for_status,
-    raise_read_only,
-    raise_too_large,
-    raise_unreachable,
-)
-from .readonly import ReadOnlyViolation, read_only_hook
+from .errors import ResponseTooLarge
+from .readonly import ReadOnlyViolation
 from .scope import ALL_COLLECTIONS, CollectionResolver
+from .transport import MAX_RESPONSE_BYTES, Query, Transport
 
 # Indirected so a test can advance a fake clock across an attempt. The retry budget is
 # wall-clock, and a test that cannot move the clock is blind to the term that dominates it.
+# Read at call time by both deadlines built from it — the scope resolver's and the search
+# shrink loop's — and handed to `Transport` the same way, so one patch moves every clock a
+# single tool call consults.
 _monotonic = time.monotonic
 
 # Elasticsearch `from + size` window enforced by Aleph (aleph/index/util.py MAX_PAGE).
@@ -47,13 +43,6 @@ MAX_EXPAND = 200
 # cap again what is copied back, because the two are set by different parties.
 MAX_FACET_SIZE = 200
 
-# A ceiling on the body this server will accept. Enforced while the response is streamed,
-# so it bounds the allocation rather than describing it after the fact — httpx decodes
-# Content-Encoding as it iterates, so a gzip bomb is refused at the same threshold as a
-# plain body. The error path has its own, much smaller bound in errors.py, because there
-# the status is known before the body is.
-MAX_RESPONSE_BYTES = 25 * 1024 * 1024
-
 # How many times search_entities may re-ask with a smaller page after crossing the ceiling.
 # Each hop is a whole extra request against Aleph and buffers up to the ceiling again, so
 # this is deliberately small: the goal is a usable partial page, not a binary search for the
@@ -62,12 +51,6 @@ MAX_RESPONSE_BYTES = 25 * 1024 * 1024
 # does not shrink with `limit` at all, so those calls spend every hop and still fail; the
 # deadline in search_entities is what bounds that case, not this count.
 MAX_SEARCH_SHRINKS = 3
-
-# The connect phase gets its own, much shorter ceiling than the rest of the request. A
-# handshake that takes a minute will not produce a useful answer, and the retry loop has
-# to be able to afford more than one attempt inside the same budget: a bare float timeout
-# gives httpx one value for every phase, so connect alone would consume the whole of it.
-MAX_CONNECT_SECS = 10.0
 
 # Properties that carry whole documents. Never worth spending context on inside a
 # search hit; get_entity_text exists to read them deliberately and in bounded slices.
@@ -84,9 +67,6 @@ def _fence(text: str) -> str:
     nonce = secrets.token_hex(8)
     return "\n".join((_FENCE_OPEN.format(nonce=nonce), text, _FENCE_CLOSE.format(nonce=nonce)))
 
-
-# httpx types query values permissively; match it so no cast is needed at the call site.
-Query = list[tuple[str, str | int | float | bool | None]]
 
 # Matched with `fullmatch`, as in readonly.py — no anchors, so the two agree by
 # construction. An anchored `$` here is what previously let a trailing newline through.
@@ -481,12 +461,13 @@ def _slim_result(payload: dict[str, Any]) -> dict[str, Any]:
 class AlephClient:
     """Async, read-only wrapper around the Aleph HTTP API.
 
-    Owns one httpx.AsyncClient; the caller closes it with aclose(). Only GET requests
-    are issued, with the single exception of POST /api/2/match, which is a read
-    operation that takes a JSON body. Every outgoing request is checked against the
-    allowlist in `readonly.py` before it is sent, so no endpoint that creates, mutates
-    or deletes Aleph state is reachable through this class regardless of what the API
-    key is permitted to do.
+    Owns one `Transport`, which owns the one httpx.AsyncClient; the caller closes both
+    with aclose(). Only GET requests are issued, with the single exception of POST
+    /api/2/match, which is a read operation that takes a JSON body. Every outgoing
+    request is checked against the allowlist in `readonly.py` before it is sent — the
+    transport installs that guard and is the only thing here that reaches the network —
+    so no endpoint that creates, mutates or deletes Aleph state is reachable through
+    this class regardless of what the API key is permitted to do.
     """
 
     def __init__(self, settings: Settings):
@@ -502,24 +483,14 @@ class AlephClient:
             monotonic=lambda: _monotonic(),
         )
         self._model: dict[str, Any] | None = None
-        self._http = httpx.AsyncClient(
-            base_url=settings.host,
-            headers={
-                "Authorization": f"ApiKey {settings.api_key.get_secret_value()}",
-                "Accept": "application/json",
-                "User-Agent": "aleph-mcp",
-            },
-            timeout=httpx.Timeout(
-                settings.timeout_secs,
-                connect=min(MAX_CONNECT_SECS, settings.timeout_secs),
-            ),
-            verify=settings.verify_tls,
-            follow_redirects=True,
-            event_hooks={"request": [read_only_hook(settings.host)]},
-        )
+        # Retries, budgets, the streaming ceiling and the read-only hook live in
+        # transport.py; this class only ever asks it for a decoded body. `_monotonic` is
+        # passed through the same late-bound way as above, so one patched clock governs the
+        # retry budget, the scope resolver and the shrink loop alike.
+        self._transport = Transport(settings, monotonic=lambda: _monotonic())
 
     async def aclose(self) -> None:
-        await self._http.aclose()
+        await self._transport.aclose()
 
     # -- followthemoney ontology -----------------------------------------------
 
@@ -530,7 +501,7 @@ class AlephClient:
         version the server actually indexes with, instead of a pinned client copy.
         """
         if self._model is None:
-            payload = await self._request(
+            payload = await self._transport.request(
                 "GET", "/api/2/metadata", context="aleph://schema", resource=True
             )
             self._model = payload.get("model") or {}
@@ -552,7 +523,7 @@ class AlephClient:
         over it would be worse than deriving it from a fixed order.
 
         A *local* refusal is not that. `get_model()` reaches the wire through
-        `_request(..., resource=True)`, which converts a `ReadOnlyViolation` into a
+        `Transport.request(..., resource=True)`, which converts a `ReadOnlyViolation` into a
         `ResourceError` -- so the bare `except Exception` this replaces also ate readonly.py
         refusing to let a request leave the configured origin, and there is no logging in
         this package, so it left no trace at all. Measured before this change: a metadata
@@ -575,22 +546,22 @@ class AlephClient:
         except (httpx.HTTPError, ValueError):
             # Two families, both upstream's fault and neither the caller's.
             #
-            # httpx.HTTPError covers the read-side faults `_request` deliberately does not
-            # retry -- ReadTimeout, ReadError, RemoteProtocolError. A slow model is literally
-            # the ReadTimeout in that set, so this is the arm the first paragraph describes.
+            # httpx.HTTPError covers the read-side faults `Transport.request` deliberately does
+            # not retry -- ReadTimeout, ReadError, RemoteProtocolError. A slow model is
+            # literally the ReadTimeout in that set, so this is the arm the first paragraph
+            # describes.
             #
-            # ValueError covers the body not parsing, and it has to be the base class rather
-            # than JSONDecodeError. `_request` ends at `jsonlib.loads(body)` where body is
-            # *bytes*: json.loads runs detect_encoding and decodes first, so a body that is
-            # not valid UTF-8 raises UnicodeDecodeError -- a sibling of JSONDecodeError under
+            # ValueError covers the body not parsing, and it has to be the base class rather than
+            # JSONDecodeError. `Transport.request` ends at `jsonlib.loads(body)` where body is
+            # *bytes*: json.loads runs detect_encoding and decodes first, so a body that is not
+            # valid UTF-8 raises UnicodeDecodeError -- a sibling of JSONDecodeError under
             # ValueError, not a subclass. Measured with JSONDecodeError here: a metadata route
             # answering 200 with a PNG, a raw gzip or a latin-1 error page hard-failed all ten
-            # shaped tools, permanently (only a success is cached, so every later call
-            # refetched and failed the same way), and UnicodeDecodeError being a ValueError
-            # meant `server.py`'s seam handed the model
-            # "'utf-8' codec can't decode byte 0x89..." unprefixed and surviving masking --
-            # the shape of a deliberate, caller-actionable refusal, naming nothing the caller
-            # can act on.
+            # shaped tools, permanently (only a success is cached, so every later call refetched and
+            # failed the same way), and UnicodeDecodeError being a ValueError meant `server.py`'s
+            # seam handed the model "'utf-8' codec can't decode byte 0x89..." unprefixed and
+            # surviving masking -- the shape of a deliberate, caller-actionable refusal, naming
+            # nothing the caller can act on.
             #
             # Still named rather than a bare except: a defect in this module -- an
             # AttributeError, a TypeError -- reaches the caller instead of silently degrading
@@ -664,108 +635,6 @@ class AlephClient:
             ),
         }
 
-    # -- transport -------------------------------------------------------------
-
-    _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
-
-    # Failures raised before the request left this process. Retrying them is safe whatever
-    # the method, because nothing was delivered and nothing can be duplicated. Read-side
-    # failures (ReadError, ReadTimeout, RemoteProtocolError) are deliberately excluded:
-    # they are indistinguishable from a request Aleph did receive.
-    _CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout)
-
-    async def _request(
-        self,
-        method: Literal["GET", "POST"],
-        path: str,
-        *,
-        context: str,
-        params: Query | None = None,
-        json: Any | None = None,
-        resource: bool = False,
-        follow_redirects: bool | None = None,
-        on_redirect: Callable[[httpx.Response], dict[str, Any]] | None = None,
-    ) -> dict[str, Any]:
-        attempts = self._settings.max_retries
-        query = httpx.QueryParams(params) if params else None
-        resp: httpx.Response | None = None
-        body = b""
-        follow = self._http.follow_redirects if follow_redirects is None else follow_redirects
-        # One tool call, one budget. Each hop's backoff is clamped, but an upstream that
-        # answers every attempt with a Retry-After — or a host that swallows every connect
-        # until the connect timeout fires — would otherwise multiply that clamp by
-        # max_retries and decide how long the caller hangs.
-        budget = self._settings.timeout_secs
-        try:
-            for attempt in range(1, attempts + 1):
-                started = _monotonic()
-                try:
-                    async with self._http.stream(
-                        method, path, params=query, json=json, follow_redirects=follow
-                    ) as resp:
-                        if on_redirect is not None and resp.is_redirect:
-                            return on_redirect(resp)
-                        # A zero delay still retries; only an exhausted budget stops the loop.
-                        give_up = (
-                            resp.status_code not in self._RETRY_STATUS
-                            or attempt == attempts
-                            or budget <= 0
-                        )
-                        delay = 0.0 if give_up else min(_retry_delay(resp, attempt), budget)
-                        if give_up:
-                            body = await self._read_bounded(
-                                resp, context=context, resource=resource
-                            )
-                            break
-                except self._CONNECT_ERRORS as e:
-                    # A failed connect is spend, not just the sleep after it: it can burn the
-                    # whole connect phase, which is the larger term. Charging only the backoff
-                    # would let max_retries slow connects hold one tool call open for a
-                    # multiple of the budget — the case MAX_CONNECT_SECS also bounds.
-                    budget -= _monotonic() - started
-                    if attempt == attempts or budget <= 0:
-                        raise_unreachable(e, context=context, attempts=attempt, resource=resource)
-                    delay = min(_backoff_delay(attempt), budget)
-                # One place where the budget is spent, whichever path bound the delay.
-                budget -= delay
-                await asyncio.sleep(delay)
-        except ReadOnlyViolation as e:
-            raise_read_only(e, context=context, resource=resource)
-        assert resp is not None
-        raise_for_status(resp, context=context, resource=resource, body=body)
-        data: Any = jsonlib.loads(body)
-        if not isinstance(data, dict):
-            return {"results": data}
-        return data
-
-    async def _read_bounded(self, resp: httpx.Response, *, context: str, resource: bool) -> bytes:
-        """Accumulate the body, refusing the moment the running total crosses the ceiling.
-
-        The refusal has to happen here rather than after the read: httpx content-decodes
-        as it iterates, so this is the only point at which a compressed body's expanded
-        size is knowable before it has all been allocated.
-        """
-        total = 0
-        chunks: list[bytes] = []
-        async for chunk in resp.aiter_bytes():
-            total += len(chunk)
-            if total > MAX_RESPONSE_BYTES:
-                # Drop both buffers before raising. The exception's traceback keeps this
-                # frame alive for as long as the exception lives, and `search_entities` can
-                # reach this point MAX_SEARCH_SHRINKS + 1 times in one call. Measured
-                # without the clear: 106 MiB of real resident growth for a 25 MiB ceiling,
-                # 4.16x.
-                #
-                # `chunk` matters as much as `chunks` and is easy to miss. For a
-                # `Content-Encoding: gzip` body the ceiling is crossed on the first decoded
-                # chunk, so the list is empty and `chunk` is the whole of it — and httpx
-                # decodes with no `max_length`, so it is the one buffer nothing bounds.
-                chunks.clear()
-                chunk = b""
-                raise_too_large(total, MAX_RESPONSE_BYTES, context=context, resource=resource)
-            chunks.append(chunk)
-        return b"".join(chunks)
-
     # -- collections -----------------------------------------------------------
 
     async def list_collections(
@@ -774,7 +643,7 @@ class AlephClient:
         params = _page_params(limit, offset, cap=100)
         if q:
             params.append(("q", q))
-        payload = await self._request(
+        payload = await self._transport.request(
             "GET", "/api/2/collections", context="list_collections", params=params
         )
         return {
@@ -806,7 +675,7 @@ class AlephClient:
         question is asked. `context` names the calling tool, so a failed lookup is
         reported against the tool the caller actually invoked.
         """
-        return await self._request(
+        return await self._transport.request(
             "GET",
             "/api/2/collections",
             context=context,
@@ -814,7 +683,7 @@ class AlephClient:
         )
 
     async def _get_collection_by_id(self, collection_id: str) -> dict[str, Any]:
-        payload = await self._request(
+        payload = await self._transport.request(
             "GET",
             f"/api/2/collections/{collection_id}",
             context="get_collection",
@@ -907,14 +776,14 @@ class AlephClient:
 
         page = limit
         payload: dict[str, Any] | None = None
-        # One tool call, one deadline. `_request` bounds each request on its own budget, but
-        # a shrink issues a whole fresh one: without this, four hops against a slow or
-        # 5xx-ing upstream multiply that budget by MAX_SEARCH_SHRINKS + 1, which is the same
-        # amplification the per-request budget exists to prevent, one level up.
+        # One tool call, one deadline. `Transport.request` bounds each request on its own budget,
+        # but a shrink issues a whole fresh one: without this, four hops against a slow or 5xx-ing
+        # upstream multiply that budget by MAX_SEARCH_SHRINKS + 1, which is the same amplification
+        # the per-request budget exists to prevent, one level up.
         deadline = _monotonic() + self._settings.timeout_secs
         for shrink in range(MAX_SEARCH_SHRINKS + 1):
             try:
-                payload = await self._request(
+                payload = await self._transport.request(
                     "GET", "/api/2/entities", context="search_entities", params=page_params(page)
                 )
                 break
@@ -1002,7 +871,9 @@ class AlephClient:
     @_shaped
     async def get_entity(self, *, entity_id: str) -> _Ent:
         _check_entity_id(entity_id)
-        payload = await self._request("GET", f"/api/2/entities/{entity_id}", context="get_entity")
+        payload = await self._transport.request(
+            "GET", f"/api/2/entities/{entity_id}", context="get_entity"
+        )
         return _Ent(payload)
 
     @_shaped
@@ -1018,7 +889,7 @@ class AlephClient:
         params: Query = [("limit", str(limit))]
         for prop in properties or []:
             params.append(("filter:property", prop))
-        payload = await self._request(
+        payload = await self._transport.request(
             "GET",
             f"/api/2/entities/{entity_id}/expand",
             context="expand_entity",
@@ -1039,7 +910,7 @@ class AlephClient:
     @_shaped
     async def similar_entities(self, *, entity_id: str, limit: int = 20) -> dict[str, Any]:
         _check_entity_id(entity_id)
-        payload = await self._request(
+        payload = await self._transport.request(
             "GET",
             f"/api/2/entities/{entity_id}/similar",
             context="similar_entities",
@@ -1059,7 +930,7 @@ class AlephClient:
 
     async def entity_tags(self, *, entity_id: str) -> dict[str, Any]:
         _check_entity_id(entity_id)
-        payload = await self._request(
+        payload = await self._transport.request(
             "GET", f"/api/2/entities/{entity_id}/tags", context="entity_tags"
         )
         return _slim_tags(payload)
@@ -1082,7 +953,7 @@ class AlephClient:
         params = _page_params(limit, 0, cap=100)
         scope = await self._scope.resolve_scope(collection, context="match_entity")
         params.extend(scope.match_filters())
-        payload = await self._request(
+        payload = await self._transport.request(
             "POST", "/api/2/match", context="match_entity", params=params, json=sample
         )
         return _slim_result(payload)
@@ -1092,7 +963,9 @@ class AlephClient:
     @_shaped
     async def get_profile(self, *, profile_id: str) -> dict[str, Any]:
         _check_entity_id(profile_id, field="profile_id")
-        payload = await self._request("GET", f"/api/2/profiles/{profile_id}", context="get_profile")
+        payload = await self._transport.request(
+            "GET", f"/api/2/profiles/{profile_id}", context="get_profile"
+        )
         # `merged` is a merged FollowTheMoney proxy, so it can carry a constituent
         # Document's bodyText; slim_entity is what keeps that out of context. It also
         # drops ProfileSerializer's `latinized` block by construction, which is a
@@ -1110,7 +983,7 @@ class AlephClient:
 
     async def profile_tags(self, *, profile_id: str) -> dict[str, Any]:
         _check_entity_id(profile_id, field="profile_id")
-        payload = await self._request(
+        payload = await self._transport.request(
             "GET", f"/api/2/profiles/{profile_id}/tags", context="profile_tags"
         )
         return _slim_tags(payload)
@@ -1118,7 +991,7 @@ class AlephClient:
     @_shaped
     async def profile_similar(self, *, profile_id: str, limit: int = 20) -> dict[str, Any]:
         _check_entity_id(profile_id, field="profile_id")
-        payload = await self._request(
+        payload = await self._transport.request(
             "GET",
             f"/api/2/profiles/{profile_id}/similar",
             context="profile_similar",
@@ -1151,7 +1024,7 @@ class AlephClient:
         params: Query = [("limit", str(limit))]
         for prop in properties or []:
             params.append(("filter:property", prop))
-        payload = await self._request(
+        payload = await self._transport.request(
             "GET",
             f"/api/2/profiles/{profile_id}/expand",
             context="expand_profile",
@@ -1183,7 +1056,7 @@ class AlephClient:
         params.extend(resolved.filters())
         if set_type:
             params.append(("filter:type", set_type))
-        payload = await self._request(
+        payload = await self._transport.request(
             "GET", "/api/2/entitysets", context="list_entitysets", params=params
         )
         return {
@@ -1212,7 +1085,7 @@ class AlephClient:
                 ),
             }
 
-        payload = await self._request(
+        payload = await self._transport.request(
             "GET",
             f"/api/2/entitysets/{entityset_id}",
             context="get_entityset",
@@ -1228,7 +1101,7 @@ class AlephClient:
         self, *, entityset_id: str, limit: int = 50, offset: int = 0
     ) -> dict[str, Any]:
         _check_entity_id(entityset_id, field="entityset_id")
-        payload = await self._request(
+        payload = await self._transport.request(
             "GET",
             f"/api/2/entitysets/{entityset_id}/entities",
             context="entityset_items",
@@ -1244,7 +1117,7 @@ class AlephClient:
         # and a call refused on its paging must not pay for one.
         params = _page_params(limit, offset, cap=100)
         resolved = await self._scope.resolve_one(collection, context="xref_results")
-        payload = await self._request(
+        payload = await self._transport.request(
             "GET",
             f"/api/2/collections/{resolved.id}/xref",
             context="xref_results",
@@ -1282,14 +1155,14 @@ class AlephClient:
         if limit < 1 or limit > 200_000:
             raise ValueError("limit must be between 1 and 200000 characters")
 
-        entity = await self._request(
+        entity = await self._transport.request(
             "GET", f"/api/2/entities/{entity_id}", context="get_entity_text"
         )
         body = "\n".join((entity.get("properties") or {}).get("bodyText") or [])
         source = "bodyText"
 
         if not body:
-            pages = await self._request(
+            pages = await self._transport.request(
                 "GET",
                 "/api/2/entities",
                 context="get_entity_text",
@@ -1398,23 +1271,3 @@ def _page_params(limit: int, offset: int, *, cap: int) -> Query:
     if offset < 0:
         raise ValueError("offset must be >= 0")
     return [("limit", str(limit)), ("offset", str(offset))]
-
-
-# Total time a single tool call may spend asleep between retries. The per-request httpx
-# timeout does not cover asyncio.sleep, so without this an upstream answering every
-# attempt with `Retry-After: 30` decides how long the caller's tool invocation hangs.
-MAX_RETRY_SLEEP_SECS = 30.0
-
-
-def _backoff_delay(attempt: int) -> float:
-    return min(MAX_RETRY_SLEEP_SECS, float(2 ** (attempt - 1)))
-
-
-def _retry_delay(resp: httpx.Response, attempt: int) -> float:
-    retry_after = resp.headers.get("Retry-After")
-    if retry_after:
-        try:
-            return min(MAX_RETRY_SLEEP_SECS, max(0.0, float(retry_after)))
-        except ValueError:
-            pass
-    return _backoff_delay(attempt)
