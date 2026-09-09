@@ -1,0 +1,330 @@
+"""The collection-scope module on its own: parse, resolve, cache, render.
+
+Not one `respx` route in this file, and that is the point rather than an economy. The
+scope's refusals are the half of `openspec/specs/mcp-tool-surface` that promises a refused
+call costs no collection lookup, so a refusal that needs a mocked upstream to be tested is
+a refusal that has already sent something. The lookup here is an in-process callable, and
+most cases pass one that fails the test if it is called at all.
+
+`tests/test_collection_scope.py` keeps the end-to-end contract — what reaches the wire and
+what the reply says. This file pins the module those tests run through.
+"""
+
+from typing import Any
+
+import pytest
+
+from aleph_mcp.scope import (
+    ALL_COLLECTIONS,
+    MAX_SCOPE_COLLECTIONS,
+    CollectionResolver,
+    CollectionScope,
+    ResolvedCollection,
+    parse_collection,
+    parse_scope,
+)
+
+# 122 characters, carrying a control character and a double quote. Stands in for the one
+# path where a collection id is upstream text rather than caller text: the `id` read out of
+# a foreign_id lookup.
+UPSTREAM_ID = "a" * 60 + "\x1b" + '"' + "b" * 60
+
+
+async def _refuse_to_look_up(foreign_id: str, context: str) -> dict[str, Any]:
+    raise AssertionError(
+        f"a local refusal cost an upstream lookup: {foreign_id!r} for {context}. Every "
+        "parse-level refusal must precede any request -- see the required-scope "
+        "requirement in openspec/specs/mcp-tool-surface."
+    )
+
+
+class FakeUpstream:
+    """The one request the resolver makes, answered in process.
+
+    `ids` maps a foreign_id to the numeric id a well-behaved instance would return.
+    `answer` replaces the whole payload, for the cases that need an instance which answers
+    with something other than what was asked for.
+    """
+
+    def __init__(
+        self, ids: dict[str, str] | None = None, *, answer: dict[str, Any] | None = None
+    ) -> None:
+        self._ids = ids or {}
+        self._answer = answer
+        self.calls: list[tuple[str, str]] = []
+
+    async def __call__(self, foreign_id: str, context: str) -> dict[str, Any]:
+        self.calls.append((foreign_id, context))
+        if self._answer is not None:
+            return self._answer
+        numeric = self._ids.get(foreign_id)
+        if numeric is None:
+            return {"total": 0, "results": []}
+        return {"total": 1, "results": [{"id": numeric, "foreign_id": foreign_id}]}
+
+
+def resolver(
+    lookup: Any = _refuse_to_look_up,
+    *,
+    timeout_secs: float = 30.0,
+    monotonic: Any = None,
+) -> CollectionResolver:
+    return CollectionResolver(
+        lookup=lookup,
+        timeout_secs=lambda: timeout_secs,
+        **({"monotonic": monotonic} if monotonic is not None else {}),
+    )
+
+
+# -- parse: every refusal that needs no upstream -------------------------------
+
+# Each row is refused by reading the value alone. The message fragment is asserted because
+# a scope refusal that does not say which value is wrong sends the caller back to guessing.
+SCOPE_REFUSALS: list[tuple[Any, str]] = [
+    ("", "must not be empty"),
+    ("   ", "must not be empty"),
+    ("\n", "must not be empty"),
+    ([], "at least one collection"),
+    ([""], "must not be empty"),
+    ([ALL_COLLECTIONS, "874"], "cannot be combined"),
+    (["874", ALL_COLLECTIONS], "cannot be combined"),
+    (list(range(MAX_SCOPE_COLLECTIONS + 1)), f"at most {MAX_SCOPE_COLLECTIONS} collections"),
+    ("42\n", "expected a numeric collection id"),
+    ("874 874", "expected a numeric collection id"),
+]
+
+
+@pytest.mark.parametrize(
+    ("collection", "fragment"), SCOPE_REFUSALS, ids=[str(row[0]) for row in SCOPE_REFUSALS]
+)
+async def test_a_scope_that_names_nothing_is_refused_without_a_lookup(
+    collection: Any, fragment: str
+) -> None:
+    """The evidence for "a refused call costs no collection lookup", at the layer that decides it.
+
+    The lookup passed here fails the test rather than answering, so a refusal that moved
+    to after the request would fail with that assertion instead of passing quietly.
+    """
+    with pytest.raises(ValueError, match=fragment):
+        await resolver().resolve_scope(collection, context="search_entities")
+
+
+ONE_COLLECTION_REFUSALS: list[tuple[Any, str]] = [
+    (ALL_COLLECTIONS, "addresses exactly one collection"),
+    ("", "must not be empty"),
+    ("  ", "must not be empty"),
+    ("42\n", "expected a numeric collection id"),
+]
+
+
+@pytest.mark.parametrize(
+    ("collection", "fragment"),
+    ONE_COLLECTION_REFUSALS,
+    ids=[str(row[0]) for row in ONE_COLLECTION_REFUSALS],
+)
+async def test_a_single_collection_is_refused_without_a_lookup(
+    collection: Any, fragment: str
+) -> None:
+    """`"*"` is refused here rather than looked up as a foreign_id, because the same
+    argument on the search tools uses that literal for every collection."""
+    with pytest.raises(ValueError, match=fragment):
+        await resolver().resolve_one(collection, context="get_collection")
+
+
+def test_parse_needs_no_resolver_at_all() -> None:
+    """The parse half is a pure function, callable with nothing constructed around it.
+
+    Also pins the input-spelling dedup: `874` and `"874"` are one spelling, so a list
+    carrying both costs one resolution rather than two.
+    """
+    assert parse_scope(ALL_COLLECTIONS) is None
+    assert parse_scope([874, "874", "my-case"]) == ("874", "my-case")
+    assert parse_scope("my-case") == ("my-case",)
+    assert parse_collection(874) == "874"
+
+
+# -- render: the wire spellings live on the resolved scope ---------------------
+
+
+def test_a_scope_renders_one_search_filter_per_collection() -> None:
+    scope = CollectionScope((ResolvedCollection("874"), ResolvedCollection("12")))
+    assert scope.search_filters() == [
+        ("filter:collection_id", "874"),
+        ("filter:collection_id", "12"),
+    ]
+
+
+def test_a_scope_renders_the_match_endpoint_its_own_spelling() -> None:
+    """Two wire spellings for one concept is why the rendering is a method and not a loop
+    at the call site: /api/2/match takes `collection_ids`, everything else takes
+    `filter:collection_id`."""
+    scope = CollectionScope((ResolvedCollection("874"), ResolvedCollection("12")))
+    assert scope.match_filters() == [("collection_ids", "874"), ("collection_ids", "12")]
+
+
+def test_a_single_collection_renders_the_listing_filter() -> None:
+    assert ResolvedCollection("874").filters() == [("filter:collection_id", "874")]
+
+
+def test_every_collection_renders_no_filter_and_reports_the_literal() -> None:
+    """Omitting the filter is how Aleph is asked for every readable collection, on both
+    endpoints. The reply has to say so, because the request cannot: an empty filter list
+    and a deliberate cross-collection search look identical on the wire."""
+    scope = CollectionScope(None)
+    assert scope.is_every_collection
+    assert scope.search_filters() == []
+    assert scope.match_filters() == []
+    assert scope.reported() == ALL_COLLECTIONS
+
+
+def test_a_named_scope_reports_the_resolved_ids() -> None:
+    scope = CollectionScope((ResolvedCollection("874"), ResolvedCollection("12")))
+    assert not scope.is_every_collection
+    assert scope.reported() == ["874", "12"]
+
+
+def test_a_scope_of_no_collections_cannot_be_constructed() -> None:
+    """The empty tuple is the one construction that fails open, so the type refuses it.
+
+    It renders byte-identically to the sentinel — no filter, so Aleph answers across every
+    readable collection — while reporting `searched.collection: []` and suppressing the
+    EVERY COLLECTION note. `parse_scope` cannot produce it; without this guard that is a
+    property of the current control flow rather than of the type, and the docstring above
+    would be a claim nothing checks.
+    """
+    with pytest.raises(ValueError, match="names no collection"):
+        CollectionScope(())
+
+
+# -- resolve: the lookup, the dedup, the cache, the deadline -------------------
+
+
+async def test_two_spellings_of_one_collection_collapse_to_one_filter() -> None:
+    """A numeric id and a foreign_id naming the same collection are one collection.
+
+    Deduplicating only the input spellings is not enough — they differ as text and agree
+    only once resolved. Emitting the filter twice would contradict what the reply reports
+    under `searched.collection` and what the one-filter-per-id contract says.
+    """
+    upstream = FakeUpstream({"my-case": "874"})
+    scope = await resolver(upstream).resolve_scope(["874", "my-case"], context="search_entities")
+    assert scope.reported() == ["874"]
+    assert scope.search_filters() == [("filter:collection_id", "874")]
+
+
+async def test_the_all_collections_literal_resolves_to_the_sentinel() -> None:
+    """`"*"` must arrive as the sentinel, not as a scope of zero collections.
+
+    The two are indistinguishable on the wire and differ only in what the reply says, so
+    this is the join between `parse_scope("*") is None` and the rendering tests above —
+    which each hold their own end and neither of which pins the path between them.
+    """
+    scope = await resolver().resolve_scope(ALL_COLLECTIONS, context="search_entities")
+    assert scope.collections is None
+    assert scope.is_every_collection
+    assert scope.reported() == ALL_COLLECTIONS
+    assert scope.search_filters() == []
+
+
+async def test_a_foreign_id_the_instance_does_not_know_is_refused() -> None:
+    """An empty listing is a refusal naming the tool that can enumerate collections, not
+    an empty scope — an empty scope would search every collection instead."""
+    upstream = FakeUpstream({"my-case": "874"})
+    resolve = resolver(upstream)
+    with pytest.raises(ValueError, match="list_collections"):
+        await resolve.resolve_one("no-such-case", context="get_collection")
+    assert upstream.calls == [("no-such-case", "get_collection")]
+    assert resolve.cached == {}
+
+
+async def test_a_verified_hit_is_cached_and_costs_one_lookup() -> None:
+    """A collection's numeric id never changes, so the cache never needs invalidating."""
+    upstream = FakeUpstream({"my-case": "874"})
+    resolve = resolver(upstream)
+    first = await resolve.resolve_one("my-case", context="get_collection")
+    second = await resolve.resolve_one("my-case", context="xref_results")
+    assert first == second == ResolvedCollection("874")
+    assert upstream.calls == [("my-case", "get_collection")]
+    assert resolve.cached == {"my-case": "874"}
+
+
+async def test_a_resolution_the_upstream_did_not_confirm_is_never_cached() -> None:
+    """The listing answers with a collection nobody named — a dropped filter, a loose
+    match, a redirect answered by a different listing. That is a refusal, and caching it
+    would make one lenient answer permanent for the process lifetime."""
+    upstream = FakeUpstream(answer={"total": 1, "results": [{"id": "999", "foreign_id": "other"}]})
+    resolve = resolver(upstream)
+    with pytest.raises(ValueError, match="list_collections"):
+        await resolve.resolve_one("my-case", context="search_entities")
+    assert resolve.cached == {}
+
+
+async def test_the_cache_cannot_be_seeded_from_outside() -> None:
+    """Only a verified hit gets in. A writable cache is a way to resolve a collection
+    without ever asking the instance whether it is the right one."""
+    resolve = resolver(FakeUpstream({"my-case": "874"}))
+    await resolve.resolve_one("my-case", context="get_collection")
+    with pytest.raises(TypeError):
+        resolve.cached["other"] = "999"  # type: ignore[index]
+    assert resolve.cached == {"my-case": "874"}
+
+
+async def test_the_resolution_deadline_stops_a_scope_that_runs_long() -> None:
+    """One resolution phase, one deadline, mirroring the shrink loop.
+
+    Each lookup is bounded on its own budget, so N of them in sequence would otherwise
+    multiply that budget by N before the search is even sent. The first collection is
+    never charged: a scope of one must cost exactly what a single lookup costs.
+    """
+    upstream = FakeUpstream({"first": "874", "second": "12"})
+    ticks = [0.0, 61.0]
+
+    def clock() -> float:
+        return ticks.pop(0) if len(ticks) > 1 else ticks[0]
+
+    with pytest.raises(ValueError, match=r"exceeded this call's 30.0s budget after 1 of 2"):
+        await resolver(upstream, monotonic=clock).resolve_scope(
+            ["first", "second"], context="search_entities"
+        )
+    assert upstream.calls == [("first", "search_entities")], (
+        "the deadline must stop the phase, not merely report it afterwards"
+    )
+
+
+async def test_the_budget_is_read_at_call_time_not_captured() -> None:
+    """`AlephClient` passes a callable, not a value, and a comment says why.
+
+    A resolver that captured the budget at construction passes every other test in the
+    suite, so that comment was a claim nothing checked — and the claim matters: the
+    settings object is what a test adjusts to exercise a short budget, and it is adjusted
+    after the client is built.
+    """
+    upstream = FakeUpstream({"first": "874", "second": "12"})
+    budget = [30.0]
+    ticks = [0.0, 61.0]
+
+    def clock() -> float:
+        return ticks.pop(0) if len(ticks) > 1 else ticks[0]
+
+    resolve = CollectionResolver(lookup=upstream, timeout_secs=lambda: budget[0], monotonic=clock)
+    budget[0] = 45.0
+    with pytest.raises(ValueError, match=r"exceeded this call's 45.0s budget"):
+        await resolve.resolve_scope(["first", "second"], context="search_entities")
+
+
+async def test_an_upstream_id_echoed_into_a_refusal_is_bounded_and_escaped() -> None:
+    """The `id` read out of a listing hit is upstream text on its way to a model.
+
+    Both halves are load-bearing and neither is visible from the other's test: the cap
+    comes from `COLLECTION_ECHO`, and the escaping comes from the `!r` at the call site.
+    Keeping the policy while dropping the `!r` would silently unstrip the control
+    characters that policy deliberately does not strip itself.
+    """
+    upstream = FakeUpstream(
+        answer={"total": 1, "results": [{"id": UPSTREAM_ID, "foreign_id": "my-case"}]}
+    )
+    with pytest.raises(ValueError) as excinfo:
+        await resolver(upstream).resolve_one("my-case", context="search_entities")
+    message = str(excinfo.value)
+    assert "\x1b" not in message, "a raw control character reached a model-visible message"
+    assert "'" + "a" * 60 + "\\x1b" + '"' + "b" * 58 + "… [+2 chars]'" in message

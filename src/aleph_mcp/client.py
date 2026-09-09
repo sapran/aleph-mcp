@@ -7,13 +7,13 @@ import re
 import secrets
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any, Concatenate, Final, Literal, cast
+from typing import Any, Concatenate, Literal, cast
 
 import httpx
 from fastmcp.exceptions import ResourceError, ToolError
 
 from .config import Settings
-from .echo import COLLECTION_ECHO, PROPERTY_VALUE, render
+from .echo import PROPERTY_VALUE, render
 from .errors import (
     ResponseTooLarge,
     raise_for_status,
@@ -22,6 +22,7 @@ from .errors import (
     raise_unreachable,
 )
 from .readonly import ReadOnlyViolation, read_only_hook
+from .scope import ALL_COLLECTIONS, CollectionResolver
 
 # Indirected so a test can advance a fake clock across an attempt. The retry budget is
 # wall-clock, and a test that cannot move the clock is blind to the term that dominates it.
@@ -90,26 +91,6 @@ Query = list[tuple[str, str | int | float | bool | None]]
 # Matched with `fullmatch`, as in readonly.py — no anchors, so the two agree by
 # construction. An anchored `$` here is what previously let a trailing newline through.
 _ENTITY_ID = re.compile(r"[A-Za-z0-9._:-]+")
-_COLLECTION_ID = re.compile(r"[0-9]+")
-
-# The only way to ask for an unscoped search. Deliberately not a natural-language word: a
-# caller that types it has chosen to search every readable collection, where a caller that
-# omits the argument entirely has chosen nothing and is refused. See
-# openspec/specs/mcp-tool-surface — an unscoped search returned in answer to a scoped
-# question contaminates a product with another collection's rows, silently.
-ALL_COLLECTIONS: Final = "*"
-
-# What a resolved scope is: the sentinel, or numeric collection ids. Spelled as a Literal
-# rather than `str` so the sentinel cannot be confused with an id — `for cid in scope` over
-# a bare `"874"` would emit three one-character filters, and a plain `str` return type
-# hides that from mypy because a string is iterable.
-Scope = Literal["*"] | list[str]
-
-# How many collections one call may name. Each uncached foreign id is a whole upstream
-# request with its own retry budget; this is what stops one tool call from multiplying that
-# budget by the length of a caller-supplied list. Ten is well past the one or two a real
-# session uses, and far short of an instance's collection count.
-MAX_SCOPE_COLLECTIONS = 10
 
 
 def _check_entity_id(value: str, *, field: str = "entity_id") -> str:
@@ -122,23 +103,6 @@ def _check_entity_id(value: str, *, field: str = "entity_id") -> str:
     if not value.strip("."):
         raise ValueError(f"invalid {field}: addresses nothing (got {value!r})")
     return value
-
-
-def _check_collection_id(value: object) -> str:
-    text = str(value)
-    if not _COLLECTION_ID.fullmatch(text):
-        raise ValueError(
-            # `value` is caller input on every path but one: the id read out of a
-            # foreign_id lookup is upstream text, so it is bounded under the shared rule
-            # in echo.py — an unbounded echo is a write primitive into the model's
-            # context. `!r` additionally escapes control characters, which is why
-            # COLLECTION_ECHO does not strip them itself.
-            f"invalid collection: expected a numeric collection id "
-            f"(got {render(text, COLLECTION_ECHO)!r}). "
-            "A foreign_id is accepted directly and resolved for you; this error means the "
-            "value is neither."
-        )
-    return text
 
 
 # Aleph does not always serialise a `caption`; on the instances tested it is null on both
@@ -527,9 +491,16 @@ class AlephClient:
 
     def __init__(self, settings: Settings):
         self._settings = settings
-        # foreign_id -> numeric collection id, for the process lifetime. See
-        # _resolve_collection_id for why this never needs invalidating.
-        self._foreign_ids: dict[str, str] = {}
+        # Collection scope in full — parse, resolve, cache and rendering — lives in
+        # scope.py. This class supplies only the one upstream request that module needs.
+        # Both callables are read at call time rather than captured, so a test that
+        # adjusts the settings or advances the fake clock after construction still
+        # governs the resolution deadline.
+        self._scope = CollectionResolver(
+            lookup=self._lookup_collection,
+            timeout_secs=lambda: self._settings.timeout_secs,
+            monotonic=lambda: _monotonic(),
+        )
         self._model: dict[str, Any] | None = None
         self._http = httpx.AsyncClient(
             base_url=settings.host,
@@ -816,149 +787,31 @@ class AlephClient:
     async def get_collection(self, *, collection: str) -> dict[str, Any]:
         """Fetch one collection by numeric id or by foreign_id.
 
-        Resolution is shared with every other collection-taking tool
-        (`_resolve_collection_id`), so one value form works everywhere on this surface.
+        Resolution is shared with every other collection-taking tool (`scope.py`), so one
+        value form works everywhere on this surface.
 
         The listing endpoint carries no `statistics` block, so answering a foreign_id
         straight from the listing hit would return `statistics: null` and silently break
         the one promise this tool makes over list_collections. Both branches therefore end
         at the same by-id fetch.
         """
-        return await self._get_collection_by_id(
-            await self._resolve_collection_id(collection, context="get_collection")
-        )
+        resolved = await self._scope.resolve_one(collection, context="get_collection")
+        return await self._get_collection_by_id(resolved.id)
 
-    async def _resolve_collection_id(self, collection: str | int, *, context: str) -> str:
-        """Return the numeric id for a numeric id or a foreign_id.
+    async def _lookup_collection(self, foreign_id: str, context: str) -> dict[str, Any]:
+        """The one upstream request the collection scope needs.
 
-        The numeric branch interpolates into a path, so it goes through the shared
-        validator rather than trusting the branch test. The branch test reads "digits and
-        whitespace only" so that `"42\\n"` is understood as numeric *intent* and refused by
-        the validator, rather than falling through to the foreign_id branch and quietly
-        resolving to nothing. The corollary, stated because it is surprising: a value of
-        only digits is ALWAYS read as a numeric id, so a collection whose foreign_id is
-        all digits cannot be addressed by that foreign_id here — pass its numeric id.
-
-        A foreign_id is left free-form on purpose: it becomes a url-encoded query
-        parameter and cannot escape the path, and foreign ids are not constrained to any
-        charset.
-
-        `context` names the calling tool so a failed lookup is reported against the tool
-        the caller actually invoked, rather than against `get_collection`.
+        Handed to `CollectionResolver` at construction: the scope module decides what a
+        collection is and whether the answer may be trusted, and this decides how the
+        question is asked. `context` names the calling tool, so a failed lookup is
+        reported against the tool the caller actually invoked.
         """
-        text = str(collection)
-        # Refused before the cache and before any request. An empty or blank value names
-        # no collection, and Aleph does not treat it as naming none: `sanitize_text`
-        # returns None for it, the filter set comes out empty, and `field_filter_query`
-        # emits `match_all` — so the listing answers with the first collection this key
-        # can read and `limit=1` takes it. That is a silently misdirected search, which is
-        # the exact failure this argument exists to prevent.
-        if not text.strip():
-            raise ValueError(
-                "collection must not be empty: pass a numeric collection id, a foreign_id, "
-                f"or {ALL_COLLECTIONS!r} to search every readable collection"
-            )
-        if text == ALL_COLLECTIONS:
-            raise ValueError(
-                f"this tool addresses exactly one collection, so {ALL_COLLECTIONS!r} is not "
-                "meaningful here; it is the all-collections literal for search_entities and "
-                "match_entity only. Pass one collection id or foreign_id."
-            )
-        if not text.strip("0123456789 \t\r\n"):
-            return _check_collection_id(text)
-
-        cached = self._foreign_ids.get(text)
-        if cached is not None:
-            return cached
-
-        listing = await self._request(
+        return await self._request(
             "GET",
             "/api/2/collections",
             context=context,
-            params=[("filter:foreign_id", text), ("limit", "1")],
+            params=[("filter:foreign_id", foreign_id), ("limit", "1")],
         )
-        results = listing.get("results") or []
-        hit = results[0] if results and isinstance(results[0], dict) else None
-        # Tie the answer back to the question. Without this the resolver trusts that the
-        # upstream applied the filter it was given, and any leniency — a dropped filter, a
-        # loose match, a redirect answered by a different listing — resolves to a
-        # plausible id for a collection nobody named, then caches it for the process
-        # lifetime. A non-dict row is checked in the same breath because `_request` wraps a
-        # non-dict JSON body as `{"results": <body>}`, and `.get` on a str would raise
-        # AttributeError, which no tool's `except ValueError` translates.
-        if hit is None or hit.get("foreign_id") != text:
-            raise ValueError(
-                f"no collection with foreign_id {text!r} is readable with this API key; "
-                "call list_collections to see what is available"
-            )
-        resolved = _check_collection_id(hit.get("id"))
-        # A collection's numeric id never changes, so this needs no invalidation. Cached for
-        # the process lifetime beside `_model`: a session works one or two collections and
-        # would otherwise pay a lookup on every scoped call. Only a verified hit is cached;
-        # a failure is never stored, so a bogus id cannot grow the map.
-        self._foreign_ids[text] = resolved
-        return resolved
-
-    async def _resolve_collection_scope(
-        self, collection: str | int | list[str | int], *, context: str
-    ) -> Scope:
-        """Return `ALL_COLLECTIONS`, or the numeric ids for one or more collections.
-
-        Accepts the literal `"*"`, a single id in either form, or a list of them. A caller
-        that omits the argument never reaches here — the tool signature refuses first,
-        which is the point: see the required-scope requirement in the spec.
-
-        Every refusal below is local and precedes any request, so a scope that names
-        nothing costs nothing.
-        """
-        # A scalar, either spelling: a model handed a numeric id often sends the JSON
-        # number rather than the string, and rejecting that would spend a turn on syntax.
-        if not isinstance(collection, list):
-            if collection == ALL_COLLECTIONS:
-                return ALL_COLLECTIONS
-            return [await self._resolve_collection_id(collection, context=context)]
-
-        if not collection:
-            raise ValueError(
-                "collection must name at least one collection, or the literal '*' to search "
-                "every readable collection"
-            )
-        if ALL_COLLECTIONS in collection:
-            raise ValueError(
-                "collection='*' searches every readable collection and cannot be combined "
-                "with named collections; pass either '*' or the ids you want"
-            )
-        # Deduplicated preserving order, and bounded. Each uncached foreign id is a whole
-        # upstream request with its own retry budget, so an unbounded list would let one
-        # tool call multiply that budget — the same amplification the per-request budget
-        # and the shrink loop's deadline both exist to prevent.
-        # Stringified first, so a list mixing 874 and "874" dedups as one spelling.
-        unique = list(dict.fromkeys(str(c) for c in collection))
-        if len(unique) > MAX_SCOPE_COLLECTIONS:
-            raise ValueError(
-                f"collection may name at most {MAX_SCOPE_COLLECTIONS} collections in one "
-                f"call (got {len(unique)}). Each one may cost a lookup, so query the slices "
-                "separately, or pass '*' and filter the hits by collection_id."
-            )
-        # One resolution phase, one deadline, mirroring the shrink loop: `_request` bounds
-        # each request on its own budget, and N of them in sequence would otherwise
-        # multiply it by N before the search is even sent.
-        deadline = _monotonic() + self._settings.timeout_secs
-        resolved: list[str] = []
-        for item in unique:
-            if resolved and _monotonic() >= deadline:
-                raise ValueError(
-                    f"resolving the collection scope exceeded this call's "
-                    f"{self._settings.timeout_secs}s budget after {len(resolved)} of "
-                    f"{len(unique)} collections. Pass numeric ids, which need no lookup, or "
-                    "query fewer collections per call."
-                )
-            resolved.append(await self._resolve_collection_id(item, context=context))
-        # Deduplicated again, on the resolved ids: a numeric id and a foreign_id naming the
-        # same collection are two distinct spellings that collapse to one id, and emitting
-        # `filter:collection_id` twice for it would contradict what `searched.collection`
-        # reports and what the one-filter-per-id contract says.
-        return list(dict.fromkeys(resolved))
 
     async def _get_collection_by_id(self, collection_id: str) -> dict[str, Any]:
         payload = await self._request(
@@ -1021,7 +874,7 @@ class AlephClient:
         # pass a numeric id. The scope's own local refusals (empty, blank, `"*"` mixed with
         # ids, too many, non-numeric form) all run inside the resolver before it makes any
         # request, so a scope that names nothing is still reported without I/O.
-        scope = await self._resolve_collection_scope(collection, context="search_entities")
+        scope = await self._scope.resolve_scope(collection, context="search_entities")
 
         # /api/2/entities picks its Elasticsearch index from filter:schema or
         # filter:schemata and rejects a query carrying neither with a bare 400
@@ -1038,10 +891,8 @@ class AlephClient:
             if effective_schemata:
                 params.append(("filter:schemata", effective_schemata))
             # Inside the closure so the shrink loop rebuilds the scope unchanged with each
-            # smaller page. A list ORs within the key, which is Aleph's filter semantics.
-            if isinstance(scope, list):
-                for cid in scope:
-                    params.append(("filter:collection_id", cid))
+            # smaller page.
+            params.extend(scope.search_filters())
             for key, value in (filters or {}).items():
                 for item in value if isinstance(value, list) else [value]:
                     params.append((f"filter:{key}", str(item)))
@@ -1093,11 +944,11 @@ class AlephClient:
         # Beside the schema scope rather than in a second mechanism: `searched` already
         # exists so a caller can tell "no matches" from "matched nothing in a scope I did
         # not choose", and the collection is the scope that was silently wrong before.
-        result["searched"]["collection"] = scope
+        result["searched"]["collection"] = scope.reported()
         # The notes compose rather than overwrite: a shrunk page in a result set past the
         # window is both truncated and unenumerated, and a caller needs to be told both.
         notes: list[str] = []
-        if scope == ALL_COLLECTIONS:
+        if scope.is_every_collection:
             # A deliberate cross-collection search must still read as one in a transcript.
             # Without this, `"*"` and a scoped search are indistinguishable in the rows.
             notes.append(
@@ -1229,15 +1080,8 @@ class AlephClient:
         # Page params first: they validate locally, and resolving a foreign_id costs an
         # upstream request that a refused call must not pay for.
         params = _page_params(limit, 0, cap=100)
-        scope = await self._resolve_collection_scope(collection, context="match_entity")
-        # Aleph's match endpoint spells this `collection_ids` on the wire; omitting it is
-        # its all-collections behaviour — `match_query` adds a terms filter only for a
-        # non-empty list, and the authorisation filter still bounds the result to what this
-        # key may read. The wire name stays, the argument does not — see the
-        # one-vocabulary requirement in openspec/specs/mcp-tool-surface.
-        if isinstance(scope, list):
-            for cid in scope:
-                params.append(("collection_ids", cid))
+        scope = await self._scope.resolve_scope(collection, context="match_entity")
+        params.extend(scope.match_filters())
         payload = await self._request(
             "POST", "/api/2/match", context="match_entity", params=params, json=sample
         )
@@ -1335,12 +1179,8 @@ class AlephClient:
         limit: int = 30,
     ) -> dict[str, Any]:
         params = _page_params(limit, 0, cap=100)
-        params.append(
-            (
-                "filter:collection_id",
-                await self._resolve_collection_id(collection, context="list_entitysets"),
-            )
-        )
+        resolved = await self._scope.resolve_one(collection, context="list_entitysets")
+        params.extend(resolved.filters())
         if set_type:
             params.append(("filter:type", set_type))
         payload = await self._request(
@@ -1403,10 +1243,10 @@ class AlephClient:
         # Paging validated locally first: resolving a foreign_id costs an upstream request
         # and a call refused on its paging must not pay for one.
         params = _page_params(limit, offset, cap=100)
-        cid = await self._resolve_collection_id(collection, context="xref_results")
+        resolved = await self._scope.resolve_one(collection, context="xref_results")
         payload = await self._request(
             "GET",
-            f"/api/2/collections/{cid}/xref",
+            f"/api/2/collections/{resolved.id}/xref",
             context="xref_results",
             params=params,
         )

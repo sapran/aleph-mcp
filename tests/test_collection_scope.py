@@ -328,7 +328,7 @@ async def test_a_resolved_hit_must_be_the_collection_that_was_asked_for(
         await client.search_entities(collection="my-case", q="acme")
     assert lookup.call_count == 1
     assert entities.call_count == 0, "an unverified resolution must not be searched"
-    assert client._foreign_ids == {}, "a rejected resolution must never be cached"
+    assert client._scope.cached == {}, "a rejected resolution must never be cached"
 
 
 async def test_a_non_dict_listing_row_is_a_tool_error_not_an_attribute_error(

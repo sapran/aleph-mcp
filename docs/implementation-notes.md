@@ -241,9 +241,39 @@ Retired since the last prune:
 
 - **`echo.COLLECTION_ECHO` leaves control characters to its call site's `!r`.** Found while
   building the policy module (T2); it is the behaviour the four helpers had, preserved deliberately
-  rather than a new gap. `_check_collection_id` is the only caller and formats the result with
+  rather than a new gap. `scope.check_collection_id` is the only caller and formats the result with
   `!r`, which escapes controls -- so the policy does not strip them itself. A second caller that
   interpolates the rendering plainly would put upstream control characters into a model-visible
   message. Recorded because the coupling is now between two files rather than inside one function.
   Closing it means either stripping in the policy (a behaviour change to the existing message, so
   its own change) or asserting the `!r` at the call site.
+
+- **A non-list `results` from the collection listing escapes the `except ValueError` seam.**
+  `scope.py:312-313` (was `client.py:879-880`, character-identical). The `isinstance(results[0],
+  dict)` guard covers a body that arrives as a list or a scalar, because `_request` wraps a
+  non-dict body as `{"results": <body>}` -- but an Aleph *dict* body whose own `results` key is
+  not a list reaches `results[0]` on a truthy non-list. Measured on both `develop` and the T5
+  branch, byte-identical: `{"results": {"a": 1}}` raises `KeyError`, `{"results": 5}` and
+  `{"results": true}` raise `TypeError`. `server.py` translates `ValueError` only, so these reach
+  the model untranslated rather than as a legible refusal. Found by review during T5 and
+  reproduced against pristine `develop`, so it predates that change. Fires only against an
+  upstream or proxy answering 200 with an unexpected body shape.
+
+- **"no collection with foreign_id X" absorbs an upstream malfunction.** `scope.py:321-325`,
+  unchanged from `develop`. Any lookup payload without a usable `results[0]` -- including
+  `{"status": "error"}` with no `results` key at all, and `{"results": [null]}` -- is reported to
+  the model as an authorisation-or-existence problem naming `list_collections`. A proxy, an SSO
+  interstitial or an unfamiliar Aleph version therefore produces a confident wrong diagnosis and a
+  dead-end next step. Fail-closed, so no wrong rows are returned. Found by review during T5.
+
+- **The `MAX_SCOPE_COLLECTIONS` boundary is unpinned.** Only `MAX + 1` is tested
+  (`tests/test_scope.py`, `tests/test_collection_scope.py:371`); changing `>` to `>=` at
+  `scope.py:161` -- which would refuse a legitimate ten-collection scope -- passes the whole
+  suite. Pre-existing gap inherited from `test_collection_scope.py`, not introduced by T5. Related
+  and also unpinned: the dedup runs *before* the bound, so eleven spellings collapsing to ten are
+  accepted. Closing it is one row in the existing parametrised table.
+
+- **A single-element `["*"]` is refused with the wrong reason.** `scope.py:150` fires the mixed-
+  scope message -- "cannot be combined with named collections" -- for a list that names no other
+  collection. Unchanged from `develop`, untested anywhere. Correcting it changes a refusal
+  message, so it is a behaviour change rather than a move.
