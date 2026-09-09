@@ -175,11 +175,18 @@ Retired since the last prune:
   branch; parked because T1's scope is the ten entity-returning methods and netting these two means
   deciding whether an entityset's `entities` is entity-shaped at all, which is a spec question.
 
-- **`_slim_tags` copies each aggregation row through, so a row that is an entity survives it.**
-  `entity_tags` and `profile_tags` truncate a row's string values and pass every other value on
-  unchanged, so an entity object in the `results` list arrives with its properties intact. Aleph
-  returns `{field, value, count}` rows there, so this needs the same upstream contract change as the
-  two notes above and leaks nothing today. Recorded from the T1-FIX work, where the new
-  `NOT_SHAPING_CASES` row for these two methods probes the position beside the aggregation rather
-  than inside it; parked with its two siblings because netting all three is one spec question about
-  what counts as entity-shaped, not three refactors.
+- **`_slim_tags` copies a tag row's non-string values through.** `entity_tags` and `profile_tags`
+  truncate a row's *string* values and pass every other value on unchanged, so an entity object as a
+  row's `value` arrives with all five blob properties intact. Aleph returns `{field, value, count}`
+  rows there, so this needs the same upstream contract change as the notes above and leaks nothing
+  today.
+
+- **`_slim_collection(full=True)` copies `statistics` verbatim.** `get_collection` returns whatever
+  that block holds, unread and unbounded; `list_collections` does not, because it slims with
+  `full=False`. Same class as the three notes above: an aggregation slot that is copied rather than
+  rebuilt.
+
+  All four of these -- `get_profile.entities`, `_slim_entityset.entities`, a tag row's `value`, and
+  `statistics` -- are one spec question about what counts as entity-shaped, not four refactors.
+  Since T1-FIX-2 each is pinned by a `strict` xfail row in `NOT_SHAPING_CASES`, so the behaviour
+  cannot change without the suite saying so, and fixing any of them forces this note to be closed.

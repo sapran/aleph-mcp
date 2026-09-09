@@ -2,7 +2,7 @@ import asyncio
 import gzip
 from collections.abc import AsyncIterator, Callable, Iterator
 from itertools import pairwise
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import parse_qsl, urlsplit
 
 import httpx
@@ -1890,143 +1890,190 @@ def test_every_client_method_is_classified() -> None:
 # Methods on NOT_ENTITY_RETURNING that are not endpoints at all, so no payload can be fed
 # to them. Spelled out rather than skipped by a rule, because "it takes no payload" is the
 # excuse that would let a real endpoint out of the check below.
-_NOT_AN_ENDPOINT = frozenset({"aclose"})
+class NotShaping(NamedTuple):
+    """One declared-entity-free method, and the payload that tries to prove it wrong."""
 
-# The mirror of SHAPING_CASES: (client method, kwargs, verb, mocked path, payload), where
-# every payload carries a raw_document() in a position that method's own reply could
-# surface it from. SHAPING_CASES proves the shaped methods shape; without these, nothing
-# proves the unshaped ones have nothing to shape, and the declaration in
+    method: str
+    kwargs: dict[str, Any]
+    # None means the member takes no payload at all: it must issue no request and return
+    # None. Spelled as a row rather than as a name on an exemption list, because an
+    # exemption list is a one-line test edit and that is exactly the bypass this table
+    # exists to close -- measured: a plausible `get_entity_raw` listed in both
+    # NOT_ENTITY_RETURNING and the old `_NOT_AN_ENDPOINT` left the suite green at 380.
+    path: str | None
+    payload: dict[str, Any] | None
+    # Where the probe sits, and why that is the position worth probing for this method.
+    position: str
+    # Set when the method copies the probe straight through today. The behaviour is parked
+    # in docs/implementation-notes.md as one spec question about what counts as
+    # entity-shaped; these rows pin it as an expected failure so the note cannot rot and so
+    # fixing it forces the note to be closed.
+    parked: str | None = None
+    # get_entity_text returns document text on purpose, in a bounded fence.
+    text_is_the_answer: bool = False
+
+
+# The mirror of SHAPING_CASES. SHAPING_CASES proves the shaped methods shape; without these,
+# nothing proves the unshaped ones have nothing to shape, and the declaration in
 # NOT_ENTITY_RETURNING is an assertion no test ever checks.
 #
 # Measured: adding a plausible new entity-returning method on an already-allowlisted path
-# and declaring it here shipped a real leak with the suite green at 362 passed -- the caller
+# and declaring it there shipped a real leak with the suite green at 362 passed -- the caller
 # received bodyText and the whole housekeeping surface. readonly.py blocks a method on a
-# genuinely new path, so the leak needs a method reusing an allowlisted one: a second view
-# of expand, a raw-entity fetch helper, a paging variant. That is ordinary, not exotic.
+# genuinely new path, so the leak needs a method reusing an allowlisted one: a second view of
+# expand, a raw-entity fetch helper, a paging variant. That is ordinary, not exotic.
 #
-# One position is deliberately not probed here: the `entities` list that _slim_entityset
-# copies through, which today does pass an entity object back. It is the sibling of the
-# get_profile trade recorded in docs/implementation-notes.md, it needs the same owner
-# decision, and pinning either answer to it inside this change would pre-empt that. Noted
-# in docs/implementation-notes.md.
-NOT_SHAPING_CASES: tuple[tuple[str, dict[str, Any], str, str, dict[str, Any]], ...] = (
-    ("get_model", {}, "GET", "/api/2/metadata", {**raw_model(), "results": [raw_document()]}),
-    ("list_schemata", {}, "GET", "/api/2/metadata", {**raw_model(), "results": [raw_document()]}),
-    (
-        "get_schema",
-        {"name": "Person"},
-        "GET",
+# Every probe sits in the position that method actually copies through, not merely somewhere
+# in the payload. That distinction was measured to matter: with the probe parked in a field
+# the method structurally drops, five of these rows could not have failed whatever the code
+# did, and moving each into its real copy-through field made all five return a complete
+# document.
+NOT_SHAPING_CASES: tuple[NotShaping, ...] = (
+    # The three ontology methods select a key rather than copying the payload. The probe
+    # sits beside the key they select, so the row fails if one ever starts copying.
+    NotShaping(
+        "get_model",
+        {},
         "/api/2/metadata",
         {**raw_model(), "results": [raw_document()]},
+        "beside the `model` key it selects",
     ),
-    (
+    NotShaping(
+        "list_schemata",
+        {},
+        "/api/2/metadata",
+        {**raw_model(), "results": [raw_document()]},
+        "beside the `model` key it reduces to counts and name lists",
+    ),
+    NotShaping(
+        "get_schema",
+        {"name": "Person"},
+        "/api/2/metadata",
+        {**raw_model(), "results": [raw_document()]},
+        "beside the `model` key it indexes into",
+    ),
+    NotShaping(
         "list_collections",
         {},
-        "GET",
         "/api/2/collections",
         {"total": 1, "results": [{"id": "42", "label": "c", "entity": raw_document()}]},
+        "an extra key on a collection object; _slim_collection builds a fixed key set",
     ),
-    (
+    NotShaping(
         "get_collection",
         {"collection": "42"},
-        "GET",
         "/api/2/collections/42",
-        {"id": "42", "label": "c", "entity": raw_document()},
+        {"id": "42", "label": "c", "statistics": {"byEntity": raw_document()}},
+        "inside `statistics`, which _slim_collection(full=True) copies verbatim",
+        parked="`statistics` is copied through unread -- see docs/implementation-notes.md",
     ),
-    (
+    NotShaping(
         "list_entitysets",
         {"collection": "42"},
-        "GET",
         "/api/2/entitysets",
-        {
-            "total": 1,
-            "results": [
-                {"id": "es1", "type": "list", "entities": ["e1"], "entity": raw_document()}
-            ],
-        },
+        {"total": 1, "results": [{"id": "es1", "type": "list", "entities": [raw_document()]}]},
+        "inside `entities`, which _slim_entityset copies verbatim",
+        parked="`entities` is copied through unread -- see docs/implementation-notes.md",
     ),
-    (
+    NotShaping(
         "get_entityset",
         {"entityset_id": "es1"},
-        "GET",
         "/api/2/entitysets/es1",
-        {"id": "es1", "type": "list", "entities": ["e1"], "entity": raw_document()},
+        {"id": "es1", "type": "list", "entities": [raw_document()]},
+        "inside `entities`, which _slim_entityset copies verbatim",
+        parked="`entities` is copied through unread -- see docs/implementation-notes.md",
     ),
-    (
+    NotShaping(
         "entity_tags",
         {"entity_id": "e1"},
-        "GET",
         "/api/2/entities/e1/tags",
-        {
-            "total": 1,
-            "results": [{"field": "names", "value": "Acme", "count": 3}],
-            "entity": raw_document(),
-        },
+        {"total": 1, "results": [{"field": "names", "value": raw_document(), "count": 3}]},
+        "a tag row's `value`; _slim_tags bounds strings and copies everything else",
+        parked="a non-string tag value is copied through -- see docs/implementation-notes.md",
     ),
-    (
+    NotShaping(
         "profile_tags",
         {"profile_id": "p1"},
-        "GET",
         "/api/2/profiles/p1/tags",
-        {
-            "total": 1,
-            "results": [{"field": "names", "value": "Acme", "count": 3}],
-            "entity": raw_document(),
-        },
+        {"total": 1, "results": [{"field": "names", "value": raw_document(), "count": 3}]},
+        "a tag row's `value`; _slim_tags bounds strings and copies everything else",
+        parked="a non-string tag value is copied through -- see docs/implementation-notes.md",
     ),
-    # The whole upstream entity is this endpoint's payload. It returns document text on
-    # purpose, in a bounded fence -- what it must not return is the entity around it.
-    ("get_entity_text", {"entity_id": "d1"}, "GET", "/api/2/entities/d1", raw_document()),
+    NotShaping(
+        "get_entity_text",
+        {"entity_id": "d1"},
+        "/api/2/entities/d1",
+        raw_document(),
+        "the whole upstream entity; the text is what this endpoint is for",
+        text_is_the_answer=True,
+    ),
+    NotShaping("aclose", {}, None, None, "takes no payload and issues no request"),
 )
+
+NOT_SHAPING_PARAMS = [
+    pytest.param(
+        case,
+        id=case.method,
+        marks=[pytest.mark.xfail(strict=True, reason=case.parked)] if case.parked else [],
+    )
+    for case in NOT_SHAPING_CASES
+]
 
 
 def test_every_unshaped_endpoint_has_a_negative_case() -> None:
     """Declaring a method entity-free is a claim, and this is what makes it checkable."""
-    covered = {name for name, *_ in NOT_SHAPING_CASES} | _NOT_AN_ENDPOINT
+    covered = {case.method for case in NOT_SHAPING_CASES}
     assert covered == NOT_ENTITY_RETURNING, (
         f"declared to return no entities but never checked: "
         f"{sorted(NOT_ENTITY_RETURNING - covered)}; "
         f"checked but no longer declared: {sorted(covered - NOT_ENTITY_RETURNING)}. "
-        "Add a NOT_SHAPING_CASES row feeding the method a payload with an entity in it. "
-        "If the row cannot be made to pass, the method returns entities: decorate it with "
-        "@_shaped and give it a SHAPING_CASES row instead."
+        "Add a NOT_SHAPING_CASES row feeding the method a payload with an entity in the "
+        "position it copies through. If the row cannot be made to pass, the method returns "
+        "entities: decorate it with @_shaped and give it a SHAPING_CASES row instead."
     )
 
 
-@pytest.mark.parametrize(
-    ("method", "kwargs", "verb", "path", "payload"),
-    NOT_SHAPING_CASES,
-    ids=[case[0] for case in NOT_SHAPING_CASES],
-)
+@pytest.mark.parametrize("case", NOT_SHAPING_PARAMS)
 async def test_a_method_declared_unshaped_returns_nothing_entity_shaped(
-    client: AlephClient,
-    respx_mock: respx.MockRouter,
-    method: str,
-    kwargs: dict[str, Any],
-    verb: str,
-    path: str,
-    payload: dict[str, Any],
+    client: AlephClient, respx_mock: respx.MockRouter, case: NotShaping
 ) -> None:
-    """Hand the method an entity and check none comes back.
+    """Hand the method a document where it would copy one through, and check none survives.
 
-    `_entities_in` is the same walk `_shape` guards with, run over the reply instead of
-    inside it, so what this test calls an entity is what the seam calls one.
+    Two assertions, because either alone is escapable. `_entities_in` is the same walk
+    `_shape` guards with, so what this calls an entity is what the seam calls one -- but it
+    only recognises a dict carrying both `schema` and `properties`, so an entity taken apart
+    on the way through would slip past it. The document-text check is position-independent
+    and shape-independent: `raw_document()` populates every blob property, and none of those
+    bodies has any business in a reply from a method that claims to return no entities.
     """
-    respx_mock.request(verb, path).mock(return_value=httpx.Response(200, json=payload))
+    if case.path is None:
+        wire = respx_mock.route().mock(return_value=httpx.Response(200, json={}))
+        assert await getattr(client, case.method)(**case.kwargs) is None
+        assert wire.call_count == 0, f"{case.method} issued a request: {case.position}"
+        assert_model_not_fetched(respx_mock)
+        return
 
-    out = await getattr(client, method)(**kwargs)
+    respx_mock.get(case.path).mock(return_value=httpx.Response(200, json=case.payload))
+
+    out = await getattr(client, case.method)(**case.kwargs)
 
     # Without this the case is satisfiable by finding nothing on both sides.
-    assert list(_entities_in(payload)), (
-        f"{method}: this case's payload carries no entity, so it proves nothing"
+    assert list(_entities_in(case.payload)), (
+        f"{case.method}: this case's payload carries no entity, so it proves nothing"
     )
     leaked = list(_entities_in(out))
     assert not leaked, (
-        f"{method} is declared in NOT_ENTITY_RETURNING but returned "
-        f"{[e.get('id') for e in leaked]} unshaped. Either it belongs behind @_shaped with "
-        "a SHAPING_CASES row, or the field carrying the entity must stop being copied "
+        f"{case.method} is declared in NOT_ENTITY_RETURNING but returned "
+        f"{[e.get('id') for e in leaked]} unshaped, from {case.position}. Either it belongs "
+        "behind @_shaped with a SHAPING_CASES row, or that field must stop being copied "
         "through."
     )
+    if not case.text_is_the_answer:
+        bodies = [prop for prop in BLOB_PROPS if f"<{prop} body>" in repr(out)]
+        assert not bodies, (
+            f"{case.method} returned document text ({', '.join(bodies)}) from "
+            f"{case.position}, which is the cost the shaping seam exists to prevent"
+        )
 
 
 def test_every_shaped_endpoint_has_a_shaping_case() -> None:
