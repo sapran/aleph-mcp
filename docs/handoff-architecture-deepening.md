@@ -19,8 +19,8 @@ Update this table as tasks land; it is the single source of truth for what is do
 | T1 | Shape the reply on the way out | **ACCEPTED WITH CONDITIONS** | #13, merged `8f1824d` | Deepening proven; four findings open — see T1-FIX |
 | T1-FIX | Close the T1 review findings | **ACCEPTED** | #14, merged `3b3059c` | All four findings closed and mutation-verified |
 | T1-FIX-2 | Close the two PR #14 regressions | **ACCEPTED** | #14 (same branch), merged `3b3059c` | Both blockers + all five recommendations closed; reviewed by all three pr-review-toolkit agents, one substantive finding found and fixed |
-| **T2** | **Give the bounded-echo rule a module** | **NEXT — unblocked** | — | Touches `client.py` + `errors.py` |
-| T5 | Collection scope module | blocked by T2 | — | |
+| T2 | Give the bounded-echo rule a module | **ACCEPTED** | #15, merged `9a894fa` | New `echo.py`; four contexts verified byte-identical to `develop`; all three scope traps respected |
+| **T5** | **Collection scope module** | **NEXT — unblocked** | — | Base `develop` @ `9a894fa`; refresh this task's header before starting |
 | T4 | Lift the transport | blocked by T5 | — | Run last |
 
 Out-of-band, not blocking any task: `.github/workflows/ci.yml` still triggers `push: branches: [main]`,
@@ -892,15 +892,24 @@ Submit: a pushed branch, an open PR, and a PR body containing —
    weaken it.
 6. Anything you parked in `docs/implementation-notes.md`.
 
-The PM then, independently:
+**You run the review fleet, not the PM.** Before submitting, run
+`pr-review-toolkit:code-reviewer` and `pr-review-toolkit:silent-failure-hunter` on your diff, plus
+`pr-review-toolkit:pr-test-analyzer` if you added tests. Report every finding in the PR body with
+its resolution — fixed, or dismissed with a reason. A finding you dismissed is not a problem; a
+finding you did not mention is.
+
+The PM then, independently — and **does not re-run those three agents**, because you already did,
+and running them twice doubles the wall-clock wait for the same output:
 
 - Re-runs the full suite from a clean checkout of the branch. Your reported count is not evidence.
 - Re-runs Gate A from a pristine `develop` worktree.
+- **Runs a differential** against `develop` on the behaviour your task was supposed to preserve —
+  same inputs both sides, outputs compared. This is the check your own review cannot make for you,
+  because it needs the before-state.
 - **Re-derives at least one red-test claim** by reintroducing the defect and watching it fail. A
   test asserted to catch something, that does not, is the single failure mode this protocol exists
   to catch.
-- Runs `pr-review-toolkit:code-reviewer` and `pr-review-toolkit:silent-failure-hunter` on the diff,
-  plus `pr-review-toolkit:pr-test-analyzer` where tests were added.
-- Reads the diff for scope creep against the "explicitly out of scope" list.
+- Reads the diff for scope creep against the "explicitly out of scope" list, and spot-checks the
+  findings you reported rather than rediscovering them.
 
 Findings come back to you to fix or dismiss with a reason. Nothing merges until they are closed.
