@@ -523,7 +523,7 @@ class AlephClient:
         over it would be worse than deriving it from a fixed order.
 
         A *local* refusal is not that. `get_model()` reaches the wire through
-        `_request(..., resource=True)`, which converts a `ReadOnlyViolation` into a
+        `Transport.request(..., resource=True)`, which converts a `ReadOnlyViolation` into a
         `ResourceError` -- so the bare `except Exception` this replaces also ate readonly.py
         refusing to let a request leave the configured origin, and there is no logging in
         this package, so it left no trace at all. Measured before this change: a metadata

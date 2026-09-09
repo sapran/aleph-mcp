@@ -334,7 +334,7 @@ async def test_a_resolved_hit_must_be_the_collection_that_was_asked_for(
 async def test_a_non_dict_listing_row_is_a_tool_error_not_an_attribute_error(
     client: AlephClient, respx_mock: respx.MockRouter
 ) -> None:
-    """`_request` wraps a non-dict JSON body as `{"results": <body>}`, so a bare array
+    """`Transport.request` wraps a non-dict JSON body as `{"results": <body>}`, so a bare array
     upstream makes `results[0]` a string. `.get` on it would raise AttributeError, which
     no tool's `except ValueError` translates — the caller would see an unhandled exception
     instead of a legible refusal."""

@@ -284,3 +284,23 @@ Retired since the last prune:
   `scope.py` (T5) or `transport.py` (T4). Documentation only -- no spec assertion depends on it --
   so it is parked rather than corrected inside a behaviour-preserving refactor. One paragraph to
   fix, and cheapest to do once rather than once per task.
+
+- **A non-2xx whose body is over the ceiling is reported as a ceiling refusal, never as the
+  status.** `transport.py`: `_read_bounded` runs before `raise_for_status` and does not look at
+  `resp.status_code`, so a 502 with a >25 MiB body raises `TooLargeToolError` and the 502 is
+  discarded. Measured identical on `develop` and the T4 branch: a 502 with a plain body costs 4
+  requests and says "unexpected HTTP 502"; a 502 with an oversized body costs **16** requests --
+  the shrink loop re-asks four times, each paying four transport retries because 502 is in
+  `_RETRY_STATUS` -- and tells the model to narrow its query, never that the instance is failing.
+  Only `search_entities`' deadline bounds it. Related inaccuracy: `errors.py`'s comment claims the
+  error path "has its own, much smaller bound"; the 64 KiB limit in `_upstream_detail` bounds only
+  what is *quoted*, and above the ceiling the error path is never reached at all. Found by review
+  during T4; pre-existing, and fixing it changes a refusal message, so it is a behaviour change.
+
+- **`AlephClient.aclose` delegation is untested.** Making it a no-op leaves the whole suite green,
+  on `develop` (where it closed `_http` directly) as well as on the T4 branch (where it delegates
+  to `Transport.aclose`). Found by review during T4; pre-existing.
+
+- **`verify_tls` has no test anywhere.** Zero hits across `tests/`, so nothing pins that
+  `ALEPH_MCP_VERIFY_TLS` reaches the httpx client at all. Found by review during T4;
+  pre-existing. Related to the parked TLS-failure-retry note above.

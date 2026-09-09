@@ -326,7 +326,8 @@ def test_the_shrink_arithmetic_always_decreases() -> None:
 async def test_the_shrink_loop_stops_at_the_tool_call_deadline(
     client: AlephClient, respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`_request` bounds each request on its own budget, but a shrink issues a fresh one.
+    """`Transport.request` bounds each request on its own budget, but a shrink issues a
+    fresh one.
 
     Without a deadline across the loop, four hops against a slow upstream multiply that
     budget by MAX_SEARCH_SHRINKS + 1 — the same amplification the per-request budget exists
@@ -1957,8 +1958,9 @@ async def test_a_metadata_body_that_does_not_parse_degrades_rather_than_failing(
     """A body that is not JSON is upstream's fault, whatever it fails to be.
 
     Three of these four are not valid UTF-8, and that distinction used to decide the
-    outcome: `_request` ends at `jsonlib.loads(body)` on *bytes*, so json decodes first and
-    raises `UnicodeDecodeError` -- a sibling of `JSONDecodeError` under `ValueError`, not a
+    outcome: `Transport.request` ends at `jsonlib.loads(body)` on *bytes*, so json decodes
+    first and raises `UnicodeDecodeError` -- a sibling of `JSONDecodeError` under `ValueError`,
+    not a
     subclass. With only `JSONDecodeError` caught, all ten shaped tools hard-failed on these
     three and kept failing, because only a success is cached. Worse, `UnicodeDecodeError` is
     a `ValueError`, so `server.py`'s seam dressed it up as a caller-actionable refusal
@@ -1981,8 +1983,9 @@ async def test_a_metadata_read_timeout_degrades_rather_than_failing(
 ) -> None:
     """The arm most likely to fire on a real instance, and nothing reached it.
 
-    `_request` retries connect failures only -- read-side faults are deliberately excluded,
-    because they cannot be told apart from a request Aleph did receive -- so a `ReadTimeout`
+    `Transport.request` retries connect failures only -- read-side faults are deliberately
+    excluded, because they cannot be told apart from a request Aleph did receive -- so a
+    `ReadTimeout`
     leaves `get_model` as a raw httpx error. "The model was slow" is literally this case,
     and it is the one the fallback exists for. Measured: deleting the whole arm left the
     suite green at 380 passed.

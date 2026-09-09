@@ -6,11 +6,11 @@ the slimmer would accept. `Transport` is constructible on its own, so most of th
 say what they mean: a route, a status or a fault, and an assertion about the budget, the
 ceiling or the error.
 
-Two are deliberately still driven through `AlephClient`. They patch
-`aleph_mcp.client._monotonic`, so they are also the tripwire on the wiring: if the client
-stopped handing the transport its clock, the transport would fall back to the real one and
-both would fail. `test_the_client_hands_the_transport_its_own_clock` names that invariant
-directly.
+Four are deliberately driven through `AlephClient` instead, because a fixture-built
+`Transport` cannot see a *client* that builds its own transport wrongly. Two patch
+`aleph_mcp.client._monotonic` and so pin the clock wiring; the other two assert on the
+credential and the split timeout, both of which review showed a suite-wide green could hide
+when the transport under test was one the test built itself.
 """
 
 import asyncio
@@ -30,6 +30,7 @@ from aleph_mcp.transport import (
     MAX_RETRY_SLEEP_SECS,
     Transport,
 )
+from tests.conftest import assert_model_not_fetched
 
 # An allowlisted read route -- readonly.py refuses anything else before it reaches the
 # wire, so a transport test cannot invent a path. The bodies below are chosen to be
@@ -50,9 +51,15 @@ async def test_the_transport_answers_a_body_no_aleph_endpoint_would_send(
 ) -> None:
     """The seam is real if it can be exercised alone. Nothing here is Aleph-shaped: no
     results envelope, no entity, no model fetch — just a decoded JSON object returned to
-    the caller."""
+    the caller.
+
+    "No model fetch" is asserted rather than merely stated: the shaping seam above fetches
+    the instance model on every entity-bearing reply, and a transport that fetched anything
+    of its own would be reaching for an Aleph payload after all.
+    """
     respx_mock.get(PROBE).mock(return_value=httpx.Response(200, json={"anything": 1}))
     assert await transport.request("GET", PROBE, context="probe") == {"anything": 1}
+    assert_model_not_fetched(respx_mock)
 
 
 async def test_the_client_hands_the_transport_its_own_clock(
@@ -67,9 +74,13 @@ async def test_the_client_hands_the_transport_its_own_clock(
     assert client._transport._monotonic() == 1234.5
 
 
-async def test_sends_apikey_header(transport: Transport, respx_mock: respx.MockRouter) -> None:
+async def test_sends_apikey_header(client: AlephClient, respx_mock: respx.MockRouter) -> None:
+    """Driven through the client's own transport, not a fixture-built one. Review measured
+    the difference: with a `Transport` the test builds itself, a client that hands its
+    transport settings carrying no credential leaves the whole suite green, because nothing
+    else asserts the client's own request is authenticated."""
     route = respx_mock.get(PROBE).mock(return_value=httpx.Response(200, json={}))
-    await transport.request("GET", PROBE, context="probe")
+    await client._transport.request("GET", PROBE, context="probe")
     assert route.calls.last.request.headers["Authorization"] == "ApiKey test_key"
 
 
@@ -251,13 +262,18 @@ async def test_a_slow_connect_is_charged_to_the_retry_budget(
 
 
 async def test_the_connect_phase_is_capped_below_the_request_timeout(
-    transport: Transport,
+    client: AlephClient,
 ) -> None:
     """A bare float timeout gives httpx one value for every phase, so connect alone would
-    eat the whole budget and no retry could fit inside it."""
-    timeout = transport._http.timeout
+    eat the whole budget and no retry could fit inside it.
+
+    Asserted on the client's own transport for the same reason as the header test above: a
+    fixture-built `Transport` cannot see a client that builds its transport with the wrong
+    timeout, and that is the regression this pins.
+    """
+    timeout = client._transport._http.timeout
     assert timeout.connect == MAX_CONNECT_SECS
-    assert timeout.read == transport._settings.timeout_secs
+    assert timeout.read == client._settings.timeout_secs
     assert timeout.connect < timeout.read
 
 
