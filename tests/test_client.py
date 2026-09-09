@@ -1923,34 +1923,50 @@ class NotShaping(NamedTuple):
 # genuinely new path, so the leak needs a method reusing an allowlisted one: a second view of
 # expand, a raw-entity fetch helper, a paging variant. That is ordinary, not exotic.
 #
-# Every probe sits in the position that method actually copies through, not merely somewhere
-# in the payload. That distinction was measured to matter: with the probe parked in a field
-# the method structurally drops, five of these rows could not have failed whatever the code
-# did, and moving each into its real copy-through field made all five return a complete
-# document.
+# Every probe sits where that method would surface it if it stopped selecting and started
+# copying -- not merely somewhere in the payload. That distinction was measured to matter
+# twice: with probes parked in a field the method structurally drops, five of these rows
+# could not have failed whatever the code did, and moving each into its real copy-through
+# field made all five return a complete document; a second pass found two more rows with the
+# same defect among the ontology methods below.
 NOT_SHAPING_CASES: tuple[NotShaping, ...] = (
-    # The three ontology methods select a key rather than copying the payload. The probe
-    # sits beside the key they select, so the row fails if one ever starts copying.
+    # The three ontology methods select rather than copy, and each selects from a different
+    # depth -- so the probe has to go at that method's own depth or the row cannot fail for
+    # any defect confined to it. Measured: with all three probing top-level `results`,
+    # `get_schema` stayed green even when rewritten to return `{**model, **schema}`, and
+    # `list_schemata` only went red when `get_model` was broken too -- which `get_model`'s
+    # own row already catches.
     NotShaping(
         "get_model",
         {},
         "/api/2/metadata",
         {**raw_model(), "results": [raw_document()]},
-        "beside the `model` key it selects",
+        "beside the `model` key it selects out of the payload",
     ),
     NotShaping(
         "list_schemata",
         {},
         "/api/2/metadata",
-        {**raw_model(), "results": [raw_document()]},
-        "beside the `model` key it reduces to counts and name lists",
+        {"model": {**raw_model()["model"], "leaked": raw_document()}},
+        "inside the `model` it reduces to counts and name lists",
     ),
     NotShaping(
         "get_schema",
         {"name": "Person"},
         "/api/2/metadata",
-        {**raw_model(), "results": [raw_document()]},
-        "beside the `model` key it indexes into",
+        {
+            "model": {
+                **raw_model()["model"],
+                "schemata": {
+                    **raw_model()["model"]["schemata"],
+                    "Person": {
+                        **raw_model()["model"]["schemata"]["Person"],
+                        "leaked": raw_document(),
+                    },
+                },
+            }
+        },
+        "inside the `Person` schema it builds a fixed key set from",
     ),
     NotShaping(
         "list_collections",

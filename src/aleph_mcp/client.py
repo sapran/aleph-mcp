@@ -640,6 +640,12 @@ class AlephClient:
             # every caption on the instance. That property is pinned by a test, because
             # deleting this arm entirely, or appending `except Exception` after it, both left
             # the suite green at 380 passed.
+            #
+            # One live counterexample to that reading, pre-existing and recorded in
+            # docs/implementation-notes.md rather than fixed here: `model.get("schemata")`
+            # below is outside this try, so an upstream `model` that is truthy but not a dict
+            # raises AttributeError there and means "upstream sent nonsense", not "this module
+            # has a bug".
             return None
         schemata = model.get("schemata")
         return schemata if isinstance(schemata, dict) else None

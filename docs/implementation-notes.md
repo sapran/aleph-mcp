@@ -146,6 +146,29 @@ Retired since the last prune:
   would have captioned. Found during T1; fixing it changes a tool's output and so is a behaviour
   change, not a refactor.
 
+- **A non-dict `model` from `/api/2/metadata` is a permanent hard failure.** `get_model` caches
+  `payload.get("model") or {}` with no type check, and `_schemata` reads `model.get("schemata")`
+  outside its own try, so a metadata body like `{"model": "https://..."}`, `{"model": [..]}`,
+  `{"model": 3}` or `{"model": NaN}` (Python's json accepts bare NaN) raises `AttributeError`
+  there. It reaches the caller as `Error calling tool '<name>': 'str' object has no attribute
+  'get'` — prefixed, erased under masking — and because the bad value *is* cached it never
+  refetches, so all ten shaped tools plus `list_schemata`, `get_schema` and the `aleph://schemata`
+  resource stay broken for the process lifetime. Pre-existing and unchanged by T1-FIX-2, verified
+  identical at `1e8e74c`; parked because fixing it is a behaviour change outside that brief. It is
+  also the one live counterexample to the "an AttributeError here means a defect in this module"
+  reading that `_schemata`'s comment states. One line in `get_model` closes it:
+  `model = payload.get("model"); self._model = model if isinstance(model, dict) else {}`.
+
+- **The marker guard covers every tool but only one of three resources.** `find_marker` runs inside
+  `_refusing`, so `collections_resource` and `schemata_resource` — which are not decorated with
+  `@_as_resource_error` — return without it. Inert today: both call unshaped client methods that
+  build no markers. It becomes real only if a resource is ever pointed at a `@_shaped` method.
+
+- **`find_marker` does not traverse tuples, sets or dict keys.** A marker in one of those positions
+  is not found. No client method builds a tuple, a set or a non-string key into a reply, so nothing
+  reaches those branches today, and the markers' own serialisation refusal still fires there — the
+  outcome degrades to the pre-T1-FIX-2 message rather than leaking.
+
 - **`_schemata()` does not cache its failures.** `get_model` memoises only a success, and
   `_schemata` swallows every exception, so a persistently broken `/api/2/metadata` costs the full
   retry budget on *every* entity-returning call while still returning `None`. Found during T1 and
