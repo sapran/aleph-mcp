@@ -29,6 +29,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Final, Literal
 
+# Spelled once, at runtime, because `Literal` is a typing construct only: nothing stops a
+# caller — or a typo in this file — from constructing a policy with a third value.
+_OVERFLOW_KINDS: Final = ("count", "ellipsis")
+
 
 @dataclass(frozen=True)
 class Policy:
@@ -46,6 +50,22 @@ class Policy:
     collapse_whitespace: bool = False
     quote: str | None = None
     overflow: Literal["count", "ellipsis"] = "ellipsis"
+
+    def __post_init__(self) -> None:
+        """Refuse a policy that would fail open, loudly and at construction.
+
+        A cap below 1 does not bound anything: `text[:-1]` slices from the *end*, so a
+        negative cap emits nearly the whole string and still appends the truncation
+        marker — `max_chars=-1` returns 4,999 of 5,000 characters labelled
+        `… [+5001 chars]`. That reads as a bounded echo to anything downstream, which is
+        the worst shape a misconfiguration can take here. `overflow` is a `Literal`, and
+        `Literal` is erased at runtime, so a typo would silently downgrade a value's
+        overflow reporting to a bare ellipsis.
+        """
+        if self.max_chars < 1:
+            raise ValueError(f"{self.name}: max_chars must be at least 1, got {self.max_chars}")
+        if self.overflow not in _OVERFLOW_KINDS:
+            raise ValueError(f"{self.name}: unknown overflow {self.overflow!r}")
 
 
 # A property value inside a slimmed entity, a facet bucket label, a tag row. This is
@@ -84,7 +104,17 @@ def render(text: str, policy: Policy) -> str:
     so the cap counts the characters the model actually receives. Collapsing a multi-line
     body first is what lets a long one fit at all; capping first would spend the budget on
     whitespace and then still emit the ellipsis.
+
+    Non-string input is refused rather than passed through. Under the two verbatim policies
+    every transform below is skipped, so a `list` or a `bytes` would reach the length check,
+    satisfy it, and be returned unshaped — and a nested list is exactly what `json.loads`
+    yields for an Aleph property value. Every call site guards with `isinstance` or `str()`
+    today, but the payloads are `Any`, so mypy cannot enforce that; this is the seam those
+    call sites are asked to trust, and a seam that fails open on its own input class is
+    worse than no seam.
     """
+    if not isinstance(text, str):
+        raise TypeError(f"{policy.name}: expected str, got {type(text).__name__}")
     if policy.unprintable is not None:
         text = "".join(ch if ch.isprintable() else policy.unprintable for ch in text)
     if policy.collapse_whitespace:

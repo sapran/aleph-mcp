@@ -2,7 +2,7 @@ import httpx
 import pytest
 from fastmcp.exceptions import ResourceError, ToolError
 
-from aleph_mcp.errors import raise_for_status
+from aleph_mcp.errors import raise_for_status, raise_unreachable
 
 
 def _resp(status: int, text: str = "") -> httpx.Response:
@@ -114,4 +114,15 @@ def test_the_upstream_echo_is_capped_at_the_length_this_path_chose() -> None:
     with pytest.raises(ToolError) as exc:
         raise_for_status(_json_resp(400, {"message": "z" * 201}), context="ctx")
     quoted = str(exc.value).split('(untrusted upstream text): "', 1)[1].rstrip('"')
+    assert quoted == "z" * 200 + "\u2026"
+
+
+def test_the_transport_echo_is_capped_at_the_length_this_path_chose() -> None:
+    """The second `UPSTREAM_ERROR` call site. Its treatment is pinned by
+    `test_the_unreachable_message_labels_the_transport_text_as_untrusted`, which catches a
+    policy swap on the quote difference — but nothing pinned the number, so a cap drift
+    here was invisible."""
+    with pytest.raises(ToolError) as exc:
+        raise_unreachable(RuntimeError("z" * 201), context="ctx", attempts=1)
+    quoted = str(exc.value).split('untrusted transport text: "', 1)[1].split('"', 1)[0]
     assert quoted == "z" * 200 + "\u2026"

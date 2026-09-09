@@ -92,6 +92,35 @@ def test_upstream_error_strips_controls_collapses_lines_and_neutralises_quotes()
     assert render('a\n\n  b\x1b"c"\td', UPSTREAM_ERROR) == "a b 'c' d"
 
 
+@pytest.mark.parametrize(
+    "bad", [["z" * 100_000], b"bytes", {"a": 1}, ("t",)], ids=["list", "bytes", "dict", "tuple"]
+)
+def test_render_refuses_a_non_string_rather_than_passing_it_through(bad: object) -> None:
+    """The verbatim policies skip every transform, so anything with a `__len__` under the
+    cap would sail through the length check and come back unshaped. A nested list is what
+    `json.loads` yields for an Aleph property value, and the payload is typed `Any`, so the
+    `isinstance` guards at the call sites are the only thing enforcing this — and mypy
+    cannot check them. Fail loudly at the seam the call sites are told to trust."""
+    with pytest.raises(TypeError):
+        render(bad, PROPERTY_VALUE)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("cap", [0, -1, -50])
+def test_a_policy_refuses_a_cap_that_would_fail_open(cap: int) -> None:
+    """`text[:-1]` slices from the end, so a negative cap emits nearly the whole string and
+    still appends the truncation marker — it reads as a bounded echo while bounding nothing.
+    A misconfiguration that makes the guard inert must be loud and fatal at construction."""
+    with pytest.raises(ValueError, match="max_chars"):
+        Policy(name="broken", max_chars=cap)
+
+
+def test_a_policy_refuses_an_overflow_kind_it_does_not_implement() -> None:
+    """`Literal` is erased at runtime, so a typo would fall to the `else` branch and quietly
+    downgrade a property value's `… [+N chars]` to a bare ellipsis."""
+    with pytest.raises(ValueError, match="overflow"):
+        Policy(name="broken", max_chars=10, overflow="Count")  # type: ignore[arg-type]
+
+
 def test_upstream_error_caps_what_the_model_receives_not_the_raw_body() -> None:
     """Collapsing runs before the cap, so the cap counts characters the model actually gets.
 
