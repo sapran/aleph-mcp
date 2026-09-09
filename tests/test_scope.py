@@ -183,6 +183,19 @@ def test_a_named_scope_reports_the_resolved_ids() -> None:
     assert scope.reported() == ["874", "12"]
 
 
+def test_a_scope_of_no_collections_cannot_be_constructed() -> None:
+    """The empty tuple is the one construction that fails open, so the type refuses it.
+
+    It renders byte-identically to the sentinel — no filter, so Aleph answers across every
+    readable collection — while reporting `searched.collection: []` and suppressing the
+    EVERY COLLECTION note. `parse_scope` cannot produce it; without this guard that is a
+    property of the current control flow rather than of the type, and the docstring above
+    would be a claim nothing checks.
+    """
+    with pytest.raises(ValueError, match="names no collection"):
+        CollectionScope(())
+
+
 # -- resolve: the lookup, the dedup, the cache, the deadline -------------------
 
 
@@ -197,6 +210,31 @@ async def test_two_spellings_of_one_collection_collapse_to_one_filter() -> None:
     scope = await resolver(upstream).resolve_scope(["874", "my-case"], context="search_entities")
     assert scope.reported() == ["874"]
     assert scope.search_filters() == [("filter:collection_id", "874")]
+
+
+async def test_the_all_collections_literal_resolves_to_the_sentinel() -> None:
+    """`"*"` must arrive as the sentinel, not as a scope of zero collections.
+
+    The two are indistinguishable on the wire and differ only in what the reply says, so
+    this is the join between `parse_scope("*") is None` and the rendering tests above —
+    which each hold their own end and neither of which pins the path between them.
+    """
+    scope = await resolver().resolve_scope(ALL_COLLECTIONS, context="search_entities")
+    assert scope.collections is None
+    assert scope.is_every_collection
+    assert scope.reported() == ALL_COLLECTIONS
+    assert scope.search_filters() == []
+
+
+async def test_a_foreign_id_the_instance_does_not_know_is_refused() -> None:
+    """An empty listing is a refusal naming the tool that can enumerate collections, not
+    an empty scope — an empty scope would search every collection instead."""
+    upstream = FakeUpstream({"my-case": "874"})
+    resolve = resolver(upstream)
+    with pytest.raises(ValueError, match="list_collections"):
+        await resolve.resolve_one("no-such-case", context="get_collection")
+    assert upstream.calls == [("no-such-case", "get_collection")]
+    assert resolve.cached == {}
 
 
 async def test_a_verified_hit_is_cached_and_costs_one_lookup() -> None:
@@ -251,6 +289,27 @@ async def test_the_resolution_deadline_stops_a_scope_that_runs_long() -> None:
     assert upstream.calls == [("first", "search_entities")], (
         "the deadline must stop the phase, not merely report it afterwards"
     )
+
+
+async def test_the_budget_is_read_at_call_time_not_captured() -> None:
+    """`AlephClient` passes a callable, not a value, and a comment says why.
+
+    A resolver that captured the budget at construction passes every other test in the
+    suite, so that comment was a claim nothing checked — and the claim matters: the
+    settings object is what a test adjusts to exercise a short budget, and it is adjusted
+    after the client is built.
+    """
+    upstream = FakeUpstream({"first": "874", "second": "12"})
+    budget = [30.0]
+    ticks = [0.0, 61.0]
+
+    def clock() -> float:
+        return ticks.pop(0) if len(ticks) > 1 else ticks[0]
+
+    resolve = CollectionResolver(lookup=upstream, timeout_secs=lambda: budget[0], monotonic=clock)
+    budget[0] = 45.0
+    with pytest.raises(ValueError, match=r"exceeded this call's 45.0s budget"):
+        await resolve.resolve_scope(["first", "second"], context="search_entities")
 
 
 async def test_an_upstream_id_echoed_into_a_refusal_is_bounded_and_escaped() -> None:

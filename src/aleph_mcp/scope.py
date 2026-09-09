@@ -9,9 +9,13 @@ names no collection is refused rather than passed on.
 The three halves are separated because each fails differently:
 
 *Parse* is pure and refuses without I/O. That is load-bearing rather than tidy —
-`openspec/specs/mcp-tool-surface` promises that a refused call costs no collection lookup,
-so a scope naming nothing must be reported before anything is sent. It is also what lets
-those refusals be tested without a mocked upstream.
+`openspec/specs/mcp-tool-surface` promises that a call refused on its own arguments costs
+no collection lookup, so every refusal that can be reached by reading the value is made
+before anything is sent. It is also what lets those refusals be tested without a mocked
+upstream. One deliberate exception, stated because the promise is easy to over-read: a
+*list* resolves element by element, so an element naming nothing is refused only once the
+elements before it have resolved — `["my-case", ""]` costs one lookup before it is
+refused. That is `develop`'s behaviour, preserved here rather than quietly tightened.
 
 *Resolve* owns the one upstream request the scope needs, the `foreign_id` listing, and the
 cache that stops a session paying for it twice. It reaches HTTP through an injected
@@ -192,6 +196,24 @@ class CollectionScope:
     """
 
     collections: tuple[ResolvedCollection, ...] | None
+
+    def __post_init__(self) -> None:
+        """Refuse the one construction that fails open, loudly and at build time.
+
+        An empty tuple renders byte-identically to the sentinel — no filter, so Aleph
+        answers across every readable collection — while `is_every_collection` stays False,
+        so the reply reports `searched.collection: []` and the EVERY COLLECTION note is
+        suppressed. A cross-collection search, reported as a scoped one, with no error
+        anywhere: exactly the failure this module exists to prevent, reachable only by
+        building the type wrongly. `parse_scope` cannot produce it, and this is what keeps
+        that true rather than merely stated. `echo.Policy` refuses a fail-open cap the same
+        way and for the same reason.
+        """
+        if self.collections is not None and not self.collections:
+            raise ValueError(
+                "CollectionScope: an empty scope names no collection and would search "
+                "every readable one; pass None for the all-collections scope"
+            )
 
     @property
     def is_every_collection(self) -> bool:
