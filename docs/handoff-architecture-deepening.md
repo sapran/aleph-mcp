@@ -769,25 +769,54 @@ fix `get_model` caching a non-dict `model`, also parked.
 # T5 — Make the collection scope a module that renders itself
 
 **Tier 2**: a silently-wrong scope is the data-integrity failure the spec exists to prevent.
+**Base branch: `develop` @ `956dedd`** — **408 passed, 31 skipped, 5 xfailed**.
 **Files**: `src/aleph_mcp/client.py`, `tests/test_collection_scope.py`, plus a new module.
+
+> Re-measured against `develop @ 956dedd` on 2026-09-09, after T1, T1-FIX, T1-FIX-2 and T2 landed.
+> `client.py` is 1580 lines and `tests/test_collection_scope.py` is 506, not the figures in the
+> historical baseline table. Line numbers below are current — verify before trusting them, and if
+> one disagrees with what you see, believe the code and say so.
 
 ### Problem
 
-Collection scope is the hottest concept in recent history — `require-explicit-collection-scope`, a
-494-line dedicated test file — and `openspec/specs/mcp-tool-surface` names it. It exists as:
+Collection scope is the hottest concept in this codebase's history — `require-explicit-collection-scope`,
+a dedicated 506-line test file — and `openspec/specs/mcp-tool-surface` names it. It exists as
+scattered parts of `client.py`, which also does HTTP:
 
-- two private methods on the module that also does HTTP (`_resolve_collection_id`,
-  `_resolve_collection_scope`),
-- a type alias (`Scope`), three constants (`ALL_COLLECTIONS`, `MAX_SCOPE_COLLECTIONS`,
-  `_COLLECTION_ID`), a validator (`_check_collection_id`), and a cache dict (`_foreign_ids`).
+| Part | Line |
+|---|---|
+| `_COLLECTION_ID` pattern | 93 |
+| `ALL_COLLECTIONS` sentinel | 100 |
+| `Scope` type alias | 106 |
+| `MAX_SCOPE_COLLECTIONS` | 112 |
+| `_check_collection_id` | 127 |
+| `_foreign_ids` cache | 532 |
+| `_resolve_collection_id` | 831 |
+| `_resolve_collection_scope` | 902 |
 
-And three call sites each re-derive how a resolved scope becomes a query parameter:
+Seven call sites depend on them — `_resolve_collection_id` from `get_collection` (828),
+`list_entitysets` (1341), `xref_results` (1406) and twice inside `_resolve_collection_scope`
+(919, 956); `_resolve_collection_scope` from `search_entities` (1024) and `match_entity` (1232).
 
-- `client.py:774` — `filter:collection_id`, one per id (search)
-- `client.py:968` — `collection_ids`, one per id (match)
-- `client.py:1067` — `filter:collection_id`, single id (entitysets)
+And three sites each re-derive how a resolved scope becomes a query parameter:
+
+- `client.py:1044` — `filter:collection_id`, one per id (search)
+- `client.py:1240` — `collection_ids`, one per id (match)
+- `client.py:1340` — `filter:collection_id`, single id (entitysets)
 
 Two distinct wire spellings exist today, so the seam is real, not hypothetical.
+
+### What T2 changed here, and what you must preserve
+
+`_check_collection_id` no longer clips its own echo. It now calls
+`render(text, COLLECTION_ECHO)` from `src/aleph_mcp/echo.py`, because on one path the value is
+upstream text — the `id` read out of a `filter:foreign_id` lookup — and this repo bounds every
+upstream string that reaches the model.
+
+Carry that call into the new module **unchanged**: same policy, same cap, same `!r` around it. The
+`!r` is load-bearing and the comment says why — `COLLECTION_ECHO` deliberately does not strip
+control characters because `!r` escapes them. Dropping the `!r` while keeping the policy would
+silently unstrip them.
 
 ### Required outcome
 
@@ -799,23 +828,43 @@ preserve it and make it testable without a mocked upstream.
 
 - [ ] Parse-level refusals (empty, blank, `"*"` mixed with ids, over `MAX_SCOPE_COLLECTIONS`,
       non-numeric form) are tested **without `respx`**. That they need no mocked upstream is the
-      evidence the seam is in the right place.
-- [ ] The two renderings are methods on the resolved scope, not open-coded at call sites.
+      evidence the seam is in the right place. For scale: the current file has 23 test functions
+      and 57 `respx_mock` references, so almost everything is mocked today.
+- [ ] The three renderings are methods on the resolved scope, not open-coded at call sites.
+- [ ] `_check_collection_id`'s `render(..., COLLECTION_ECHO)!r` survives intact. Show it: feed a
+      120+ character upstream id containing a control character and a quote, and assert the message
+      is bounded and escaped exactly as it is on `develop`.
 - [ ] Every requirement in `openspec/specs/mcp-tool-surface` about collection scope still holds,
       unchanged. Quote each one you checked in the PR body.
 - [ ] The order-preserving dedup on **both** the input spellings and the resolved ids is preserved —
       a numeric id and a foreign_id naming the same collection must still collapse to one filter.
 - [ ] The resolution deadline and the "only a verified hit is cached" behaviour are preserved.
 - [ ] Show red: break the resolved-id dedup, confirm a test fires.
-- [ ] Gate A: empty surface diff.
-- [ ] The full suite passes at the count in this task's header. **That header is refreshed when
-      the task is scheduled — if it still says 325, it has not been refreshed and you should say
-      so before starting.** `uv run --locked mypy`, `ruff check .`, `ruff format --check .` clean.
+- [ ] Gate A: empty surface diff, baselined from `develop`.
+- [ ] Gate C: `ERROR_CASES` wire counts unchanged — several of them are collection refusals, and
+      "a refused call costs no upstream request" is exactly what a scope resolver can break.
+- [ ] **408 passed, 31 skipped, 5 xfailed** — the xfails stay xfailed. If one turns
+      `XPASS(strict)` you have changed a parked behaviour; stop and report.
+- [ ] `uv run --locked mypy`, `ruff check .`, `ruff format --check .` all clean.
 
 ### Explicitly out of scope
 
-The transport. The shaping seam. Any change to what scope values are accepted or refused — this is a
-move, not a redesign of the contract.
+Any change to what scope values are accepted or refused. This is a move, not a redesign of the
+contract.
+
+The transport and the retry loop — those are T4's, and `_resolve_collection_scope`'s deadline sits
+close enough to them to be tempting.
+
+Do not fix any of these parked findings, all recorded in `docs/implementation-notes.md`:
+
+- **`get_schema`'s unbounded echo.** `client.py` builds `"Did you mean one of: …"` from upstream
+  ontology keys with no cap and no policy — reproduced at 20,112 characters with `ESC`, `NUL`,
+  `U+202E` and a raw quote intact. It is the nearest neighbour to your task and it is **not yours**:
+  it needs a new policy and a bound on a joined list, which is a behaviour change to a tool's output.
+- The unbounded **caption**, `get_model` caching a non-dict `model`, and the `ProxyError`
+  sanitisation gap.
+
+Anything else you find goes as one line in `docs/implementation-notes.md`, and nowhere else.
 
 ---
 
