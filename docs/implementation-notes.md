@@ -6,7 +6,7 @@ this file when it becomes a spec requirement or is fixed — not when someone re
 - **`httpx.ProxyError` reaches the model unsanitised, and its text is attacker-authored.**
   Found by security review of `fix/retry-connection-failures`; pre-existing, so parked rather
   than fixed there. `ProxyError` is a sibling of `ConnectError` under `TransportError`, not a
-  subclass, so `AlephClient._CONNECT_ERRORS` does not catch it and it never reaches
+  subclass, so `transport._CONNECT_ERRORS` does not catch it and it never reaches
   `errors.py`'s sanitiser. httpcore builds its message from the proxy's `CONNECT` reason
   phrase (`httpcore/_async/http_proxy.py`), which h11 admits as `([ \t]|[^\x00\s])*` — every
   C0 control except NUL, `ESC` included — decoded with `errors="ignore"`. FastMCP then renders
@@ -14,7 +14,7 @@ this file when it becomes a spec requirement or is fixed — not when someone re
   proxy can write multi-kilobyte ASCII with ANSI escapes into a model-visible tool error,
   bypassing both the 200-char cap and the non-printable stripping of `echo.UPSTREAM_ERROR`. A
   forward proxy is a live deployment shape here, so this is worth a change of its own: catch
-  `httpx.TransportError` at the top of `_request` and route the non-retryable members through
+  `httpx.TransportError` at the top of `Transport.request` and route the non-retryable members through
   `raise_unreachable`. Do **not** simply add `ProxyError` to `_CONNECT_ERRORS` — a `CONNECT`
   that reached the proxy is not obviously undelivered, which is the argument that correctly
   keeps `ReadError` out.
@@ -98,9 +98,10 @@ Retired since the last prune:
   makes it a latent bug rather than a fixed one. Parked: outside T3's scope. One-line fix is to
   capture first, as the step already does for `meta` — `listing=$(tar tzf dist/*.tar.gz)`
   then `grep -q '/LICENSE$' <<<"$listing"`.
-- `client.py:496` decodes the body with an unguarded `jsonlib.loads`. `json.JSONDecodeError`
-  and `UnicodeDecodeError` are both `ValueError` subclasses, so a 2xx whose body is not JSON
-  — an HTML maintenance page, a proxy interstitial, a truncated body — reaches the model as a
+- `Transport.request` (`transport.py`, was `client.py:496`) decodes the body with an unguarded
+  `jsonlib.loads`. `json.JSONDecodeError` and `UnicodeDecodeError` are both `ValueError`
+  subclasses, so a 2xx whose body is not JSON — an HTML maintenance page, a proxy
+  interstitial, a truncated body — reaches the model as a
   refusal reading `Expecting value: line 1 column 1 (char 0)`, indistinguishable from "you
   passed a bad id". The rational reply to a refusal is to change arguments and retry, against
   an upstream that is down. Run-verified identical on `main @ 1952232`, so the T3 seam
@@ -250,7 +251,7 @@ Retired since the last prune:
 
 - **A non-list `results` from the collection listing escapes the `except ValueError` seam.**
   `scope.py:312-313` (was `client.py:879-880`, character-identical). The `isinstance(results[0],
-  dict)` guard covers a body that arrives as a list or a scalar, because `_request` wraps a
+  dict)` guard covers a body that arrives as a list or a scalar, because `Transport.request` wraps a
   non-dict body as `{"results": <body>}` -- but an Aleph *dict* body whose own `results` key is
   not a list reaches `results[0]` on a truthy non-list. Measured on both `develop` and the T5
   branch, byte-identical: `{"results": {"a": 1}}` raises `KeyError`, `{"results": 5}` and
