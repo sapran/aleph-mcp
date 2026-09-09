@@ -251,8 +251,13 @@ def slim_entity(entity: dict[str, Any], schemata: dict[str, Any] | None = None) 
 _SHAPED_ENDPOINTS: set[str] = set()
 
 
-class _MarkerEscaped(RuntimeError):
-    """A shaping marker reached a serialiser, so a reply left this module unshaped."""
+class _MarkerEscaped(ToolError):
+    """A shaping marker reached a serialiser, so a reply left this module unshaped.
+
+    A `ToolError` for the same reason `_shape`'s refusal is one: it is a refusal, and
+    anything else is prefixed by FastMCP and erased under `mask_error_details`. That alone
+    is not enough on the path that actually fires -- see `find_marker`.
+    """
 
 
 class _Marker:
@@ -264,16 +269,25 @@ class _Marker:
     fail-*open* on the inverse. Measured through the MCP boundary before this guard, with
     one method unhooked from the seam: `isError: False`, carrying the whole document body.
 
-    Two mechanisms, because either alone leaves half the mistake open, and both were
-    measured rather than reasoned about:
+    Three mechanisms, in the order they fire. `find_marker` at the refusal seam is the one
+    that decides what the caller is told; the two here are what make a marker unable to
+    serialise if it ever gets past that, and they were measured rather than reasoned about:
 
-    - `__get_pydantic_core_schema__` covers the marker as a declared return type, which is
-      how an unhooked `-> _Ent` method leaks.
-    - Not being a dataclass covers the marker sitting inside a `dict[str, Any]` reply --
-      the shape `_slim_result` produces, and therefore the shape an author copying it
-      produces. There pydantic infers a schema from the runtime type, never consults the
-      hook, and walks a dataclass's fields straight into the payload. With the hook alone,
-      that path still returned the entire body as a success.
+    - Not being a dataclass is the live one. It covers the marker sitting inside a
+      `dict[str, Any]` reply -- the shape `_slim_result` produces, and therefore the shape
+      an author copying it produces. There pydantic infers a schema from the runtime type
+      and would walk a dataclass's fields straight into the payload; with a raising
+      `__str__` instead, the serialiser's fallback refuses. Measured with the schema hook
+      alone: that path still returned the entire body as a success.
+    - `__get_pydantic_core_schema__` covers the marker as a *declared* return type. In this
+      architecture nothing declares one -- `_shaped` rewrites `__annotations__["return"]` to
+      `dict[str, Any]`, and every `server.py` tool declares its own return type, so FastMCP
+      never sees a `-> _Ent`. Measured: removing this hook fails its own unit test and
+      nothing at the boundary. Kept because the property it asserts is what makes the class
+      unserialisable by construction rather than by the accident of no one declaring it.
+
+    `__repr__` names the defect instead of dumping the payload, so no diagnostic path -- a
+    traceback, a log line, pytest's assertion output -- can print what the seam keeps back.
     """
 
     __slots__ = ()
@@ -282,8 +296,9 @@ class _Marker:
     def __get_pydantic_core_schema__(cls, source: Any, handler: Any) -> Any:
         raise _MarkerEscaped(
             f"{cls.__name__} reached the serialiser: a reply left aleph_mcp.client without "
-            "passing the shaping seam. Every entity-returning method must be decorated "
-            "with @_shaped."
+            "passing the shaping seam. Every entity-returning method must be decorated with "
+            "@_shaped. Nothing about the call can change this and retrying will not help -- "
+            "report it against aleph-mcp."
         )
 
     def __repr__(self) -> str:
@@ -297,7 +312,8 @@ class _Marker:
         # which stays safe and quotes nothing of what the seam exists to keep back.
         raise _MarkerEscaped(
             f"{type(self).__name__} reached a string conversion: a reply left "
-            "aleph_mcp.client without passing the shaping seam."
+            "aleph_mcp.client without passing the shaping seam. Nothing about the call can "
+            "change this and retrying will not help -- report it against aleph-mcp."
         )
 
 
@@ -401,6 +417,42 @@ def _shaped[**P](
     # introspects these methods is told the type they actually return.
     wrapper.__annotations__ = {**method.__annotations__, "return": "dict[str, Any]"}
     return wrapper
+
+
+def find_marker(node: Any) -> _Marker | None:
+    """The first shaping marker anywhere in a built reply, or None.
+
+    The seam in `server.py` calls this on every reply so that a marker which never reached
+    `_shape` -- because the method building it was never decorated with `@_shaped` -- is
+    refused where the refusal can still be phrased, rather than deep inside a serialiser.
+
+    That distinction is the whole reason this exists. The markers already refuse to
+    serialise, so nothing leaks either way; but pydantic wraps whatever the fallback raises
+    in `PydanticSerializationError`, and FastMCP sees only that. Measured, with
+    `_MarkerEscaped` made a `ToolError` and a method unhooked from the seam:
+
+        masked=False -> Error calling tool 'get_entity': Error serializing to JSON: ...
+        masked=True  -> Error calling tool 'get_entity'
+
+    Prefixed, erased under masking, and reading as a transient hiccup -- so a model retries
+    a permanently broken endpoint, paying the upstream request each time, because the
+    endpoint's own fetch completes before the seam. Subclassing alone cannot fix that: the
+    exception FastMCP inspects is pydantic's, not ours. Catching the value before it is
+    serialised can, which is what this is for.
+    """
+    if isinstance(node, _Marker):
+        return node
+    if isinstance(node, dict):
+        for value in node.values():
+            found = find_marker(value)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = find_marker(item)
+            if found is not None:
+                return found
+    return None
 
 
 def _slim_facets(facets: Any) -> Any:

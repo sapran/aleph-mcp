@@ -300,6 +300,39 @@ async def masked_server(
         await client.aclose()
 
 
+async def test_the_masked_session_is_actually_masking(
+    masked_server: FastMCP, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The positive control for every masking test below, and the one they cannot be.
+
+    Each of those asserts that a refusal's own words survive masking. All of them also pass
+    when masking never happens at all, because an unmasked message contains its own words
+    too -- so the whole group degenerates the moment `mask_error_details` stops taking
+    effect. The fixture's `monkeypatch.setattr` catches the setting being *renamed*; it
+    cannot catch it being deprecated to a no-op. Measured: setting the fixture to `False`
+    and simultaneously reverting `_shape` to `RuntimeError` -- the exact defect those tests
+    exist to catch -- left all 18 of them green.
+
+    This one fails in that world instead of passing. A non-refusal raised inside a tool must
+    have its message replaced, so the sentinel can only arrive if masking is off.
+    """
+    sentinel = "SENTINEL-8c4f1a2e-masking-is-off"
+
+    @masked_server.tool
+    async def masking_probe() -> dict[str, Any]:
+        """A fault, not a refusal: FastMCP replaces its message when masking is on."""
+        raise RuntimeError(sentinel)
+
+    async with MCPClient(masked_server) as mcp:
+        with pytest.raises(ToolError) as excinfo:
+            await mcp.call_tool("masking_probe", {})
+
+    assert sentinel not in str(excinfo.value), (
+        "the masked session let a non-refusal's own message through, so masking is not in "
+        "effect and every masking test in this file is passing vacuously"
+    )
+
+
 @pytest.mark.parametrize(
     ("tool", "args", "match"),
     [(name, args, match) for name, args, match, _ in ERROR_CASES],
@@ -382,6 +415,47 @@ async def test_the_shaping_refusal_survives_error_masking(
         with pytest.raises(ToolError, match="get_profile cannot answer") as excinfo:
             await mcp.call_tool("get_profile", {"profile_id": "p1"})
     assert "retrying will not help" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("masked", [False, True], ids=["unmasked", "masked"])
+async def test_a_marker_that_missed_the_seam_refuses_actionably(
+    settings: Settings, respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, masked: bool
+) -> None:
+    """A marker reaching the boundary is a permanent server defect, and must say so.
+
+    The markers already refuse to serialise, so nothing leaks either way -- but that refusal
+    is raised inside pydantic, which wraps it in `PydanticSerializationError`, and FastMCP
+    sees only the wrapper. Measured before the seam checked for markers, with
+    `_MarkerEscaped` already made a ToolError:
+
+        masked=False -> Error calling tool 'get_entity': Error serializing to JSON: ...
+        masked=True  -> Error calling tool 'get_entity'
+
+    Prefixed, erased under masking, and reading as a transient hiccup -- so a model retries
+    an endpoint that can never work, paying the upstream request every time, because the
+    endpoint's own fetch completes before the seam. The refusal has to be phrased where the
+    reply is still ours, which is the adapter in server.py.
+
+    The client method is unhooked here rather than a probe tool being built by hand, because
+    forgetting `@_shaped` on a new endpoint is the mistake this guards, and going through
+    `build_server` is what proves the adapter and not the serialiser produced the answer.
+    """
+    monkeypatch.setattr(fastmcp.settings, "mask_error_details", masked)
+    monkeypatch.setattr(AlephClient, "get_entity", AlephClient.get_entity.__wrapped__, raising=True)
+    mcp, client = build_server(settings)
+    respx_mock.get("/api/2/entities/d1").mock(return_value=httpx.Response(200, json=raw_document()))
+    try:
+        async with MCPClient(mcp) as session:
+            with pytest.raises(ToolError) as excinfo:
+                await session.call_tool("get_entity", {"entity_id": "d1"})
+    finally:
+        await client.aclose()
+
+    message = str(excinfo.value)
+    assert not message.startswith("Error calling tool"), message
+    assert "retrying will not help" in message, message
+    for prop in BLOB_PROPS:
+        assert f"<{prop} body>" not in message
 
 
 async def test_a_marker_that_missed_the_seam_cannot_reach_the_caller() -> None:

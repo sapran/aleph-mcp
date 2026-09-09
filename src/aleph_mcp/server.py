@@ -7,7 +7,7 @@ from typing import Any
 from fastmcp import FastMCP
 from fastmcp.exceptions import ResourceError, ToolError
 
-from .client import MAX_EXPAND, MAX_PAGE, AlephClient
+from .client import MAX_EXPAND, MAX_PAGE, AlephClient, find_marker
 from .config import Settings
 
 INSTRUCTIONS = f"""
@@ -94,9 +94,23 @@ def _refusing[**P, R](
         @functools.wraps(fn)
         async def guarded(*args: P.args, **kwargs: P.kwargs) -> R:
             try:
-                return await fn(*args, **kwargs)
+                result = await fn(*args, **kwargs)
             except ValueError as e:
                 raise error(str(e)) from e
+            # The last point at which the reply is still ours. A shaping marker here means
+            # the client built a reply and never passed it through its own seam, which is a
+            # defect in this server rather than a bad request. The markers refuse to
+            # serialise, so nothing leaks either way -- but pydantic wraps that refusal in
+            # PydanticSerializationError and FastMCP sees only the wrapper, so the caller
+            # gets a prefixed message that masking erases and that reads as a transient
+            # hiccup. Refusing here instead is what makes it say "stop retrying".
+            if find_marker(result) is not None:
+                raise error(
+                    f"{fn.__name__} cannot answer: a defect in this server left an unshaped "
+                    "entity marker in the reply. Nothing about the call can change this and "
+                    "retrying will not help -- report it against aleph-mcp."
+                )
+            return result
 
         return guarded
 
