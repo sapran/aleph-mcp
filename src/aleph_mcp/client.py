@@ -563,14 +563,31 @@ class AlephClient:
             # Everything else this covers -- a non-2xx, an exhausted connect, a body over
             # the ceiling -- is an upstream fault the caller cannot act on.
             return None
-        except (httpx.HTTPError, jsonlib.JSONDecodeError):
-            # The read-side faults `_request` deliberately does not retry -- ReadTimeout,
-            # ReadError, RemoteProtocolError -- leave `get_model` as raw httpx errors, and a
-            # 200 carrying a non-JSON body leaves it as a decode error. A slow model is
-            # literally the ReadTimeout in that set, so this arm is the one the first
-            # paragraph describes. Named rather than left to a bare except, so a defect in
-            # this module -- an AttributeError, a TypeError -- reaches the caller instead of
-            # silently degrading every caption on the instance.
+        except (httpx.HTTPError, ValueError):
+            # Two families, both upstream's fault and neither the caller's.
+            #
+            # httpx.HTTPError covers the read-side faults `_request` deliberately does not
+            # retry -- ReadTimeout, ReadError, RemoteProtocolError. A slow model is literally
+            # the ReadTimeout in that set, so this is the arm the first paragraph describes.
+            #
+            # ValueError covers the body not parsing, and it has to be the base class rather
+            # than JSONDecodeError. `_request` ends at `jsonlib.loads(body)` where body is
+            # *bytes*: json.loads runs detect_encoding and decodes first, so a body that is
+            # not valid UTF-8 raises UnicodeDecodeError -- a sibling of JSONDecodeError under
+            # ValueError, not a subclass. Measured with JSONDecodeError here: a metadata route
+            # answering 200 with a PNG, a raw gzip or a latin-1 error page hard-failed all ten
+            # shaped tools, permanently (only a success is cached, so every later call
+            # refetched and failed the same way), and UnicodeDecodeError being a ValueError
+            # meant `server.py`'s seam handed the model
+            # "'utf-8' codec can't decode byte 0x89..." unprefixed and surviving masking --
+            # the shape of a deliberate, caller-actionable refusal, naming nothing the caller
+            # can act on.
+            #
+            # Still named rather than a bare except: a defect in this module -- an
+            # AttributeError, a TypeError -- reaches the caller instead of silently degrading
+            # every caption on the instance. That property is pinned by a test, because
+            # deleting this arm entirely, or appending `except Exception` after it, both left
+            # the suite green at 380 passed.
             return None
         schemata = model.get("schemata")
         return schemata if isinstance(schemata, dict) else None

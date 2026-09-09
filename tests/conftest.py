@@ -28,12 +28,36 @@ def settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
 # pattern again replaces this route, which is how the metadata-failure tests override it.
 DEFAULT_MODEL = {"model": {"schemata": {}}}
 
+# Named so a test can assert the route was *not* used. This matters because respx matches in
+# registration order and the fixture registers first, so a catch-all a test builds later
+# never sees /api/2/metadata -- which silently emptied the "a refused call costs no request"
+# assertions of their strongest case. Measured with the fetch moved ahead of the endpoint's
+# own request, the invariant `_reply`'s docstring states: 57 tests red without this route, 1
+# with it. `assert_model_not_fetched` is what puts that coverage back.
+METADATA_ROUTE = "metadata"
+
 
 @pytest.fixture
 def respx_mock() -> Iterator[respx.MockRouter]:
     with respx.mock(base_url=HOST, assert_all_called=False) as m:
-        m.get("/api/2/metadata").mock(return_value=httpx.Response(200, json=DEFAULT_MODEL))
+        m.get("/api/2/metadata", name=METADATA_ROUTE).mock(
+            return_value=httpx.Response(200, json=DEFAULT_MODEL)
+        )
         yield m
+
+
+def assert_model_not_fetched(router: respx.MockRouter) -> None:
+    """The instance-model fetch is an upstream request like any other.
+
+    Paired with a catch-all's `call_count == 0` wherever a call is refused: the seam fetches
+    the model inside `_reply`, after the endpoint has issued its own request, so a call
+    refused before that point must not have reached this route either.
+    """
+    assert not router[METADATA_ROUTE].called, (
+        "the instance model was fetched on a call that was refused. The seam must fetch it "
+        "only after the endpoint has made its own request, or a refusal starts costing an "
+        "upstream request -- see _reply's docstring."
+    )
 
 
 @pytest.fixture

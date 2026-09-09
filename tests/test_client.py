@@ -30,6 +30,7 @@ from aleph_mcp.client import (
     derive_caption,
     slim_entity,
 )
+from tests.conftest import assert_model_not_fetched
 from tests.shapes import (
     BLOB_PROPS,
     assert_search_envelope,
@@ -408,6 +409,7 @@ async def test_negative_offset_is_refused(
     with pytest.raises(ValueError, match="offset must be >= 0"):
         await client.list_collections(offset=-1)
     assert wire.call_count == 0
+    assert_model_not_fetched(respx_mock)
 
 
 async def test_numeric_collection_id_is_validated_before_interpolation(
@@ -420,6 +422,7 @@ async def test_numeric_collection_id_is_validated_before_interpolation(
     with pytest.raises(ValueError, match="expected a numeric collection id"):
         await client.get_collection(collection="42\n")
     assert wire.call_count == 0
+    assert_model_not_fetched(respx_mock)
 
 
 # -- search --------------------------------------------------------------------
@@ -467,6 +470,7 @@ async def test_search_rejects_an_unbounded_facet_size(
     with pytest.raises(ValueError, match="facet_size must be between"):
         await client.search_entities(collection="874", facets=["schema"], facet_size=facet_size)
     assert wire.call_count == 0
+    assert_model_not_fetched(respx_mock)
 
 
 async def test_facet_buckets_are_bounded_and_their_labels_truncated(
@@ -875,6 +879,7 @@ async def test_search_rejects_negative_paging(
     with pytest.raises(ValueError, match="must be >= 0"):
         await client.search_entities(collection="874", **args)
     assert wire.call_count == 0
+    assert_model_not_fetched(respx_mock)
 
 
 async def test_highlight_is_sent_when_a_query_is_present(
@@ -957,6 +962,7 @@ async def test_ids_with_trailing_whitespace_are_refused(
     with pytest.raises(ValueError, match="invalid entity_id"):
         await client.get_entity(entity_id=entity_id)
     assert wire.call_count == 0
+    assert_model_not_fetched(respx_mock)
 
 
 # Every method that interpolates a caller id into a path. An id of only dot segments
@@ -986,6 +992,7 @@ async def test_id_that_addresses_nothing_is_refused(
     with pytest.raises(ValueError, match=f"invalid {field}"):
         await getattr(client, method)(**{field: bad})
     assert wire.call_count == 0
+    assert_model_not_fetched(respx_mock)
 
 
 async def test_dotted_ids_are_still_accepted(
@@ -1279,6 +1286,7 @@ async def test_text_slice_bounds(
     with pytest.raises(ValueError, match=match):
         await client.get_entity_text(entity_id="d1", **args)
     assert wire.call_count == 0
+    assert_model_not_fetched(respx_mock)
 
 
 # -- ontology ------------------------------------------------------------------
@@ -2216,3 +2224,86 @@ async def test_a_read_only_refusal_fetching_the_model_is_not_swallowed(
     with pytest.raises(ToolError, match="read-only allowlist") as excinfo:
         await client.get_entity(entity_id="e1")
     assert "elsewhere.invalid" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("label", "body"),
+    [
+        ("a PNG", b"\x89PNG\r\n\x1a\n"),
+        ("raw gzip with no Content-Encoding", b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03"),
+        ("a latin-1 error page", "<h1>Fehler: ung\xfcltig</h1>".encode("latin-1")),
+        ("plain non-JSON UTF-8", b"upstream is having a bad day"),
+    ],
+    ids=["png", "gzip", "latin-1", "utf-8-text"],
+)
+async def test_a_metadata_body_that_does_not_parse_degrades_rather_than_failing(
+    client: AlephClient, respx_mock: respx.MockRouter, label: str, body: bytes
+) -> None:
+    """A body that is not JSON is upstream's fault, whatever it fails to be.
+
+    Three of these four are not valid UTF-8, and that distinction used to decide the
+    outcome: `_request` ends at `jsonlib.loads(body)` on *bytes*, so json decodes first and
+    raises `UnicodeDecodeError` -- a sibling of `JSONDecodeError` under `ValueError`, not a
+    subclass. With only `JSONDecodeError` caught, all ten shaped tools hard-failed on these
+    three and kept failing, because only a success is cached. Worse, `UnicodeDecodeError` is
+    a `ValueError`, so `server.py`'s seam dressed it up as a caller-actionable refusal
+    naming nothing the caller could act on.
+    """
+    respx_mock.get("/api/2/metadata").mock(
+        return_value=httpx.Response(200, headers={"Content-Type": "application/json"}, content=body)
+    )
+    respx_mock.get("/api/2/entities/e1").mock(
+        return_value=httpx.Response(200, json=_probe_entity())
+    )
+
+    out = await client.get_entity(entity_id="e1")
+
+    assert out["caption"] == "Acme", f"{label}: the call should degrade, not fail"
+
+
+async def test_a_metadata_read_timeout_degrades_rather_than_failing(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The arm most likely to fire on a real instance, and nothing reached it.
+
+    `_request` retries connect failures only -- read-side faults are deliberately excluded,
+    because they cannot be told apart from a request Aleph did receive -- so a `ReadTimeout`
+    leaves `get_model` as a raw httpx error. "The model was slow" is literally this case,
+    and it is the one the fallback exists for. Measured: deleting the whole arm left the
+    suite green at 380 passed.
+    """
+    respx_mock.get("/api/2/metadata").mock(side_effect=httpx.ReadTimeout("too slow"))
+    respx_mock.get("/api/2/entities/e1").mock(
+        return_value=httpx.Response(200, json=_probe_entity())
+    )
+
+    out = await client.get_entity(entity_id="e1")
+
+    assert out["caption"] == "Acme"
+
+
+@pytest.mark.parametrize("defect", [AttributeError("no such attribute"), TypeError("bad call")])
+async def test_a_defect_in_this_module_is_not_swallowed_as_a_slow_model(
+    client: AlephClient,
+    respx_mock: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+    defect: Exception,
+) -> None:
+    """The whole point of naming the caught types, pinned.
+
+    A bare `except Exception` here would silently degrade every caption on the instance
+    rather than surfacing a bug in this file, and nothing would ever say so. Measured:
+    appending `except Exception: return None` after the narrow arms left the suite green at
+    380 passed, so the narrowing was load-bearing and unpinned at the same time.
+    """
+
+    async def broken(self: AlephClient) -> dict[str, Any]:
+        raise defect
+
+    monkeypatch.setattr(AlephClient, "get_model", broken)
+    respx_mock.get("/api/2/entities/e1").mock(
+        return_value=httpx.Response(200, json=_probe_entity())
+    )
+
+    with pytest.raises(type(defect)):
+        await client.get_entity(entity_id="e1")

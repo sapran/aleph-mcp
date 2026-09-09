@@ -13,6 +13,7 @@ from fastmcp.exceptions import ResourceError, ToolError
 from aleph_mcp.client import AlephClient, _Ent
 from aleph_mcp.config import Settings
 from aleph_mcp.server import _as_resource_error, _as_tool_error, build_server
+from tests.conftest import assert_model_not_fetched
 from tests.shapes import (
     BLOB_PROPS,
     assert_search_envelope,
@@ -275,6 +276,7 @@ async def test_client_refusal_surfaces_as_a_tool_error(
     # keep both.
     assert not str(excinfo.value).startswith("Error calling tool")
     assert wire.call_count == wire_calls
+    assert_model_not_fetched(respx_mock)
     if wire_calls:
         # get_collection can only learn a foreign_id is unknown by asking the listing;
         # the detail route must still never be reached.
