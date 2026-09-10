@@ -65,7 +65,11 @@ line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP", "RUF", "ASYNC"]
+# "W" is here for W605 specifically: an invalid escape in a non-raw docstring is a
+# SyntaxWarning today and a SyntaxError in a future Python, and this repo quotes grammars
+# (h11's `([ \t]|[^\x00\s])*`) in prose often enough to hit it. Bytecode caching hides the
+# warning after the first compile, so only a lint rule catches it reliably.
+select = ["E", "F", "I", "B", "UP", "RUF", "ASYNC", "W"]
 ignore = ["E501"]
 
 [tool.mypy]

@@ -64,7 +64,7 @@ def raise_read_only(exc: ReadOnlyViolation, *, context: str, resource: bool = Fa
 
 
 def _reported(exc: Exception) -> str:
-    """How a transport exception is named in a model-visible refusal.
+    r"""How a transport exception is named in a model-visible refusal.
 
     Every raiser on this path shares it, so a new call site cannot copy half the pattern:
     the text is sanitised by `echo.UPSTREAM_ERROR` *and* labelled untrusted, because the
