@@ -63,35 +63,92 @@ def raise_read_only(exc: ReadOnlyViolation, *, context: str, resource: bool = Fa
     ) from exc
 
 
+def _reported(exc: Exception) -> str:
+    """How a transport exception is named in a model-visible refusal.
+
+    Every raiser on this path shares it, so a new call site cannot copy half the pattern:
+    the text is sanitised by `echo.UPSTREAM_ERROR` *and* labelled untrusted, because the
+    label is what `echo` calls the mitigation here. `ProxyError`'s message is built by
+    httpcore from the proxy's `CONNECT` reason phrase, which h11 admits as
+    `([ \t]|[^\x00\s])*` -- every C0 control except NUL -- so a forward proxy authors this
+    string outright, and the cap and the stripping are both load-bearing.
+
+    A `ConnectTimeout` carries no message at all -- anyio raises a bare `TimeoutError` --
+    so an unconditional parenthetical renders as empty quotes and reads as a broken
+    message. The class name alone is the answer there.
+    """
+    detail = render(str(exc), UPSTREAM_ERROR)
+    return (
+        f'{type(exc).__name__}, untrusted transport text: "{detail}"'
+        if detail
+        else type(exc).__name__
+    )
+
+
 def raise_unreachable(
     exc: Exception, *, context: str, attempts: int, resource: bool = False
 ) -> NoReturn:
     """Surface an exhausted connection retry as the MCP error for this call site.
 
     The attempt count is in the message on purpose. Without it a caller cannot tell one
-    unlucky connect from an instance that is down, so it retries by hand — which is the
+    unlucky connect from an instance that is down, so it retries by hand -- which is the
     behaviour the retry loop exists to remove.
 
-    The transport text is labelled untrusted as well as sanitised. `echo.UPSTREAM_ERROR`
-    calls the label the mitigation on this path, so the two halves belong together even though no
-    attacker-authored string is known to reach here: every message in this file that embeds
-    foreign text carries one, and the next call site inherits whichever pattern it copies.
+    Raised only where nothing was delivered, which is what licences "No response was
+    received": a caller re-asking after this one cannot duplicate an effect. A failure that
+    may have been delivered goes to `raise_transport_failed`, which must not say it.
     """
     err_cls = ResourceError if resource else ToolError
-    detail = render(str(exc), UPSTREAM_ERROR)
-    # A ConnectTimeout carries no message at all — anyio raises a bare TimeoutError — so an
-    # unconditional parenthetical renders as empty quotes and reads as a broken message.
-    reported = (
-        f'{type(exc).__name__}, untrusted transport text: "{detail}"'
-        if detail
-        else type(exc).__name__
-    )
     raise err_cls(
         f"{context}: could not reach Aleph after {attempts} "
-        f"attempt{'' if attempts == 1 else 's'} ({reported}). No response was received. "
+        f"attempt{'' if attempts == 1 else 's'} ({_reported(exc)}). No response was received. "
         "This server issues only read requests, so no retry can have changed anything "
         "upstream. Check the host is reachable and the network path is up; retrying "
         "immediately will not help."
+    ) from exc
+
+
+def raise_tls_untrusted(exc: Exception, *, context: str, resource: bool = False) -> NoReturn:
+    """Refuse a connect whose TLS handshake was not trusted.
+
+    Deliberately gives both readings and recommends neither. A `CERTIFICATE_VERIFY_FAILED`
+    against a self-signed instance and the same error against an intercepted connection are
+    the same bytes here; which one it is depends on whether the operator expects to trust
+    that certificate, which this process cannot know. Advising the setting would be advice
+    to disable verification on the one occasion it worked.
+
+    Not retried: a handshake failure is a statement about keys and names, not about load.
+    """
+    err_cls = ResourceError if resource else ToolError
+    raise err_cls(
+        f"{context}: the TLS handshake with Aleph was not trusted ({_reported(exc)}). No "
+        "response was received. This is deterministic: retrying will not help, and the "
+        "certificate will be rejected the same way until either it or this server's "
+        "configuration changes. Either the instance serves a certificate this host does not "
+        "trust -- a self-signed instance, which `ALEPH_MCP_VERIFY_TLS=false` exists for -- or "
+        "something on the network path is intercepting the connection, in which case "
+        "disabling verification would hide it. This server cannot tell the two apart."
+    ) from exc
+
+
+def raise_transport_failed(exc: Exception, *, context: str, resource: bool = False) -> NoReturn:
+    """Refuse a transport failure that may have happened after the request was delivered.
+
+    The one thing this must not do is claim no response was received. Read-side failures are
+    indistinguishable from a request Aleph did receive -- the same argument that keeps them
+    out of the retried set -- so the message says so, and leans on the guarantee that does
+    hold regardless: every request this server issues is a read.
+
+    Also the bucket an unrecognised `TransportError` subclass lands in. That is deliberate:
+    the conservative claim is correct for a failure nobody has classified yet.
+    """
+    err_cls = ResourceError if resource else ToolError
+    raise err_cls(
+        f"{context}: the connection to Aleph failed ({_reported(exc)}). The request may have "
+        "been received and its response lost, so this server cannot report whether Aleph "
+        "acted on it -- but it issues only read requests, so nothing upstream can have "
+        "changed either way. Retrying is safe; if it fails the same way, the network path or "
+        "the instance is unhealthy rather than busy."
     ) from exc
 
 

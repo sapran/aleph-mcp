@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json as jsonlib
+import ssl
 import time
 from collections.abc import Callable
 from typing import Any, Literal
@@ -30,7 +31,9 @@ from .config import Settings
 from .errors import (
     raise_for_status,
     raise_read_only,
+    raise_tls_untrusted,
     raise_too_large,
+    raise_transport_failed,
     raise_unreachable,
 )
 from .readonly import ReadOnlyViolation, read_only_hook
@@ -58,11 +61,38 @@ Query = list[tuple[str, str | int | float | bool | None]]
 
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 
-# Failures raised before the request left this process. Retrying them is safe whatever
-# the method, because nothing was delivered and nothing can be duplicated. Read-side
-# failures (ReadError, ReadTimeout, RemoteProtocolError) are deliberately excluded:
-# they are indistinguishable from a request Aleph did receive.
+# Failures raised before the request left this process, and plausibly transient. Retrying
+# them is safe whatever the method, because nothing was delivered and nothing can be
+# duplicated. Read-side failures (ReadError, ReadTimeout, RemoteProtocolError) are
+# deliberately excluded: they are indistinguishable from a request Aleph did receive.
+#
+# This is one bucket of the classification in `_classify`, not the whole of it. It used to
+# be the whole of it, which is how the other thirteen `httpx.TransportError` subclasses
+# reached the model as raw httpx exceptions.
 _CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout)
+
+
+def _has_tls_cause(exc: BaseException) -> bool:
+    """Whether an `ssl.SSLError` is anywhere in this exception's chain.
+
+    httpcore raises `ConnectError` for a failed handshake and keeps the `ssl.SSLError` as
+    `__cause__`, sometimes one level deeper, so the cause is the only place the real
+    diagnosis exists -- `CERTIFICATE_VERIFY_FAILED` is otherwise legible only inside the
+    quoted transport text, which is exactly what a model should not have to parse.
+
+    The walk is bounded by a visited set rather than by trust. An exception chain can be
+    cyclic -- `raise x from x`, or a re-raise inside its own handler -- and this server
+    re-raises a cached exception on the metadata path, so an unbounded walk here would be a
+    hang reachable from an upstream fault.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, ssl.SSLError):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _backoff_delay(attempt: int) -> float:
@@ -161,12 +191,33 @@ class Transport:
                                 resp, context=context, resource=resource
                             )
                             break
-                except _CONNECT_ERRORS as e:
-                    # A failed connect is spend, not just the sleep after it: it can burn the
+                except httpx.TransportError as e:
+                    # A failed attempt is spend, not just the sleep after it: it can burn the
                     # whole connect phase, which is the larger term. Charging only the backoff
                     # would let max_retries slow connects hold one tool call open for a
-                    # multiple of the budget — the case MAX_CONNECT_SECS also bounds.
+                    # multiple of the budget — the case MAX_CONNECT_SECS also bounds. Charged
+                    # before the dispatch, so it is charged whichever bucket the failure lands
+                    # in.
                     budget -= self._monotonic() - started
+                    # The classification, on two axes: could the request have been delivered,
+                    # and is the failure deterministic. Dispatching on the value here rather
+                    # than narrowing the `except` clause is the whole point -- the fall-through
+                    # is `raise_transport_failed`, so a subclass nobody has classified gets the
+                    # conservative answer instead of the wire.
+                    if _has_tls_cause(e):
+                        raise_tls_untrusted(e, context=context, resource=resource)
+                    if isinstance(e, httpx.ProxyError):
+                        # Undelivered -- a failed CONNECT means nothing reached Aleph -- so
+                        # `raise_unreachable` states the truth, and its class name is what
+                        # tells an operator the proxy rather than the instance refused.
+                        # Deliberately not retried and deliberately not in _CONNECT_ERRORS: a
+                        # CONNECT that reached the proxy is not obviously undelivered, which
+                        # is the argument that correctly keeps ReadError out, and the reason
+                        # phrase is the proxy's answer about this route rather than a
+                        # transient socket condition.
+                        raise_unreachable(e, context=context, attempts=attempt, resource=resource)
+                    if not isinstance(e, _CONNECT_ERRORS):
+                        raise_transport_failed(e, context=context, resource=resource)
                     if attempt == attempts or budget <= 0:
                         raise_unreachable(e, context=context, attempts=attempt, resource=resource)
                     delay = min(_backoff_delay(attempt), budget)
