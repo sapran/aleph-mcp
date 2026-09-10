@@ -405,10 +405,16 @@ Every other degradation in this server announces itself — a truncated page, an
 
 ### Requirement: Every transport failure is refused through this server's own error path
 
-No failure raised by the HTTP transport SHALL reach the caller as itself. Every member of
-`httpx.TransportError`, including one this server does not recognise, SHALL be surfaced as a tool
-or resource error naming the call context, with any transport text sanitised and labelled
-untrusted by the same policy that governs every other quoted upstream string.
+Every member of `httpx.TransportError` -- including one this server does not recognise -- and
+every `ssl.SSLError`, which is not one of them, SHALL be surfaced as a tool or resource error
+naming the call context, with any transport text sanitised and labelled untrusted by the same
+policy that governs every other quoted upstream string. None SHALL reach the caller as itself.
+
+The guarantee is stated as that family rather than as "every transport failure" because it is
+not universal: `httpx.TooManyRedirects` and `httpx.DecodingError` are siblings under
+`httpx.HTTPError`, outside this seam, and both still reach the caller as themselves. Recorded in
+`docs/implementation-notes.md` rather than claimed here -- a spec sentence wider than the code is
+worse than the gap, because the next reader checks the spec.
 
 Two of the fifteen subclasses were handled before this requirement. Measured on `develop @
 b164195` through the shipped MCP path: a `ProxyError` carrying a hostile `CONNECT` reason phrase

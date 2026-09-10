@@ -64,6 +64,25 @@ the error path "has its own, much smaller bound"; the 64 KiB `_MAX_ERROR_BODY_BY
 `_upstream_detail` bounds only what is *quoted*, and above the ceiling the error path is never
 reached at all. Fixing it changes a refusal message, so it is a behaviour change.
 
+**A redirect loop costs 21 upstream requests and reports the raw httpx message.** Found by
+security review of `classify-transport-failures`; outside it because `httpx.TooManyRedirects` is a
+sibling of `TransportError` under `HTTPError`, so the seam that change hardened does not reach it.
+Executed through the shipped MCP path: an instance answering `302` with a `Location` back to the
+same allowlisted path produced **21** upstream requests for one tool call and told the model
+`Error calling tool 'list_collections': Exceeded maximum allowed redirects.` -- no call context, no
+label, and nothing charged to the retry budget. The redirect count is httpx's own `max_redirects`
+(20), not a budget this server chose, and the same class also escapes classification entirely.
+Belongs with the charging work above: one seam, two symptoms.
+
+**A malformed compressed body reaches the model as a raw zlib message.** Same review, same reason:
+`httpx.DecodingError` is an `HTTPError`, not a `TransportError`. A `200` carrying
+`Content-Encoding: gzip` and a body that is not gzip produced
+`Error calling tool 'list_collections': Error -3 while decompressing data: incorrect header check`
+-- unlabelled, no call context. Not an injection surface, and that was checked rather than assumed:
+six hostile bodies produced three distinct messages, all drawn from zlib's fixed C string table,
+with no input bytes echoed. So the cost is a confusing refusal rather than a model-visible attacker
+string, which is why it is recorded rather than fixed under a security-hardening change.
+
 ## 3. The scope resolver mishandles three upstream shapes
 
 All three in `scope.py`, adjacent lines, one change.

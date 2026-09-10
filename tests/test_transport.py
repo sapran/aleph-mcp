@@ -18,6 +18,7 @@ import gzip
 import ssl
 from collections.abc import AsyncIterator
 
+import anyio
 import httpcore
 import httpx
 import pytest
@@ -26,6 +27,7 @@ from fastmcp.exceptions import ToolError
 
 from aleph_mcp.client import AlephClient
 from aleph_mcp.config import Settings
+from aleph_mcp.errors import ResponseTooLarge
 from aleph_mcp.transport import (
     MAX_CONNECT_SECS,
     MAX_RESPONSE_BYTES,
@@ -351,6 +353,117 @@ async def test_a_connect_failure_with_no_tls_cause_is_still_retried(
         await transport.request("GET", PROBE, context="probe")
     assert route.call_count == 4, "a non-TLS connect failure keeps its budget"
     assert "ALEPH_MCP_VERIFY_TLS" not in str(route.calls), "no TLS advice on a non-TLS failure"
+
+
+def _read_side_tls_chain() -> httpx.ReadError:
+    """A TLS fault that happens *after* the request went out, built the way anyio does.
+
+    anyio wraps an `ssl.SSLEOFError` from a mid-stream read into `BrokenResourceError`,
+    httpcore maps that to its `ReadError`, and httpx maps that to `httpx.ReadError` -- so an
+    `ssl.SSLError` sits in the chain of a failure that is emphatically not a handshake.
+    """
+    try:
+        try:
+            try:
+                try:
+                    raise ssl.SSLEOFError(
+                        8, "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation"
+                    )
+                except ssl.SSLError as e0:
+                    raise anyio.BrokenResourceError from e0
+            except Exception as e1:
+                raise httpcore.ReadError(e1) from e1
+        except httpcore.ReadError as e2:
+            raise httpx.ReadError(str(e2)) from e2
+    except httpx.ReadError as outer:
+        return outer
+    raise AssertionError("unreachable")
+
+
+async def test_a_tls_fault_after_delivery_is_not_reported_as_a_trust_failure(
+    transport: Transport, respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    """Found by security review of this change: testing the TLS cause before the delivery
+    axis reported a mid-body truncation as a handshake trust failure that claimed no
+    response was received -- false, and it named `ALEPH_MCP_VERIFY_TLS` for something that is
+    not a trust problem.
+
+    The order is now delivery first. An `ssl.SSLError` in the chain of a read-side failure is
+    a broken connection to a response that may already have been served.
+    """
+    respx_mock.get(PROBE).mock(side_effect=_read_side_tls_chain())
+    with pytest.raises(ToolError) as excinfo:
+        await transport.request("GET", PROBE, context="probe")
+    message = str(excinfo.value)
+    assert "may have been received" in message
+    assert "No response was received" not in message
+    assert "ALEPH_MCP_VERIFY_TLS" not in message, "a truncated body is not a trust verdict"
+    assert "handshake" not in message
+
+
+async def test_a_bare_ssl_error_does_not_escape_the_seam(
+    settings: Settings, no_sleep: None
+) -> None:
+    """`ssl.SSLError` is not an `httpx.TransportError`, and anyio re-raises it bare for a
+    handshake that fails for a reason other than EOF. Measured before the fix: a
+    `BAD_RECORD_MAC` reached the model as `Error calling tool 'list_collections': [SSL:
+    BAD_RECORD_MAC] ...` -- straight past a clause naming only httpx, with no call context
+    and no label."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise ssl.SSLError(1, "[SSL: BAD_RECORD_MAC] decryption failed or bad record mac")
+
+    t = Transport(settings)
+    try:
+        t._http._transport = httpx.MockTransport(handler)
+        with pytest.raises(ToolError) as excinfo:
+            await t.request("GET", PROBE, context="probe")
+    finally:
+        await t.aclose()
+    message = str(excinfo.value)
+    assert message.startswith("probe:"), f"the refusal must name the call site: {message}"
+    assert "untrusted transport text" in message
+    assert not isinstance(excinfo.value, ssl.SSLError)
+
+
+class _CloseFailsStream(httpx.AsyncByteStream):
+    """A body over the ceiling whose socket then fails to close."""
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield b"x" * (MAX_RESPONSE_BYTES + 1024)
+
+    async def aclose(self) -> None:
+        raise httpx.CloseError("socket close failed")
+
+
+async def test_a_close_failure_does_not_replace_the_refusal_already_raised(
+    settings: Settings, no_sleep: None
+) -> None:
+    """Found by security review of this change. `aclose()` on a broken socket raises during
+    `__aexit__`, which *replaces* the exception pending inside the block -- so the widened
+    seam caught the `CloseError` and converted it, destroying the `ResponseTooLarge` marker
+    `search_entities` catches by type to shrink an oversized page. Measured: the ceiling
+    refusal became "the connection to Aleph failed", and the shrink loop silently stopped
+    working while every existing test stayed green.
+
+    The typed marker is asserted, not the message: the type is what the shrink loop reads.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"content-type": "application/json"}, stream=_CloseFailsStream()
+        )
+
+    t = Transport(settings)
+    try:
+        t._http._transport = httpx.MockTransport(handler)
+        with pytest.raises(ResponseTooLarge) as excinfo:
+            await t.request("GET", PROBE, context="probe")
+    finally:
+        await t.aclose()
+    message = str(excinfo.value)
+    assert "over the" in message and "ceiling" in message
+    assert "connection to Aleph failed" not in message, "the close failure is noise after it"
 
 
 def test_the_tls_cause_walk_terminates_on_a_cyclic_chain() -> None:
