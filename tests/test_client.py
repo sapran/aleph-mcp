@@ -2177,12 +2177,17 @@ async def test_a_defect_in_this_module_is_not_memoised_as_an_upstream_fault(
     calls = 0
     real = client._transport.request
 
-    async def flaky(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    async def flaky(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        # Only the metadata request, and only the first one: the fault has to be raised
+        # *inside* `get_model`'s try, which is the only thing the cache covers. Raised on the
+        # endpoint's own request instead, it never reaches the cache at all and this test
+        # cannot fail -- measured: widening the except back to `Exception` left it green.
         nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise TypeError("a defect in this module")
-        return await real(*args, **kwargs)
+        if path == "/api/2/metadata":
+            calls += 1
+            if calls == 1:
+                raise TypeError("a defect in this module")
+        return await real(method, path, **kwargs)
 
     monkeypatch.setattr(client._transport, "request", flaky)
     respx_mock.get("/api/2/entities/e1").mock(
