@@ -6,10 +6,12 @@ from urllib.parse import parse_qsl, urlsplit
 import httpx
 import pytest
 import respx
-from fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ResourceError, ToolError
 from pydantic import TypeAdapter
 
 from aleph_mcp.client import (
+    _FALLBACK_CAPTION_NOTE,
+    _MODEL_FAILURE_TTL,
     _SHAPED_ENDPOINTS,
     MAX_EXPAND,
     MAX_FACET_SIZE,
@@ -2025,3 +2027,168 @@ async def test_a_defect_in_this_module_is_not_swallowed_as_a_slow_model(
 
     with pytest.raises(type(defect)):
         await client.get_entity(entity_id="e1")
+
+
+# A `model` that is not an object, and the cost of a metadata route that stays broken.
+# Both measured on `develop @ b374900` before this change: two `get_entity` calls against
+# `{"model": "https://..."}` both raised `AttributeError: 'str' object has no attribute
+# 'get'` with the metadata route called once -- cached, so permanent -- and three calls
+# against a 503 route cost twelve upstream requests.
+
+
+@pytest.mark.parametrize(
+    ("model", "kind"),
+    [("https://aleph.test/model", "str"), ([{"schemata": {}}], "list"), (3, "int")],
+    ids=["str", "list", "int"],
+)
+async def test_a_non_object_model_degrades_by_type_not_by_attribute_error(
+    client: AlephClient,
+    respx_mock: respx.MockRouter,
+    no_sleep: None,
+    model: Any,
+    kind: str,
+) -> None:
+    """The shaped tools keep answering, and the reason is a classified upstream refusal.
+
+    Before the type check, `model.get("schemata")` ran outside `_schemata`'s try on a
+    truthy non-dict and raised `AttributeError` -- reported to the caller as a defect in
+    this server, and permanently, because the bad value was already cached. The refusal it
+    became is a `ResourceError`, so `_schemata`'s existing arm degrades it like any other
+    upstream fault: this is what makes the degradation automatic rather than a new arm.
+    """
+    respx_mock.get("/api/2/metadata").mock(return_value=httpx.Response(200, json={"model": model}))
+    respx_mock.get("/api/2/entities/e1").mock(
+        return_value=httpx.Response(200, json=_probe_entity())
+    )
+
+    out = await client.get_entity(entity_id="e1")
+
+    assert out["caption"] == "Acme", f"a JSON {kind} model must degrade, not fail the tool"
+    assert _FALLBACK_CAPTION_NOTE in out["_note"]
+
+
+@pytest.mark.parametrize(
+    ("model", "kind"),
+    [("https://aleph.test/model", "str"), ([{"schemata": {}}], "list"), (3, "int")],
+    ids=["str", "list", "int"],
+)
+async def test_a_non_object_model_is_refused_rather_than_served_as_an_empty_ontology(
+    client: AlephClient, respx_mock: respx.MockRouter, no_sleep: None, model: Any, kind: str
+) -> None:
+    """For the ontology tools the model *is* the answer, so degrading is not available:
+    reporting zero schemata would be a false statement about the instance. The type name is
+    what tells an operator which end is broken, and unlike the value it cannot carry a
+    payload.
+    """
+    respx_mock.get("/api/2/metadata").mock(return_value=httpx.Response(200, json={"model": model}))
+
+    with pytest.raises(ResourceError) as excinfo:
+        await client.list_schemata()
+    message = str(excinfo.value)
+    assert f"JSON {kind}" in message
+    assert "will not help" in message
+    assert "aleph.test/model" not in message, "the body is upstream text and is not quoted"
+
+
+@pytest.mark.parametrize("model", [None, {}, ""], ids=["null", "empty-object", "empty-string"])
+async def test_a_model_that_declares_nothing_is_still_no_ontology_not_a_refusal(
+    client: AlephClient, respx_mock: respx.MockRouter, model: Any
+) -> None:
+    """`payload.get("model") or {}` treated a missing key, `null` and `{}` alike, and an
+    instance is entitled to declare no ontology. Only a *truthy* non-dict is nonsense, so
+    the falsy cases must stay a successful empty model -- including the falsy non-dict `""`,
+    which the type check must not catch.
+    """
+    respx_mock.get("/api/2/metadata").mock(return_value=httpx.Response(200, json={"model": model}))
+
+    assert await client.get_model() == {}
+    assert (await client.list_schemata())["count"] == 0
+
+
+async def test_a_failing_metadata_route_costs_one_retry_budget_per_window(
+    client: AlephClient, respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    """Only a success was memoised, so every entity-returning call refetched: measured at
+    twelve upstream requests for three calls, a full transport retry budget each. One
+    budget covers the window, and the window expiring must actually refetch -- a permanent
+    negative cache would turn one unlucky 503 into process-long degraded captions.
+    """
+    now = 0.0
+    monkeypatch_clock = lambda: now  # noqa: E731 -- read at call time, like the shrink loop
+    meta = respx_mock.get("/api/2/metadata").mock(return_value=httpx.Response(503))
+    respx_mock.get("/api/2/entities/e1").mock(
+        return_value=httpx.Response(200, json=_probe_entity())
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("aleph_mcp.client._monotonic", monkeypatch_clock)
+
+        for _ in range(3):
+            assert (await client.get_entity(entity_id="e1"))["caption"] == "Acme"
+        one_budget = meta.call_count
+        assert one_budget < 12, f"three calls paid {one_budget} requests, not one budget"
+
+        now = _MODEL_FAILURE_TTL + 1.0
+        await client.get_entity(entity_id="e1")
+
+    assert meta.call_count > one_budget, "the window must expire and refetch"
+
+
+async def test_a_read_only_refusal_survives_the_failure_cache(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The failure cache must not launder the safety boundary into a degraded caption. The
+    suppressed calls re-raise the cached exception, so its class and its `__cause__` -- which
+    is what `_schemata` classifies on -- have to survive the round trip, not just the first
+    call.
+    """
+    respx_mock.get("/api/2/metadata").mock(
+        return_value=httpx.Response(
+            302, headers={"Location": "https://elsewhere.invalid/api/2/metadata"}
+        )
+    )
+    respx_mock.get("/api/2/entities/e1").mock(
+        return_value=httpx.Response(200, json=_probe_entity())
+    )
+
+    for attempt in range(2):
+        with pytest.raises(ToolError, match="read-only allowlist") as excinfo:
+            await client.get_entity(entity_id="e1")
+        assert "elsewhere.invalid" in str(excinfo.value), f"lost on call {attempt + 1}"
+
+
+async def test_an_ontology_that_was_read_and_is_empty_is_not_announced_as_a_degradation(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The note says the ontology could not be read, so it must not fire when it was read
+    and simply declares no caption fields -- there the fallback order is the correct answer.
+    This is the whole reason the signal keys on `None` rather than on a falsy `schemata`.
+    """
+    respx_mock.get("/api/2/metadata").mock(
+        return_value=httpx.Response(200, json={"model": {"schemata": {}}})
+    )
+    respx_mock.get("/api/2/entities/e1").mock(
+        return_value=httpx.Response(200, json=_probe_entity())
+    )
+
+    out = await client.get_entity(entity_id="e1")
+
+    assert out["caption"] == "Acme"
+    assert "_note" not in out
+
+
+async def test_the_derived_caption_note_composes_with_the_endpoint_s_own(
+    client: AlephClient, respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    """A cross-collection search from an instance whose ontology is down is both things, and
+    a caller needs to be told both. Overwriting would delete whichever note the endpoint set
+    -- the same composition `search_entities` already does among its own notes.
+    """
+    respx_mock.get("/api/2/metadata").mock(return_value=httpx.Response(503))
+    respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json=raw_search_payload(_probe_entity()))
+    )
+
+    out = await client.search_entities(collection="*", q="acme")
+
+    assert "EVERY COLLECTION" in out["_note"], "the endpoint's own note must survive"
+    assert _FALLBACK_CAPTION_NOTE in out["_note"]

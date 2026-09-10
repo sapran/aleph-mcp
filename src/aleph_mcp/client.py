@@ -12,7 +12,7 @@ from fastmcp.exceptions import ResourceError, ToolError
 
 from .config import Settings
 from .echo import PROPERTY_VALUE, render
-from .errors import ResponseTooLarge
+from .errors import ResponseTooLarge, raise_unusable_model
 from .readonly import ReadOnlyViolation
 from .scope import ALL_COLLECTIONS, CollectionResolver
 from .transport import MAX_RESPONSE_BYTES, Query, Transport
@@ -98,6 +98,29 @@ _CAPTION_FALLBACK = (
     "phone",
     "registrationNumber",
     "full",
+)
+
+# How long a failure to obtain a usable instance model is remembered. Only a *success* was
+# memoised before, so a persistently broken /api/2/metadata was refetched by every
+# entity-returning call: measured at three `get_entity` calls costing twelve upstream
+# requests, a full transport retry budget each. Bounded rather than permanent on purpose --
+# permanent negative caching turns one unlucky 503 into process-long degraded captions,
+# which is a worse failure than the requests it saves. Read through `_monotonic`, so the one
+# patched clock that governs the retry budget, the scope resolver and the shrink loop governs
+# this window too, and a test moves it without sleeping.
+_MODEL_FAILURE_TTL = 60.0
+
+# The signal this degradation lacked. Every other one in this file announces itself --
+# TRUNCATED PAGE, EMPTY SLICE, EVERY COLLECTION, `_provenance` -- while a caption derived
+# from `_CAPTION_FALLBACK` was indistinguishable from one the instance's own ontology
+# produced. Emitted only when the ontology could not be *read*: an ontology that was read and
+# declares no caption fields makes the fallback order the correct answer, not a degradation,
+# and noting it would state something false on every reply from a minimal instance.
+_FALLBACK_CAPTION_NOTE = (
+    "DERIVED CAPTIONS: this instance's followthemoney ontology (/api/2/metadata) could not "
+    "be read, so each `caption` here was derived from a fixed property order rather than "
+    "from the schema's own caption fields. The rest of every entity is unaffected; treat a "
+    "caption as a convenience label, not as the instance's own."
 )
 
 
@@ -483,6 +506,10 @@ class AlephClient:
             monotonic=lambda: _monotonic(),
         )
         self._model: dict[str, Any] | None = None
+        # When the model last failed to load, and with what. Paired with
+        # `_MODEL_FAILURE_TTL` above; see `get_model` for why the exception itself is what
+        # gets kept.
+        self._model_failure: tuple[float, Exception] | None = None
         # Retries, budgets, the streaming ceiling and the read-only hook live in
         # transport.py; this class only ever asks it for a decoded body. `_monotonic` is
         # passed through the same late-bound way as above, so one patched clock governs the
@@ -499,12 +526,38 @@ class AlephClient:
 
         Sourced from GET /api/2/metadata so the ontology always matches the schema
         version the server actually indexes with, instead of a pinned client copy.
+
+        A failure is cached too, for `_MODEL_FAILURE_TTL`. What is kept is the exception
+        instance, re-raised with its traceback cleared: `_schemata` classifies by class and
+        by `__cause__` -- that is how a read-only refusal stays a read-only refusal rather
+        than becoming a degraded caption -- and both survive a re-raise, so the suppressed
+        calls are indistinguishable from the one that paid for the request. Clearing the
+        traceback stops it growing a frame per suppressed call across the window.
+
+        A truthy non-dict `model` is refused here rather than cached. It used to be cached
+        unchecked and read with `.get` outside any handler, so a `model` arriving as a string
+        raised `AttributeError` from `_schemata` -- reported to the caller as a defect in this
+        server, and permanent, because the bad value was in the cache. A missing, null or
+        empty `model` keeps its own meaning: an instance entitled to declare no ontology.
         """
-        if self._model is None:
+        if self._model is not None:
+            return self._model
+        if self._model_failure is not None:
+            failed_at, exc = self._model_failure
+            if _monotonic() - failed_at < _MODEL_FAILURE_TTL:
+                raise exc.with_traceback(None)
+            self._model_failure = None
+        try:
             payload = await self._transport.request(
                 "GET", "/api/2/metadata", context="aleph://schema", resource=True
             )
-            self._model = payload.get("model") or {}
+            model = payload.get("model")
+            if model and not isinstance(model, dict):
+                raise_unusable_model(type(model).__name__, context="aleph://schema", resource=True)
+        except Exception as e:
+            self._model_failure = (_monotonic(), e)
+            raise
+        self._model = model or {}
         return self._model
 
     async def _reply(self, built: Any, endpoint: str) -> dict[str, Any]:
@@ -512,8 +565,23 @@ class AlephClient:
 
         The instance model is fetched once here, after the endpoint has made its own
         request, so a call refused before that point still costs no upstream request.
+
+        `None` from `_schemata` means the ontology could not be read, and every caption in
+        this reply therefore came from `_CAPTION_FALLBACK`. That is announced, the way every
+        other degradation in this file is. It composes with a note the endpoint already set
+        rather than replacing it -- a truncated page from an instance whose ontology is down
+        is both, and a caller needs to be told both.
         """
-        return cast(dict[str, Any], _shape(built, await self._schemata(), endpoint))
+        schemata = await self._schemata()
+        shaped = cast(dict[str, Any], _shape(built, schemata, endpoint))
+        if schemata is None and isinstance(shaped, dict):
+            existing = shaped.get("_note")
+            shaped["_note"] = (
+                f"{existing} {_FALLBACK_CAPTION_NOTE}"
+                if isinstance(existing, str) and existing
+                else _FALLBACK_CAPTION_NOTE
+            )
+        return shaped
 
     async def _schemata(self) -> dict[str, Any] | None:
         """Cached FtM schemata, used only to derive captions. An upstream fault is not fatal.
@@ -569,11 +637,12 @@ class AlephClient:
             # deleting this arm entirely, or appending `except Exception` after it, both left
             # the suite green at 380 passed.
             #
-            # One live counterexample to that reading, pre-existing and recorded in
-            # docs/implementation-notes.md rather than fixed here: `model.get("schemata")`
-            # below is outside this try, so an upstream `model` that is truthy but not a dict
-            # raises AttributeError there and means "upstream sent nonsense", not "this module
-            # has a bug".
+            # The one live counterexample to that reading is gone: an upstream `model` that
+            # is truthy but not a dict used to reach `model.get("schemata")` below -- outside
+            # this try -- and raise AttributeError there, meaning "upstream sent nonsense"
+            # rather than "this module has a bug". `get_model` now refuses that shape as a
+            # ResourceError, so it arrives through the arm above and degrades like any other
+            # upstream fault, and `model` here is a dict by construction.
             return None
         schemata = model.get("schemata")
         return schemata if isinstance(schemata, dict) else None

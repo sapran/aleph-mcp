@@ -132,6 +132,27 @@ def raise_too_large(size: int, limit: int, *, context: str, resource: bool = Fal
     )
 
 
+def raise_unusable_model(kind: str, *, context: str, resource: bool = False) -> NoReturn:
+    """Refuse a metadata body whose `model` is present but is not an object.
+
+    `kind` is the JSON type that arrived, and it is the only thing quoted: the value itself
+    is upstream text, and this refusal is raised from the one place that could otherwise
+    cache it. A type name is what tells an operator which end is broken, and it cannot carry
+    a payload.
+
+    Told not to retry for the same reason `raise_unreachable` is: the bad shape is what the
+    instance serves for this route, so a second call spends an upstream request to be
+    refused identically.
+    """
+    err_cls = ResourceError if resource else ToolError
+    raise err_cls(
+        f"{context}: this Aleph instance answered /api/2/metadata with a `model` that is a "
+        f"JSON {kind} rather than an object, so its followthemoney ontology cannot be read. "
+        "That is an upstream fault: nothing about the call can change it and retrying will "
+        "not help. Entity captions fall back to a fixed property order in the meantime."
+    )
+
+
 # An error body worth quoting is never large. Parsing before checking would let the error
 # path allocate without bound, which is the one path the transport ceiling cannot cover:
 # the status is known before the body is.
