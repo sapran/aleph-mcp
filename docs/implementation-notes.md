@@ -189,8 +189,15 @@ Retired since the last prune:
   refuses an unmarked entity-shaped dict. Read both halves of that trade -- on such an instance
   `get_profile` does not degrade, it stops answering entirely, and the refusal is not something
   the caller can act on. That is the right way round for unbounded document text reaching a model,
-  but it is a real availability cost on a version bump rather than a free win. Deciding whether to
-  mark the field is a spec question, not a refactor.
+  but it is a real availability cost on a version bump rather than a free win.
+
+  **Decided 2026-09-10: accepted as-is, and shipped as a documented behaviour change in 0.3.0.**
+  The failure only occurs on an instance that serialises `entities` as objects, which no fixture and
+  no tested instance does; the leak it prevents would be silent and unbounded. The note stays open
+  because the *availability* half is unaddressed: on such an instance the tool does not degrade, it
+  stops answering, and the message blames this server for an upstream shape. Marking the field so
+  the seam skips it would restore the leak; shaping the objects properly is the fix that makes the
+  question disappear, and it belongs in its own change.
 
 - **`_slim_entityset` copies upstream `entities` verbatim, and nothing fails closed there.**
   `get_entityset` and `list_entitysets` pass that field straight through, exactly as `get_profile`
