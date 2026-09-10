@@ -6,6 +6,7 @@ from typing import NoReturn
 import httpx
 from fastmcp.exceptions import ResourceError, ToolError
 
+from .echo import UPSTREAM_ERROR, render
 from .readonly import ReadOnlyViolation
 
 
@@ -71,13 +72,13 @@ def raise_unreachable(
     unlucky connect from an instance that is down, so it retries by hand — which is the
     behaviour the retry loop exists to remove.
 
-    The transport text is labelled untrusted as well as sanitised. `_as_quoted_data` calls
-    the label the mitigation on this path, so the two halves belong together even though no
+    The transport text is labelled untrusted as well as sanitised. `echo.UPSTREAM_ERROR`
+    calls the label the mitigation on this path, so the two halves belong together even though no
     attacker-authored string is known to reach here: every message in this file that embeds
     foreign text carries one, and the next call site inherits whichever pattern it copies.
     """
     err_cls = ResourceError if resource else ToolError
-    detail = _as_quoted_data(str(exc))
+    detail = render(str(exc), UPSTREAM_ERROR)
     # A ConnectTimeout carries no message at all — anyio raises a bare TimeoutError — so an
     # unconditional parenthetical renders as empty quotes and reads as a broken message.
     reported = (
@@ -131,11 +132,6 @@ def raise_too_large(size: int, limit: int, *, context: str, resource: bool = Fal
     )
 
 
-# Aleph's own error text is upstream content, so it is quoted as data, kept to one line
-# and kept short. It is an aid to the operator, not a channel: nothing that fails the
-# shape below reaches the model at all.
-_MAX_UPSTREAM_CHARS = 200
-
 # An error body worth quoting is never large. Parsing before checking would let the error
 # path allocate without bound, which is the one path the transport ceiling cannot cover:
 # the status is known before the body is.
@@ -164,24 +160,5 @@ def _upstream_detail(resp: httpx.Response, body: bytes | None) -> str:
     message = payload.get("message")
     if not isinstance(message, str) or not message.strip():
         return ""
-    return f' Aleph reported (untrusted upstream text): "{_as_quoted_data(message)}"'
-
-
-def _as_quoted_data(text: str) -> str:
-    """Make upstream text safe to embed between quotes in a model-visible message.
-
-    The label is the only mitigation on this path, and a single double quote in the
-    payload closes the quoted region early — after which the rest reads as server-authored
-    guidance. So the delimiter is neutralised, and anything non-printable goes with it:
-    C0/C1 controls, ANSI escapes and bidi overrides all survive `str.split()`, which
-    collapses whitespace only, and MCP clients render tool errors into terminals.
-    """
-    printable = "".join(ch if ch.isprintable() else " " for ch in text)
-    # Collapsing whitespace keeps a multi-line body from presenting as separate lines.
-    return _truncate(" ".join(printable.split()).replace('"', "'"), _MAX_UPSTREAM_CHARS)
-
-
-def _truncate(s: str, n: int) -> str:
-    if len(s) <= n:
-        return s
-    return s[:n] + "…"
+    quoted = render(message, UPSTREAM_ERROR)
+    return f' Aleph reported (untrusted upstream text): "{quoted}"'

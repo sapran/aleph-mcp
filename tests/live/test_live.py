@@ -183,7 +183,7 @@ async def test_write_requests_are_refused_before_the_network(live_client: AlephC
         ("POST", "/api/2/collections/1/reingest"),
     ):
         with pytest.raises(ReadOnlyViolation):
-            await live_client._http.request(method, path, json={})
+            await live_client._transport._http.request(method, path, json={})
 
 
 # -- every tool, over MCP, against the real instance ---------------------------
