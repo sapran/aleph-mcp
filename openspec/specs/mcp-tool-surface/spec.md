@@ -343,17 +343,18 @@ An unusable model SHALL NOT be reported as an ontology that declares nothing: `l
 
 This requirement exists because the value was previously cached unchecked and read with `.get` outside any handler, so a `model` arriving as a string raised an `AttributeError` that reached the caller as a server defect, and — because the bad value was cached — left all ten shaped tools, both ontology tools and the ontology resource broken for the process lifetime.
 
-#### Scenario: A non-object model is refused by type
+#### Scenario: A non-object model degrades an entity-returning tool, and is announced
 
 - **WHEN** `/api/2/metadata` answers `200` with `{"model": "https://example/model"}` and an entity-returning tool is called
-- **THEN** the call fails with a refusal naming the received JSON type
-- **AND** the message states the fault is upstream and that retrying will not help
+- **THEN** the call answers, with captions derived from the fixed fallback order
+- **AND** the reply's `_note` states the ontology could not be read
 - **AND** no `AttributeError` reaches the caller
 
 #### Scenario: An unusable model is not served as an empty ontology
 
 - **WHEN** `/api/2/metadata` answers `200` with a `model` that is not an object and `list_schemata` is called
-- **THEN** the call fails with the refusal
+- **THEN** the call fails with a refusal naming the received JSON type
+- **AND** the message states the fault is upstream and that retrying will not help
 - **AND** it does not return a schema count of zero
 
 #### Scenario: An absent model still means no ontology declared

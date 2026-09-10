@@ -4,7 +4,9 @@ import functools
 import re
 import secrets
 import time
+import traceback
 from collections.abc import Awaitable, Callable
+from types import TracebackType
 from typing import Any, Concatenate, cast
 
 import httpx
@@ -120,7 +122,8 @@ _FALLBACK_CAPTION_NOTE = (
     "DERIVED CAPTIONS: this instance's followthemoney ontology (/api/2/metadata) could not "
     "be read, so each `caption` here was derived from a fixed property order rather than "
     "from the schema's own caption fields. The rest of every entity is unaffected; treat a "
-    "caption as a convenience label, not as the instance's own."
+    "caption as a convenience label, not as the instance's own. The fault is remembered "
+    "briefly, so an immediate retry returns this same answer without asking the instance."
 )
 
 
@@ -509,7 +512,7 @@ class AlephClient:
         # When the model last failed to load, and with what. Paired with
         # `_MODEL_FAILURE_TTL` above; see `get_model` for why the exception itself is what
         # gets kept.
-        self._model_failure: tuple[float, Exception] | None = None
+        self._model_failure: tuple[float, Exception, TracebackType | None] | None = None
         # Retries, budgets, the streaming ceiling and the read-only hook live in
         # transport.py; this class only ever asks it for a decoded body. `_monotonic` is
         # passed through the same late-bound way as above, so one patched clock governs the
@@ -543,9 +546,15 @@ class AlephClient:
         if self._model is not None:
             return self._model
         if self._model_failure is not None:
-            failed_at, exc = self._model_failure
+            failed_at, exc, tb = self._model_failure
             if _monotonic() - failed_at < _MODEL_FAILURE_TTL:
-                raise exc.with_traceback(None)
+                # The *original* traceback, restored rather than dropped or extended. Dropping
+                # it names this line as the origin, and a module defect is then diagnosable
+                # only on its first occurrence -- there is no logging in this package, so the
+                # traceback is the only diagnostic there is. Extending it (a plain re-raise)
+                # appends a frame per suppressed call for the whole window. Restoring the same
+                # object each time does neither.
+                raise exc.with_traceback(tb)
             self._model_failure = None
         try:
             payload = await self._transport.request(
@@ -553,9 +562,19 @@ class AlephClient:
             )
             model = payload.get("model")
             if model and not isinstance(model, dict):
-                raise_unusable_model(type(model).__name__, context="aleph://schema", resource=True)
-        except Exception as e:
-            self._model_failure = (_monotonic(), e)
+                raise_unusable_model(model, context="aleph://schema", resource=True)
+        except (ResourceError, httpx.HTTPError, ValueError) as e:
+            # Exactly the families `_schemata` classifies as upstream faults, which is what
+            # this cache is for. A defect in this module is deliberately *not* memoised: it
+            # must keep reaching the caller with its own traceback on every call, which is the
+            # property `_schemata`'s named except arms exist to preserve.
+            #
+            # The frames are cleared before the instance is stored. It now outlives its call
+            # by the whole window, and `Transport.request`'s frame holds the response body --
+            # up to MAX_RESPONSE_BYTES, since the give-up body is read in full. The line chain
+            # a traceback shows survives; only the locals go.
+            traceback.clear_frames(e.__traceback__)
+            self._model_failure = (_monotonic(), e, e.__traceback__)
             raise
         self._model = model or {}
         return self._model
@@ -566,18 +585,24 @@ class AlephClient:
         The instance model is fetched once here, after the endpoint has made its own
         request, so a call refused before that point still costs no upstream request.
 
-        `None` from `_schemata` means the ontology could not be read, and every caption in
+        `None` from `_schemata` means the ontology could not be *read*, and every caption in
         this reply therefore came from `_CAPTION_FALLBACK`. That is announced, the way every
         other degradation in this file is. It composes with a note the endpoint already set
         rather than replacing it -- a truncated page from an instance whose ontology is down
         is both, and a caller needs to be told both.
+
+        The server's own statement goes first. Nothing upstream-authored can reach `existing`
+        today -- every shaped endpoint builds its top-level keys itself, and only
+        `search_entities` sets `_note`, from its own constants -- but this is the ordering that
+        would not hurt if that ever changed: upstream text prefixed to a server sentence reads
+        as its opening clause.
         """
         schemata = await self._schemata()
         shaped = cast(dict[str, Any], _shape(built, schemata, endpoint))
-        if schemata is None and isinstance(shaped, dict):
+        if schemata is None:
             existing = shaped.get("_note")
             shaped["_note"] = (
-                f"{existing} {_FALLBACK_CAPTION_NOTE}"
+                " ".join([_FALLBACK_CAPTION_NOTE, existing])
                 if isinstance(existing, str) and existing
                 else _FALLBACK_CAPTION_NOTE
             )
@@ -645,6 +670,14 @@ class AlephClient:
             # upstream fault, and `model` here is a dict by construction.
             return None
         schemata = model.get("schemata")
+        if not schemata:
+            # Read, and declares nothing. `{}` rather than `None` because `None` is what
+            # `_reply` reads as *could not be read*, and announcing a degradation here would
+            # state something false on every reply from a legitimately minimal instance --
+            # including `{"model": {}}` and a missing `model`, which `get_model` caches as `{}`.
+            # Caption-neutral: `derive_caption` guards with `if schemata:`, so an empty dict
+            # and `None` already select the same fallback order.
+            return {}
         return schemata if isinstance(schemata, dict) else None
 
     async def list_schemata(self) -> dict[str, Any]:

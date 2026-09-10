@@ -192,6 +192,18 @@ fixing any of them forces this note to be closed.
 - **`_slim_collection(full=True)` copies `statistics` verbatim.** `get_collection` returns whatever
   that block holds, unread and unbounded; `list_collections` does not, because it slims with
   `full=False`.
+- **An upstream `_note` key makes `get_entityset` return the whole unslimmed payload.**
+  `client.py:1164` short-circuits the slimmer on `if payload.get("_note")`, a branch written for
+  the server-authored profile-redirect reply — but the test is on the *decoded upstream body*, so
+  an instance or an on-path proxy that adds one `_note` key to a 200 gets the entire payload back
+  verbatim, bypassing `_slim_entityset`'s fixed key set, the `bodyText` strip and the 500-char
+  property cap. Executed during review of `harden-metadata-path`: with the key present a hostile
+  note, an unknown upstream key and a 400-character `bodyText` all reached the caller; without it
+  the reply was slimmed and the `bodyText` dropped. A different mechanism from the `entities`
+  copy-through above, and unexercised by the suite — no test sends a 200 carrying `_note`. It also
+  becomes sharper if `get_entityset` is ever `@_shaped`, which is the natural fix for the slot
+  above: upstream text would then land in `_reply`'s existing-note composition. Fix is to key the
+  short-circuit on something upstream cannot set. Pre-existing and outside that change's scope.
 
 ## 8. The resource path lacks the tool path's guarantees
 

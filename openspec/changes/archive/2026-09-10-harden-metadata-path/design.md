@@ -51,8 +51,12 @@ reasons: `_schemata` classifies by type and by `__cause__`, both of which a re-r
 preserves, so the degradation stays byte-identical to today's; and clearing the traceback
 stops it accumulating a frame per suppressed call across the window.
 
-**The note fires on `None`, not on an empty ontology.** `_schemata` already returns `None`
-only for a fault and `{}` for "read, declares nothing". A note on `{}` would fire on every
+**The note fires on `None`, not on an empty ontology.** `_schemata` is made to return `None`
+only for a fault and `{}` for "read, declares nothing" -- it did not, before this change:
+`model.get("schemata")` is `None` for `{"model": {}}` and for a missing `model`, the very
+shapes this change defines as a successful read, so keying the note on `None` announced an
+unreadable ontology on every reply from a minimal instance. Found in review of this change;
+the tail of `_schemata` now collapses every falsy `schemata` to `{}`. A note on `{}` would fire on every
 reply from a legitimately minimal instance — and on most of this suite — while saying the
 ontology could not be read, which would be false. The note composes with an existing `_note`
 rather than replacing it, the way `search_entities`' own notes compose: a truncated page from

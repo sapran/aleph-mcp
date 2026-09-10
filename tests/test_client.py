@@ -2038,8 +2038,13 @@ async def test_a_defect_in_this_module_is_not_swallowed_as_a_slow_model(
 
 @pytest.mark.parametrize(
     ("model", "kind"),
-    [("https://aleph.test/model", "str"), ([{"schemata": {}}], "list"), (3, "int")],
-    ids=["str", "list", "int"],
+    [
+        ("https://aleph.test/model", "string"),
+        ([{"schemata": {}}], "array"),
+        (3, "number"),
+        (True, "boolean"),
+    ],
+    ids=["string", "array", "number", "boolean"],
 )
 async def test_a_non_object_model_degrades_by_type_not_by_attribute_error(
     client: AlephClient,
@@ -2069,8 +2074,13 @@ async def test_a_non_object_model_degrades_by_type_not_by_attribute_error(
 
 @pytest.mark.parametrize(
     ("model", "kind"),
-    [("https://aleph.test/model", "str"), ([{"schemata": {}}], "list"), (3, "int")],
-    ids=["str", "list", "int"],
+    [
+        ("https://aleph.test/model", "string"),
+        ([{"schemata": {}}], "array"),
+        (3, "number"),
+        (True, "boolean"),
+    ],
+    ids=["string", "array", "number", "boolean"],
 )
 async def test_a_non_object_model_is_refused_rather_than_served_as_an_empty_ontology(
     client: AlephClient, respx_mock: respx.MockRouter, no_sleep: None, model: Any, kind: str
@@ -2101,8 +2111,18 @@ async def test_a_model_that_declares_nothing_is_still_no_ontology_not_a_refusal(
     """
     respx_mock.get("/api/2/metadata").mock(return_value=httpx.Response(200, json={"model": model}))
 
+    respx_mock.get("/api/2/entities/e1").mock(
+        return_value=httpx.Response(200, json=_probe_entity())
+    )
+
     assert await client.get_model() == {}
     assert (await client.list_schemata())["count"] == 0
+    out = await client.get_entity(entity_id="e1")
+    assert out["caption"] == "Acme"
+    assert "_note" not in out, (
+        "the ontology was read: announcing it as unreadable states something false on every "
+        "reply from a minimal instance"
+    )
 
 
 async def test_a_failing_metadata_route_costs_one_retry_budget_per_window(
@@ -2131,15 +2151,50 @@ async def test_a_failing_metadata_route_costs_one_retry_budget_per_window(
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr("aleph_mcp.client._monotonic", monkeypatch_clock)
 
-        for _ in range(3):
-            assert (await client.get_entity(entity_id="e1"))["caption"] == "Acme"
+        assert (await client.get_entity(entity_id="e1"))["caption"] == "Acme"
         one_budget = meta.call_count
-        assert one_budget < 12, f"three calls paid {one_budget} requests, not one budget"
+        for _ in range(2):
+            assert (await client.get_entity(entity_id="e1"))["caption"] == "Acme"
+        # `< 12` would also pass for a cache good for exactly one suppressed call.
+        assert meta.call_count == one_budget, "a suppressed call must cost no upstream request"
 
         now = 3600.0
         await client.get_entity(entity_id="e1")
 
     assert meta.call_count > one_budget, "the window must expire and refetch"
+
+
+async def test_a_defect_in_this_module_is_not_memoised_as_an_upstream_fault(
+    client: AlephClient, respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failure cache covers exactly the families `_schemata` treats as upstream faults.
+
+    A `TypeError` from a defect in this package is not one of them: memoising it would make
+    the next call raise from the cache site instead of the bug, and there is no logging in
+    this package, so the traceback is the only diagnostic there is. Observable form -- the
+    call after the defect must be answered, not suppressed.
+    """
+    calls = 0
+    real = client._transport.request
+
+    async def flaky(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TypeError("a defect in this module")
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(client._transport, "request", flaky)
+    respx_mock.get("/api/2/entities/e1").mock(
+        return_value=httpx.Response(200, json=_probe_entity())
+    )
+
+    with pytest.raises(TypeError, match="a defect in this module"):
+        await client.get_entity(entity_id="e1")
+
+    assert (await client.get_entity(entity_id="e1"))["caption"] == "Acme", (
+        "a defect must not be cached as an upstream fault and suppress the next call"
+    )
 
 
 async def test_a_read_only_refusal_survives_the_failure_cache(
@@ -2150,7 +2205,7 @@ async def test_a_read_only_refusal_survives_the_failure_cache(
     is what `_schemata` classifies on -- have to survive the round trip, not just the first
     call.
     """
-    respx_mock.get("/api/2/metadata").mock(
+    meta = respx_mock.get("/api/2/metadata").mock(
         return_value=httpx.Response(
             302, headers={"Location": "https://elsewhere.invalid/api/2/metadata"}
         )
@@ -2163,6 +2218,8 @@ async def test_a_read_only_refusal_survives_the_failure_cache(
         with pytest.raises(ToolError, match="read-only allowlist") as excinfo:
             await client.get_entity(entity_id="e1")
         assert "elsewhere.invalid" in str(excinfo.value), f"lost on call {attempt + 1}"
+    # Without this the test passes with no cache at all: the 302 route simply answers twice.
+    assert meta.call_count == 1, "the second refusal must come from the cache, not a refetch"
 
 
 async def test_an_ontology_that_was_read_and_is_empty_is_not_announced_as_a_degradation(
