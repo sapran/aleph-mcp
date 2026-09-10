@@ -356,7 +356,14 @@ async def test_a_connect_failure_with_no_tls_cause_is_still_retried(
 def test_the_tls_cause_walk_terminates_on_a_cyclic_chain() -> None:
     """An exception chain can be cyclic, and this server re-raises a cached exception on the
     metadata path, so an unbounded walk here would be a hang reachable from an upstream
-    fault. Asserted rather than argued: without the visited set this call does not return."""
+    fault.
+
+    Mutation-proved, but note what red looks like here: dropping the visited set does not
+    make this test FAIL, it makes it never return -- measured as a 90-second timeout with no
+    summary line, against 0.11s for the whole selection when the bound is present. A future
+    reader looking for a red assertion will not find one, and should not conclude the guard
+    is inert.
+    """
     a = httpx.ConnectError("a")
     b = httpx.ConnectError("b")
     a.__cause__ = b

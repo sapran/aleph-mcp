@@ -7,56 +7,27 @@ Triaged 2026-09-10 against `develop @ b46b52d`: all 35 open claims were re-check
 tree, close relatives merged into the change that would close them, and two retired. Thirty-three
 survived, as fourteen entries. Entries are ordered by the work plan below; the numbering is the
 priority order, not an id. Item 1 of that plan — the metadata path — was closed by
-`harden-metadata-path` on 2026-09-10, so the plan and the sections below are renumbered and
-thirty-one claims across thirteen entries remain.
+`harden-metadata-path` on 2026-09-10, and item 1 of the renumbered plan — transport failure
+classification — by `classify-transport-failures` the same day. The plan and the sections below
+are renumbered after each, so twenty-nine claims across twelve entries remain.
 
 ## Work plan
 
-1. Classify transport failures — attacker-authored proxy text reaches the model unsanitised.
-2. Bound and neutralise the ontology echo — upstream schema names reach the model uncapped.
-3. Charge and account the response path — a 502 costs 16 requests and names the wrong cause.
-4. Guard the scope resolver's upstream shapes — untranslated errors, confident wrong diagnosis.
-5. Give refusals a type — a dead upstream is reported as a bad argument.
-6. Make the licence gate able to fail — it passes with the project's own LICENSE deleted.
-7. Answer the entity-shaped spec question — four copy-through slots, one decision, five xfails.
-8. Extend the tool path's guarantees to resources — a `resource()` factory and a wider walk.
-9. Close echo.py's enforcement gaps — an inline policy escapes both guards.
-10. Give `get_entity_text` a derived caption.
-11. Close the tests that cannot fail — four checks that certify nothing.
-12. Decide the private-sibling references — the publication deadline has already passed.
-13. Correct three pieces of stale prose (Tier 0).
+1. Bound and neutralise the ontology echo — upstream schema names reach the model uncapped.
+2. Charge and account the response path — a 502 costs 16 requests and names the wrong cause.
+3. Guard the scope resolver's upstream shapes — untranslated errors, confident wrong diagnosis.
+4. Give refusals a type — a dead upstream is reported as a bad argument.
+5. Make the licence gate able to fail — it passes with the project's own LICENSE deleted.
+6. Answer the entity-shaped spec question — four copy-through slots, one decision, five xfails.
+7. Extend the tool path's guarantees to resources — a `resource()` factory and a wider walk.
+8. Close echo.py's enforcement gaps — an inline policy escapes both guards.
+9. Give `get_entity_text` a derived caption.
+10. Close the tests that cannot fail — four checks that certify nothing.
+11. Decide the private-sibling references — the publication deadline has already passed.
+12. Correct three pieces of stale prose (Tier 0).
 ---
 
-## 1. Transport failures are classified by the wrong axis
-
-Two findings from the security review of `fix/retry-connection-failures`, one change: catch
-`httpx.TransportError` at the top of `Transport.request` and route its members by whether the
-request was delivered and whether the failure is deterministic.
-
-**`httpx.ProxyError` reaches the model unsanitised, and its text is attacker-authored.**
-`ProxyError` is a sibling of `ConnectError` under `TransportError`, not a subclass, so
-`transport._CONNECT_ERRORS` (`transport.py:65`) does not catch it and it never reaches `errors.py`'s
-sanitiser. httpcore builds its message from the proxy's `CONNECT` reason phrase
-(`httpcore/_async/http_proxy.py`), which h11 admits as `([ \t]|[^\x00\s])*` — every C0 control
-except NUL, `ESC` included — decoded with `errors="ignore"`. FastMCP then renders it verbatim,
-because `mask_error_details` defaults false. So a hostile or MITM'd forward proxy can write
-multi-kilobyte ASCII with ANSI escapes into a model-visible tool error, bypassing both the cap and
-the non-printable stripping of `echo.UPSTREAM_ERROR`. A forward proxy is a live deployment shape
-here. Do **not** simply add `ProxyError` to `_CONNECT_ERRORS` — a `CONNECT` that reached the proxy
-is not obviously undelivered, which is the argument that correctly keeps `ReadError` out; route it
-through `raise_unreachable` instead.
-
-**A TLS verification failure is retried four times with the wrong advice.** httpcore maps
-`ssl.SSLError` from the handshake to `ConnectError`, so `CERTIFICATE_VERIFY_FAILED` — the
-misconfiguration the README anticipates for a self-signed instance with `ALEPH_MCP_VERIFY_TLS` left
-true — costs three backoffs before failing, and the message speaks about network reachability. The
-real cause is visible only inside the quoted transport text. Retrying is harmless but pointless,
-since the failure is deterministic. Fixing it means classifying the cause (walk `e.__cause__` for an
-`ssl.SSLError`) and branching the message to name the setting. A DNS failure also arrives as
-`ConnectError` and should keep being retried: a resolver hiccup is plausibly transient. Nothing
-pins `verify_tls` at all today — see note 11.
-
-## 2. The ontology echo is unbounded and un-neutralised
+## 1. The ontology echo is unbounded and un-neutralised
 
 **`get_schema` echoes upstream schema names into a refusal.** `client.py:597` builds
 `f"Did you mean one of: {', '.join(close[:10])}?"` from the keys of `model["schemata"]`, which is
@@ -73,7 +44,7 @@ a bound on the joined list rather than only on the count. Related and lower: `li
 into `aleph://schemata`, bounded only by `MAX_RESPONSE_BYTES` and carrying no `_provenance` label.
 Behaviour change to a tool's output, so kept out of T2.
 
-## 3. The response path is neither charged nor accounted
+## 2. The response path is neither charged nor accounted
 
 **Only the connect path charges its elapsed time to the retry budget.** `transport.py:169` charges
 the connect elapsed; the response path charges only `delay` (`transport.py:174`), so a slow 429/5xx
@@ -93,7 +64,7 @@ the error path "has its own, much smaller bound"; the 64 KiB `_MAX_ERROR_BODY_BY
 `_upstream_detail` bounds only what is *quoted*, and above the ceiling the error path is never
 reached at all. Fixing it changes a refusal message, so it is a behaviour change.
 
-## 4. The scope resolver mishandles three upstream shapes
+## 3. The scope resolver mishandles three upstream shapes
 
 All three in `scope.py`, adjacent lines, one change.
 
@@ -117,7 +88,7 @@ message — "cannot be combined with named collections" — for a list that name
 The scalar `"*"` is accepted at `scope.py:141`. Unchanged from `develop`, untested anywhere.
 Correcting it changes a refusal message.
 
-## 5. Bare `ValueError` is the wrong refusal channel, in both directions
+## 4. Bare `ValueError` is the wrong refusal channel, in both directions
 
 Both halves close with one type: a dedicated `Refusal(ValueError)` raised at the client's own
 refusal sites and caught in place of bare `ValueError` — the pattern `errors.py` already sets for
@@ -136,7 +107,7 @@ replaced wrapped only the `await client.X(...)` call. Equivalent today — every
 forwarding call — but a future in-body `int()`, `datetime.fromisoformat()` or nested `json.loads`
 would be relabelled as a client refusal with nothing to catch it.
 
-## 6. The licence gate cannot fail
+## 5. The licence gate cannot fail
 
 Both in `.github/workflows/ci.yml`, the `build` job's licence step; one change. (The SIGPIPE race
 in the same step is fixed — see Retired.)
@@ -162,7 +133,7 @@ which is the first thing anyone debugging a packaging regression wants. Also, tw
 `unzip -p`) — unreachable in CI, where the checkout is fresh and `uv build` is the only writer, but
 it bites anyone running the step locally against a dirty `dist/`.
 
-## 7. Four aggregation slots are copied rather than rebuilt — one spec question
+## 6. Four aggregation slots are copied rather than rebuilt — one spec question
 
 `get_profile.entities`, `_slim_entityset.entities`, a tag row's `value`, and
 `_slim_collection(full=True).statistics` are one decision about what counts as entity-shaped, not
@@ -205,7 +176,7 @@ fixing any of them forces this note to be closed.
   above: upstream text would then land in `_reply`'s existing-note composition. Fix is to key the
   short-circuit on something upstream cannot set. Pre-existing and outside that change's scope.
 
-## 8. The resource path lacks the tool path's guarantees
+## 7. The resource path lacks the tool path's guarantees
 
 Three findings, closed by a ~4-line local `resource(uri, **kw)` factory mirroring `tool`, plus a
 wider walk in `find_marker`.
@@ -228,7 +199,7 @@ value and lists by item only. No client method builds a tuple, a set or a non-st
 reply, so nothing reaches those branches today, and the markers' own serialisation refusal still
 fires there — the outcome degrades to the pre-T1-FIX-2 message rather than leaking.
 
-## 9. echo.py's two enforcement gaps
+## 8. echo.py's two enforcement gaps
 
 **A policy built inline at a call site escapes both guards.** `test_every_policy_has_a_cap_row`
 (`tests/test_echo.py:59`) enumerates `vars(echo)`, so it sees only module-level policies declared in
@@ -246,14 +217,14 @@ model-visible message. Recorded because the coupling is now between two files ra
 function. Closing it means either stripping in the policy (a behaviour change to the existing
 message) or asserting the `!r` at the call site.
 
-## 10. `get_entity_text` derives no caption
+## 9. `get_entity_text` derives no caption
 
 `client.py:1188` reads `entity.get("caption")` straight off the payload, where every slimmed path
 calls `derive_caption`. Live Aleph sends a null caption, so this is the one tool that can return
 `caption: null` for an entity the other tools would have captioned. Found during T1; fixing it
 changes a tool's output and so is a behaviour change, not a refactor.
 
-## 11. Four checks that certify nothing
+## 10. Four checks that certify nothing
 
 One purely-test change closes all four.
 
@@ -272,9 +243,11 @@ One purely-test change closes all four.
   `develop` (where it closed `_http` directly) as well as after T4 (where it delegates to
   `Transport.aclose`).
 - **`verify_tls` has no test anywhere.** Zero hits across `tests/`, so nothing pins that
-  `ALEPH_MCP_VERIFY_TLS` reaches the httpx client at all. Related to note 1.
+  `ALEPH_MCP_VERIFY_TLS` reaches the httpx client at all. Sharpened rather than closed by
+  `classify-transport-failures`: a TLS refusal now names that setting to the operator, so the
+  message is wrong in a new way if the setting never reaches the client.
 
-## 12. A public repo still points at private siblings
+## 11. A public repo still points at private siblings
 
 The publication this was to be decided before has happened — 0.3.0 shipped from a public repo on
 2026-09-10 — so this is now a live defect rather than a pending decision.
@@ -293,7 +266,7 @@ private; `acordia` is also named across the specs, the archived changes and
 contributor cannot see. The declaration is deliberate and documented, so removing it is a design
 decision, not a cleanup.
 
-## 13. Three pieces of stale prose (Tier 0)
+## 12. Three pieces of stale prose (Tier 0)
 
 - **`openspec/config.yaml`'s layout paragraph is three modules stale**
   (`openspec/config.yaml:23-26`). It lists `server.py`, `client.py`, `readonly.py`, `config.py` and
@@ -311,6 +284,12 @@ decision, not a cleanup.
 ---
 
 ## Retired
+
+- Transport failures being classified by the wrong axis — both claims (attacker-authored
+  `ProxyError` text reaching the model unsanitised, and a TLS verification failure retried four
+  times with reachability advice) are now three requirements in
+  `openspec/specs/mcp-tool-surface`, and the partition is verified by a test that walks
+  `httpx.TransportError`'s subclasses from the live module rather than listing them.
 
 - The version being written in three places with nothing checking they agree — which shipped
   0.1.4 to every marketplace user as 0.1.2, because the *catalog* version is what drives
@@ -343,7 +322,7 @@ decision, not a cleanup.
   `set -o pipefail`, because `grep -q` exits on the match while `tar` still has a chunk to flush.
   **Fixed** by PR #18 (`e394ed9`): both listings are captured into a variable and matched from a
   here-string, as the step already did for `meta`. Measured 0/30 false failures, from 19/30. The
-  patterns were deliberately kept byte-identical, which is why note 6 above is still open.
+  patterns were deliberately kept byte-identical, which is why note 5 above is still open.
 - The shipped plugin `.mcp.json` running a shell at every server start, and the deliberate
   `aleph-mcp:keychain-miss` marker that keeps an omitted `env` entry from letting the server inherit
   an ambient `ALEPHCLIENT_API_KEY`. **Documented** in `plugins/aleph/README.md` (the setup section
