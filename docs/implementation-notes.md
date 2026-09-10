@@ -304,3 +304,28 @@ Retired since the last prune:
 - **`verify_tls` has no test anywhere.** Zero hits across `tests/`, so nothing pins that
   `ALEPH_MCP_VERIFY_TLS` reaches the httpx client at all. Found by review during T4;
   pre-existing. Related to the parked TLS-failure-retry note above.
+
+- **The licence assertions are unanchored, so a vendored LICENSE keeps them green while the
+  project's own is gone.** `.github/workflows/ci.yml`, the `build` job's licence step.
+  `grep -q 'licenses/LICENSE'` is a bare substring against the whole `unzip -l` listing, so
+  `aleph_mcp/vendor/licenses/LICENSE` satisfies it; `grep -q '/LICENSE$'` matches a member at any
+  depth, so `<pkg>/src/aleph_mcp/vendor/somedep/LICENSE` satisfies it. What the step means to
+  assert is `<name>-<ver>.dist-info/licenses/LICENSE` for the wheel and a root-level `LICENSE` for
+  the sdist. Verified by rebuilding both artefacts with the real licence deleted and a third-party
+  one planted deeper: **both the old and the new step exit 0** and print "licence expression,
+  header and file all present". That is precisely the case the step exists to catch — hatchling
+  silently drops the licence file and a bundled dependency's licence hides it. Pre-existing and
+  unchanged by the SIGPIPE fix, which deliberately kept both patterns byte-identical. The fix is to
+  anchor them: `'\.dist-info/licenses/LICENSE'` for the wheel and `-E '^[^/]+/LICENSE$'` for the
+  sdist. Found by review during the SIGPIPE fix; worth doing on its own because it changes what
+  the gate accepts, and today the repo has exactly one LICENSE so nothing would go red.
+
+- **The licence step names the wrong cause when the check cannot run, and prints no listing when it
+  fails.** Same step. A here-string redirection that fails (unwritable `$TMPDIR`) or a `grep` exiting
+  >1 lands in the same `|| { ... }` arm as a genuine miss, so the log says "the sdist ships no
+  LICENSE" and sends the reader to rebuild an archive that is fine; and neither arm prints the
+  listing it already holds, which is the first thing anyone debugging a packaging regression wants.
+  Also, two artefacts in `dist/` fail cryptically (`tar: <second>: Not found in archive`, or a
+  two-line `$wheel` that breaks `unzip -p` before the changed code) — unreachable in CI, where the
+  checkout is fresh and `uv build` is the only writer, but it bites anyone running the step locally
+  against a dirty `dist/`. All pre-existing; found by review during the SIGPIPE fix.
