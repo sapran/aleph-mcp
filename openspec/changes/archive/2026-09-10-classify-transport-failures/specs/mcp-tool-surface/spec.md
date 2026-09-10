@@ -38,11 +38,19 @@ proxy is a supported deployment shape, so that text is authored by anything on t
 
 ### Requirement: A refusal states whether the request can have been delivered
 
-A transport failure that occurred before the request could leave this process SHALL state that no
-response was received. A failure that may have occurred after delivery SHALL NOT state that: it
-SHALL say the request may have been received. Both SHALL state that this server issues only read
-requests, so that a caller knows nothing upstream can have changed regardless of which case it
-is.
+A transport failure this server has classified as occurring before the request could leave the
+process SHALL state that no response was received. Any other failure -- including one whose phase
+is not established -- SHALL NOT state that: it SHALL say the request may have been received. Both
+SHALL state that this server issues only read requests, so that a caller knows nothing upstream can
+have changed regardless of which case it is.
+
+The unclassified default is the possibly-delivered claim, and that is deliberate rather than
+precise: `PoolTimeout`, `UnsupportedProtocol` and `LocalProtocolError` all in fact occur before
+anything is sent, yet are told the request may have been received. Overstating what might have
+happened is the safe direction for a caller deciding whether to re-ask, and the alternative is a
+per-class table that must be re-audited on every dependency bump. The delivery axis is measured
+where it can be -- once the response headers arrive, no failure may claim otherwise -- and assumed
+pessimistically where it cannot.
 
 A caller deciding whether to re-ask depends on this distinction, and read-side failures
 (`ReadError`, `ReadTimeout`, `RemoteProtocolError`) are indistinguishable from a request Aleph did

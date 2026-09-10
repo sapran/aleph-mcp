@@ -26,7 +26,11 @@
       assert each one reaches a tool error naming the call context — the partition verified, not
       declared.
 - [x] 3.2 Assert the hostile proxy phrase is capped, stripped of control bytes and labelled
-      untrusted, driven through the shipped MCP path so it measures what the model reads.
+      untrusted. The 4102-character measurement was taken through `fastmcp.Client`, but the
+      landed test asserts at the `Transport` seam: the MCP boundary only prepends
+      `Error calling tool 'X': ` and the cap under test is applied below it, so the assertion
+      and the evidence differ by that fixed prefix. Recorded rather than restated, because the
+      docstring cites the boundary figure.
 - [x] 3.3 Assert a read-side failure does not claim that no response was received.
 - [x] 3.4 Assert a TLS-caused connect makes exactly one attempt and names the setting, and that a
       connect with no TLS cause is still retried to the budget.

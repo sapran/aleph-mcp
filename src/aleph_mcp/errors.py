@@ -147,8 +147,9 @@ def raise_transport_failed(exc: Exception, *, context: str, resource: bool = Fal
         f"{context}: the connection to Aleph failed ({_reported(exc)}). The request may have "
         "been received and its response lost, so this server cannot report whether Aleph "
         "acted on it -- but it issues only read requests, so nothing upstream can have "
-        "changed either way. Retrying is safe; if it fails the same way, the network path or "
-        "the instance is unhealthy rather than busy."
+        "changed either way. Retrying is safe. The class name above is the diagnosis: a read "
+        "or write failure points at the network path, a pool timeout at this server's own "
+        "concurrency limit, and a protocol error at one end disagreeing about HTTP."
     ) from exc
 
 

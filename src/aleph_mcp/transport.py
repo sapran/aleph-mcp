@@ -87,12 +87,19 @@ def _has_tls_cause(exc: BaseException) -> bool:
     hang reachable from an upstream fault.
     """
     seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
+    queue: list[BaseException] = [exc]
+    while queue:
+        current = queue.pop()
+        if id(current) in seen:
+            continue
         if isinstance(current, ssl.SSLError):
             return True
         seen.add(id(current))
-        current = current.__cause__ or current.__context__
+        # Both attributes, not `__cause__ or __context__`. Every mapper on this path does
+        # `raise X from exc`, which sets the two to the same object, so the short-circuit is
+        # correct against the installed stack -- but it makes the docstring's "anywhere in
+        # this exception's chain" false in general, and a queue over both costs nothing.
+        queue.extend(x for x in (current.__cause__, current.__context__) if x is not None)
     return False
 
 
@@ -252,15 +259,17 @@ class Transport:
                     # arrived can carry a *trust* verdict; after them, a TLS fault is a broken
                     # connection to a response that may already have been served.
                     if isinstance(e, httpx.ProxyError):
-                        # Undelivered -- a failed CONNECT means nothing reached Aleph -- so
-                        # `raise_unreachable` states the truth, and its class name is what
-                        # tells an operator the proxy rather than the instance refused.
-                        # Deliberately not retried and deliberately not in _CONNECT_ERRORS: a
-                        # CONNECT that reached the proxy is not obviously undelivered, which
-                        # is the argument that correctly keeps ReadError out, and the reason
-                        # phrase is the proxy's answer about this route rather than a
-                        # transient socket condition. Classified ahead of the fall-through
-                        # precisely because it is not a member of _CONNECT_ERRORS.
+                        # Undelivered: every `ProxyError` raise site in httpcore is a failed
+                        # HTTP CONNECT or a SOCKS negotiation failure, none of which forwards
+                        # anything to Aleph -- so `raise_unreachable`'s "No response was
+                        # received" is true here, and its class name is what tells an operator
+                        # the proxy rather than the instance refused.
+                        #
+                        # Not retried, for a different reason than its bucket: a proxy's
+                        # refusal is a policy answer about this route, not a transient socket
+                        # condition. Classified ahead of the fall-through because it is not a
+                        # member of _CONNECT_ERRORS and would otherwise be swept into the
+                        # possibly-delivered bucket, which for this class would be false.
                         raise_unreachable(e, context=context, attempts=attempt, resource=resource)
                     if delivered or not isinstance(e, _CONNECT_ERRORS):
                         raise_transport_failed(e, context=context, resource=resource)
