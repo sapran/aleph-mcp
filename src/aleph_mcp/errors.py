@@ -132,6 +132,43 @@ def raise_too_large(size: int, limit: int, *, context: str, resource: bool = Fal
     )
 
 
+# The JSON name for each Python type `json.loads` can produce. A Python name would be wrong
+# in a message that says "JSON": JSON has no `str`, `int`, `float` or `bool`.
+_JSON_TYPE_NAMES = {
+    str: "string",
+    list: "array",
+    int: "number",
+    float: "number",
+    bool: "boolean",
+    dict: "object",
+    type(None): "null",
+}
+
+
+def raise_unusable_model(model: object, *, context: str, resource: bool = False) -> NoReturn:
+    """Refuse a metadata body whose `model` is present but is not an object.
+
+    Takes the offending value and derives its type name here, rather than accepting a string
+    to interpolate. The distinction is the point: the value is upstream text, and a signature
+    that cannot be handed foreign text at all keeps that guarantee in this function instead
+    of in whichever call site copies it next. That is the convention `raise_unreachable`
+    states for itself, and this is the cheaper way to meet it -- a type name has no payload,
+    so nothing needs rendering or labelling.
+
+    Told not to retry for the same reason `raise_unreachable` is: the bad shape is what the
+    instance serves for this route, so a second call spends an upstream request to be
+    refused identically.
+    """
+    err_cls = ResourceError if resource else ToolError
+    kind = _JSON_TYPE_NAMES.get(type(model), "value")
+    raise err_cls(
+        f"{context}: this Aleph instance answered /api/2/metadata with a `model` that is a "
+        f"JSON {kind} rather than an object, so its followthemoney ontology cannot be read. "
+        "That is an upstream fault: nothing about the call can change it and retrying will "
+        "not help. Entity captions fall back to a fixed property order in the meantime."
+    )
+
+
 # An error body worth quoting is never large. Parsing before checking would let the error
 # path allocate without bound, which is the one path the transport ceiling cannot cover:
 # the status is known before the body is.
