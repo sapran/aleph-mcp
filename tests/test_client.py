@@ -2112,7 +2112,16 @@ async def test_a_failing_metadata_route_costs_one_retry_budget_per_window(
     twelve upstream requests for three calls, a full transport retry budget each. One
     budget covers the window, and the window expiring must actually refetch -- a permanent
     negative cache would turn one unlucky 503 into process-long degraded captions.
+
+    The clock jump is a literal, and the window is bounded by a separate literal, on
+    purpose. Derived from `_MODEL_FAILURE_TTL` instead, this test cannot fail: widening the
+    constant to infinity widens the jump with it, so the refetch assertion passed against a
+    permanent negative cache -- the mutation this test exists to catch.
     """
+    assert 0 < _MODEL_FAILURE_TTL <= 300, (
+        "the window must be bounded and non-trivial; a permanent one degrades every caption "
+        "for the process lifetime, and this test's one-hour jump must be able to clear it"
+    )
     now = 0.0
     monkeypatch_clock = lambda: now  # noqa: E731 -- read at call time, like the shrink loop
     meta = respx_mock.get("/api/2/metadata").mock(return_value=httpx.Response(503))
@@ -2127,7 +2136,7 @@ async def test_a_failing_metadata_route_costs_one_retry_budget_per_window(
         one_budget = meta.call_count
         assert one_budget < 12, f"three calls paid {one_budget} requests, not one budget"
 
-        now = _MODEL_FAILURE_TTL + 1.0
+        now = 3600.0
         await client.get_entity(entity_id="e1")
 
     assert meta.call_count > one_budget, "the window must expire and refetch"
