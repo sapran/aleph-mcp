@@ -2515,6 +2515,13 @@ _REFUSING_CALLS: tuple[tuple[str, str, dict[str, Any]], ...] = (
     ("a collection id with a trailing newline", "get_collection", {"collection": "42\n"}),
     ("an over-window page", "search_entities", {"collection": "874", "offset": MAX_PAGE}),
     ("an oversized facet", "search_entities", {"collection": "874", "facet_size": 0}),
+    # Both reachable: the tool signature declares `limit: int = 20` and `offset: int = 0`
+    # with no `ge=` constraint, so a negative value passes pydantic and arrives here. Added
+    # after review mutated exactly these two sites to a bare `ValueError` and measured the
+    # full suite green at 605 passed -- `ERROR_CASES` covers one refusal per tool and this
+    # table had picked three others for `search_entities`.
+    ("a negative search limit", "search_entities", {"collection": "874", "limit": -1}),
+    ("a negative search offset", "search_entities", {"collection": "874", "offset": -1}),
     ("an over-limit expansion", "expand_entity", {"entity_id": "e1", "limit": MAX_EXPAND + 1}),
     ("a text slice out of range", "get_entity_text", {"entity_id": "d1", "offset": -1}),
     ("a sample with no schema", "match_entity", {"sample": {}, "collection": "874"}),
@@ -2550,6 +2557,12 @@ async def test_every_client_refusal_carries_the_refusal_type(
     with pytest.raises(Refusal):
         await getattr(client, method)(**kwargs)
     assert wire.call_count == 0, f"{label}: a local refusal must cost no upstream request"
+    # The catch-all above cannot see `/api/2/metadata`: respx matches in registration order
+    # and the fixture registers that route first, so `call_count == 0` is silent about the
+    # one request the shaping seam makes on its own. Review demonstrated the blindness --
+    # a call to `get_model` leaves the catch-all at zero while the named route reports
+    # `called`. This is the assertion `conftest` ships for exactly that trap.
+    assert_model_not_fetched(respx_mock)
 
 
 async def test_an_unknown_schema_name_is_refused_by_type(

@@ -11,7 +11,18 @@ from .readonly import ReadOnlyViolation
 
 
 class Refusal(ValueError):
-    """This server declining a call on its own judgement, as opposed to anything failing.
+    """A message this server composed and meant the caller to read, as opposed to an
+    exception that escaped.
+
+    That axis -- authored rather than escaped -- is the one the seam needs, and it is
+    deliberately *not* "the caller can fix it". Several refusals say the opposite in their
+    own text: `scope._unusable_listing` reads "This is an upstream malfunction rather than a
+    problem with the arguments", and `raise_unusable_model` tells the caller retrying will
+    not help. Those are still refusals in the sense that matters here -- this server chose
+    the words, and they must reach the model unwrapped rather than behind FastMCP's "Error
+    calling tool" prefix, which `mask_error_details` deletes outright. Narrowing the type to
+    caller-fixable faults would put them back in the untranslated pile, which is the failure
+    this exists to close, and review caught the docstring asserting it.
 
     The tool and resource seams in `server.py` translate this type and nothing wider, which
     is the whole reason it exists. They used to select on `ValueError`, and `ValueError` is
@@ -257,15 +268,17 @@ def raise_undecodable_body(exc: Exception, *, context: str, resource: bool = Fal
 
 
 def raise_unparsable_body(
-    exc: Exception, *, context: str, status: int, resource: bool = False
+    exc: Exception, *, context: str, status: int, size: int, resource: bool = False
 ) -> NoReturn:
     """Refuse a *successful* response whose body is not JSON.
 
     The last response failure that left this server as itself. `Transport.request` ended at
-    an unguarded `jsonlib.loads`, and both shapes it can fail with -- `json.JSONDecodeError`
-    for text that is not JSON, `UnicodeDecodeError` for bytes that are not UTF-8, siblings
-    under `ValueError` rather than one subclassing the other -- were translated by the tool
-    seam into the shape reserved for a deliberate refusal. Measured on `develop @ 7f9c139`
+    an unguarded `jsonlib.loads`, and the two `ValueError` shapes it fails with --
+    `json.JSONDecodeError` for text that is not JSON, `UnicodeDecodeError` for bytes that are
+    not UTF-8, siblings under `ValueError` rather than one subclassing the other -- were
+    translated by the tool seam into the shape reserved for a deliberate refusal. Those two
+    and no others: the decode has further failure modes this does not claim, parked in
+    docs/implementation-notes.md. Measured on `develop @ 7f9c139`
     through the shipped MCP path: an HTML maintenance page on a `200` reached the model as
     `Expecting value: line 1 column 1 (char 0)` and a PNG as `'utf-8' codec can't decode
     byte 0x89 in position 0: invalid start byte`, neither naming the call, the status, or
@@ -289,8 +302,25 @@ def raise_unparsable_body(
     It says the arguments are not the cause because the failure mode being closed is a model
     reading a bare decoder string and rewriting its arguments in reply. Saying only "this
     failed" leaves that the default move.
+
+    `size` splits off the one case the four-cause enumeration describes wrongly. An empty
+    body is not a maintenance page, an interstitial or a truncation -- and for a `204` it is
+    the status's definition rather than a fault in the body at all. Review measured a `204`
+    and a zero-length `200` producing prose byte-identical to the HTML case, differing only
+    in the status number, under a green test that asserted only that number. The length is
+    the one fact that separates them and it is already in hand at the call site.
     """
     err_cls = ResourceError if resource else ToolError
+    if size == 0:
+        raise err_cls(
+            f"{context}: Aleph answered {status} with an empty body, so there is nothing to "
+            f"decode ({_reported(exc)}). The response arrived and its status was a success. "
+            "Nothing about this call produced it -- the arguments are not the cause, and "
+            "changing them will not help. A read endpoint that answers with no content is an "
+            "upstream fault, and a status that carries no body by definition -- 204, 205 -- "
+            "is the wrong answer to a read this server issues. Nothing upstream can have "
+            "changed regardless: this server issues only read requests."
+        ) from exc
     raise err_cls(
         f"{context}: Aleph answered {status} but the body is not JSON ({_reported(exc)}). "
         "The response arrived and its status was a success; what failed is the body. "

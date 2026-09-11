@@ -224,9 +224,13 @@ Validation SHALL be anchored so that no trailing character escapes it, and SHALL
 A refusal this server makes on its own judgement SHALL be a distinct exception type, raised only at
 the sites that make such a refusal, and the tool and resource seams SHALL translate that type
 rather than a category of Python failure. Any other exception raised inside a tool or resource body
-SHALL NOT be presented to the caller as a refusal. The distinction is what the message means: a
-refusal says the call was wrong and the caller can fix it, so relabelling a defect or an upstream
-fault as one directs the caller to rewrite arguments that were never the cause. Measured on
+SHALL NOT be presented to the caller as a refusal. The distinction the type draws is *authored
+rather than escaped* -- a message this server composed and meant the caller to read -- and NOT
+*caller-fixable*: several refusals correctly tell the caller the fault is upstream and that
+retrying will not help, and those must still reach the model unwrapped. What must never be
+presented as a refusal is an exception nobody here composed, because its text was written for a
+Python traceback rather than for the caller, and reading it as this server's considered answer
+directs the caller to rewrite arguments that were never the cause. Measured on
 `develop @ 7f9c139`, where the seam selected on `ValueError`: a `200` carrying an HTML maintenance
 page reached the model as `Expecting value: line 1 column 1 (char 0)` and a tool body calling
 `int()` on upstream text as `invalid literal for int() with base 10: 'not-a-number'` — both

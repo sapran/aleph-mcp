@@ -1263,6 +1263,35 @@ async def test_the_unparsable_body_refusal_names_the_status_that_actually_arrive
     message = str(excinfo.value)
     assert "204" in message, message
     assert "200" not in message, f"the status is read from the response, not assumed: {message}"
+    # And the body length reaches the message too: review measured this exact response
+    # producing prose byte-identical to the HTML-maintenance-page case, offering four causes
+    # of which none is "there is no body".
+    assert "empty body" in message, message
+
+
+async def test_a_valid_json_body_this_process_cannot_parse_is_not_called_upstreams_fault(
+    transport: Transport, respx_mock: respx.MockRouter
+) -> None:
+    """The guard names two leaves rather than `ValueError`, and this is the difference.
+
+    `{"total": <5000 digits>}` is valid JSON. CPython refuses it anyway, with a bare
+    `ValueError`, because of the 4300-digit integer-string limit -- a limit inside *this*
+    process, liftable with `sys.set_int_max_str_digits()`. Review measured the base-class
+    guard catching it and answering "the body is not JSON" and "It is an upstream fault",
+    both false, sending an operator to inspect an instance that is behaving correctly.
+
+    So it must escape as the server-side condition it is. That is the same argument the
+    parked `RecursionError` entry makes, and the reason this guard does not widen: a shape
+    this server has not classified must not be handed a diagnosis it has not earned.
+    """
+    body = b'{"total": ' + b"1" * 5000 + b"}"
+    respx_mock.get(PROBE).mock(return_value=httpx.Response(200, content=body))
+    with pytest.raises(ValueError) as excinfo:
+        await transport.request("GET", PROBE, context="probe")
+    assert not isinstance(excinfo.value, ToolError), (
+        "a limit in this process must not be reported as an upstream fault"
+    )
+    assert "4300 digits" in str(excinfo.value)
 
 
 async def test_the_unparsable_body_refusal_quotes_no_part_of_the_body(

@@ -264,9 +264,16 @@ class CollectionScope:
         building the type wrongly. `parse_scope` cannot produce it, and this is what keeps
         that true rather than merely stated. `echo.Policy` refuses a fail-open cap the same
         way and for the same reason.
+
+        Deliberately NOT a `Refusal`, and the comparison to `echo.Policy` is why: both fire
+        on this repo building its own type wrongly, which is a defect and must keep reading
+        as one. A `Refusal` here would reach the model unprefixed as this server's considered
+        answer, telling it to "pass None for the all-collections scope" -- a parameter no
+        tool has and no caller can reach. Review caught this retyped along with the genuine
+        refusals around it.
         """
         if self.collections is not None and not self.collections:
-            raise Refusal(
+            raise ValueError(  # not a refusal: a defect guard, see this method's docstring
                 "CollectionScope: an empty scope names no collection and would search "
                 "every readable one; pass None for the all-collections scope"
             )

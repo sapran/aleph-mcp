@@ -751,17 +751,28 @@ class AlephClient:
         except ResourceError as e:
             if isinstance(e.__cause__, ReadOnlyViolation):
                 raise ToolError(str(e)) from e
-            # Everything else this covers -- a non-2xx, an exhausted connect, a body over
-            # the ceiling -- is an upstream fault the caller cannot act on.
+            # This is the live arm, and it covers every upstream fault the caller cannot act
+            # on: a non-2xx, an exhausted connect, a body over the ceiling, a read-side fault
+            # the transport does not retry -- ReadTimeout, ReadError, RemoteProtocolError, a
+            # slow model being literally the ReadTimeout in that set -- and, since this
+            # change, a body that is not JSON. `Transport.request` catches
+            # `(httpx.RequestError, ssl.SSLError)` around all of its I/O and every arm of that
+            # dispatch ends in a `raise_*`, so they arrive here already flavoured.
             return None
         except httpx.HTTPError:
-            # The read-side faults `Transport.request` deliberately does not retry --
-            # ReadTimeout, ReadError, RemoteProtocolError. A slow model is literally the
-            # ReadTimeout in that set, so this is the arm the first paragraph describes.
-            # Upstream's fault, and not the caller's.
+            # A backstop, and honestly labelled as one: no path produces it today. Review
+            # measured a `ReadTimeout` on the metadata route arriving at the arm above as a
+            # `ResourceError`, and making this arm unraisable left the suite green -- because
+            # the transport lets no `httpx` exception out, and `HTTPStatusError`, the other
+            # `HTTPError` member, is never raised here at all.
             #
-            # `ValueError` was the second member, absorbing a metadata body that is not JSON:
-            # `Transport.request` used to end at an unguarded `jsonlib.loads(body)` on
+            # It is kept rather than deleted because an `httpx` error that did escape should
+            # degrade a caption, not hard-fail ten tools; what is corrected is the comment,
+            # which claimed this arm handled faults that in fact reach the one above. A wrong
+            # map is worse than a dead branch: the next fault gets routed by it.
+            #
+            # `ValueError` was the second member here, absorbing a metadata body that is not
+            # JSON: `Transport.request` used to end at an unguarded `jsonlib.loads(body)` on
             # *bytes*, so a route answering 200 with a PNG, a raw gzip or a latin-1 error page
             # raised `UnicodeDecodeError` -- a sibling of `JSONDecodeError` under `ValueError`
             # rather than a subclass, which is why the base class was named. Measured with

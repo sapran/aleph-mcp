@@ -548,7 +548,11 @@ async def test_the_seam_leaves_a_non_refusal_alone(defect: Exception) -> None:
 
     with pytest.raises(type(defect)) as excinfo:
         await breaks()
-    assert excinfo.value is defect, "the seam must not re-raise it as something else"
+    # The load-bearing assertion is the `raises(type(defect))` above: reverting the seam to
+    # `except ValueError` turns three of these four into a `ToolError`. Identity is the
+    # weaker half -- only a seam that caught and rebuilt the exception would break it -- and
+    # it is here to say the original object arrives, cause and traceback intact.
+    assert excinfo.value is defect
 
 
 def test_the_seam_carries_what_fastmcp_reads() -> None:
@@ -657,7 +661,6 @@ async def test_a_maintenance_page_on_200_is_not_answered_as_a_bad_argument(
     assert message.startswith("list_collections:"), (
         f"the refusal must name the tool the caller called: {message!r}"
     )
-    assert not message.startswith("Expecting value"), "the decoder's bare string is not an answer"
     assert "not JSON" in message and "upstream" in message, message
     assert "Scheduled maintenance" not in message, "the body is never quoted"
     # The decoder text is still worth having -- "Expecting value: line 1 column 1" and

@@ -379,17 +379,35 @@ class Transport:
             attempts=spent,
             budget_spent=by_budget,
         )
-        # Guarded, because both shapes this can fail with are `ValueError` subclasses and
-        # the tool seam used to translate that whole family: a 2xx serving an HTML
-        # maintenance page reached the model as `Expecting value: line 1 column 1 (char 0)`,
-        # in the shape reserved for a deliberate refusal. `body` is bytes, so `json.loads`
+        # Guarded, because the two `ValueError` shapes this fails with are what the tool seam
+        # used to translate as a family -- not because they are every way it can fail, which
+        # they are not: `RecursionError` on a deeply nested body escapes this guard and is
+        # parked in docs/implementation-notes.md with the int-limit case below. A 2xx serving
+        # an HTML maintenance page reached the model as `Expecting value: line 1 column 1
+        # (char 0)`, in the shape reserved for a deliberate refusal. `body` is bytes, so
+        # `json.loads`
         # runs `detect_encoding` and decodes before parsing -- non-UTF-8 bytes raise
         # `UnicodeDecodeError`, a sibling of `JSONDecodeError` under `ValueError` rather
-        # than a subclass, which is why this catches the base class and not either leaf.
+        # than a subclass, which is why both leaves are named.
+        #
+        # Both leaves and NOT their base class, which is the narrower choice on purpose.
+        # `ValueError` here is not only those two: review measured a body of
+        # `{"total": <5000 digits>}` -- valid JSON -- raising a bare `ValueError` from
+        # CPython's 4300-digit integer-string limit, which this refusal then reported as
+        # "the body is not JSON" and "an upstream fault", both false. That limit lives in
+        # this process and is liftable with `sys.set_int_max_str_digits()`. A shape this
+        # server has not classified must not be given a diagnosis it has not earned, which
+        # is the same argument that keeps `RecursionError` out; both are parked together.
         try:
             data: Any = jsonlib.loads(body)
-        except ValueError as e:
-            raise_unparsable_body(e, context=context, status=resp.status_code, resource=resource)
+        except (jsonlib.JSONDecodeError, UnicodeDecodeError) as e:
+            raise_unparsable_body(
+                e,
+                context=context,
+                status=resp.status_code,
+                size=len(body),
+                resource=resource,
+            )
         # Only parsing is guarded, never shape. A bare array, string or number parsed fine
         # and keeps its wrapper; whether an envelope should be required before the rows are
         # trusted is a separate parked claim, and deciding it here would change what

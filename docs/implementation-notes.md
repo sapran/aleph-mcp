@@ -16,10 +16,11 @@ one under the stale-prose entry and one as its own entry, both found by review o
 1 again — the scope resolver's upstream shapes — was closed by `guard-scope-resolver-shapes` on
 2026-09-11, parking four new claims in passing as one new entry — the conclusions the scope path
 still draws without earning them — all found by review of that change. Item 1 once more — the
-refusal channel — was closed by `type-the-refusal-channel` on 2026-09-11, parking one new claim in
-passing as its own entry, and consuming one bullet of the stale-prose entry whose sentences that
-change made false. The plan and the sections below are renumbered after each, so twenty-six
-claims across twelve entries remain.
+refusal channel — was closed by `type-the-refusal-channel` on 2026-09-11, parking three new claims
+in passing — two as a new entry for the decode failures its guard deliberately does not cover, one
+under the ontology-shape entry — and consuming one bullet of the stale-prose entry whose sentences
+that change made false. All three were found by review of it. The plan and the sections below are
+renumbered after each, so twenty-eight claims across twelve entries remain.
 
 ## Work plan
 
@@ -31,9 +32,9 @@ claims across twelve entries remain.
 6. Give `get_entity_text` a derived caption.
 7. Close the tests that cannot fail — four checks that certify nothing.
 8. Decide the private-sibling references — the publication deadline has already passed.
-9. Guard `model["schemata"]`'s shape — a non-dict raises AttributeError at the caller.
+9. Guard the ontology's shape — a non-dict raises AttributeError, a non-object body reads as empty.
 10. Name the dropped error body — a real complaint reads as no complaint at all.
-11. Bound the decode's recursion — a deeply nested 2xx body is a server fault.
+11. Classify the decode's two uncaught failures — both reach the caller as a server fault.
 12. Correct three pieces of stale prose (Tier 0).
 ---
 
@@ -155,8 +156,8 @@ Three findings, closed by a ~4-line local `resource(uri, **kw)` factory mirrorin
 wider walk in `find_marker`.
 
 **Resources have no counterpart to the fused `tool` helper.** `@mcp.resource` is still reachable raw
-(`server.py:400`, `:405`), and `schema_resource`'s translation is a hand-applied decorator
-(`server.py:411`) nothing enforces. A future *parameterised* resource would silently regress to
+(`server.py:413`, `:418`), and `schema_resource`'s translation is a hand-applied decorator
+(`server.py:430`) nothing enforces. A future *parameterised* resource would silently regress to
 FastMCP's `Error reading resource '<uri>': ` wrapping, and the decorator order is load-bearing but
 fails silently (`@_as_resource_error` above `@mcp.resource` imports, registers and serves the
 untranslated message). `collections_resource` and `schemata_resource` cannot raise `ValueError` at
@@ -276,6 +277,25 @@ not reach this value. Found while implementing `bound-ontology-echo` on 2026-09-
 pre-existing on `develop`, unrelated to that change's scope, and the fix is a refusal-shape
 decision (reuse `raise_unusable_model`, or degrade) rather than a one-liner.
 
+**A metadata body that is valid JSON but not an object is served as an ontology declaring
+nothing, silently.** A third branch of the same defect, one level further out: the transport wraps
+a non-dict body as `{"results": <body>}` (`transport.py:398`), so a `200` whose body is the JSON
+string `"<html>down</html>"`, or the array `[1,2,3]`, reaches `get_model` as a payload with no
+`model` key at all. `raise_unusable_model`'s guard is `model and not isinstance(model, dict)` and
+cannot fire on a value that is *absent* rather than wrong-typed, so the model caches as `{}`.
+Measured on this branch: `list_schemata` answers `{'count': 0, 'all': [], ...}` with the untrusted
+provenance stamp, and `get_entity` answers with a fallback caption and **no `_note`** — because
+`_schemata` returns `{}` and `_reply` announces a degradation only on `None`. An instance serving
+garbage metadata is indistinguishable from a legitimately minimal one on every tool at once.
+
+That defeats the scenario "it does not return a schema count of zero" under the existing *An
+unusable instance model is refused, never cached as an empty ontology* requirement. Pre-existing on
+`develop` — both the wrapper and `get_model` are untouched by `type-the-refusal-channel` — and
+found by review of it, which noted that the change sharpens the asymmetry: a metadata body of
+`<html>` is now loudly refused, while `"<html>"` is still silently read as an empty ontology.
+Closing it means either requiring a real envelope before the wrapper is applied, or having
+`get_model` distinguish "no `model` key in an object body" from "no object body at all".
+
 ## 10. An oversized error body is dropped without saying so
 
 **`_upstream_detail` discards a JSON error body over 64 KiB and the refusal reads as if none
@@ -293,23 +313,31 @@ an oversized body and `b""` from an empty one are the same value today) and appe
 the refusal naming the drop. Parsing a truncated prefix is not the fix; the reasoning against that
 is written at `Transport._read_error_body`.
 
-## 11. The decode's recursion is unbounded
+## 11. Two decode failures the guard deliberately does not cover
 
-**A deeply nested 2xx body raises `RecursionError`, which is not a `ValueError` and so escapes the
-guard beside it.** `transport.py`, the `jsonlib.loads(body)` that `type-the-refusal-channel`
-wrapped in `except ValueError`. Measured on this branch with plain CPython 3.12:
-`json.loads(b"[" * 200000 + b"]" * 200000)` raises
-`RecursionError: Stack overflow (used 16352 kB) while decoding a JSON array from a unicode string`,
-and `isinstance(e, ValueError)` is `False`. It therefore reaches the caller as a server fault
-carrying no call context — the same shape the entry above closed for the two `ValueError` halves,
-one exception family over.
+Both at `transport.py`'s `jsonlib.loads(body)`, which `type-the-refusal-channel` guards for
+`json.JSONDecodeError` and `UnicodeDecodeError` only. Both reach the caller as a server fault
+carrying no call context — the shape that entry closed for the two it does cover. Neither is
+fixed here for the same reason: the refusal beside them says "the body is not JSON" and "it is an
+upstream fault", and neither sentence is true of either of these, so catching them without their
+own arm and their own wording would trade a missing diagnosis for a confident wrong one.
 
-Bounded in size by `MAX_RESPONSE_BYTES` (25 MiB), which is plenty for the nesting depth needed, and
-not a crash: CPython raises rather than segfaulting. Recorded rather than fixed because the closed
-entry's spec enumerates the shapes it covers — bytes that are not UTF-8, and text that is not JSON
-— and this is neither; widening the `except` to `(ValueError, RecursionError)` would also give a
-body nested 200000 deep a message saying it "is not JSON", which is false. Closing it means its own
-arm and its own sentence.
+**A deeply nested body raises `RecursionError`, which is not a `ValueError` at all.** Measured with
+plain CPython 3.12: `json.loads(b"[" * 200000 + b"]" * 200000)` raises `RecursionError: Stack
+overflow (used 16352 kB) while decoding a JSON array from a unicode string`, and
+`isinstance(e, ValueError)` is `False`. Bounded in size by `MAX_RESPONSE_BYTES` (25 MiB), which is
+far more than the nesting depth needs, and not a crash — CPython raises rather than segfaulting.
+
+**A valid JSON body carrying a huge integer raises a bare `ValueError` from a limit in this
+process.** `{"total": <5000 digits>}` is well-formed JSON; CPython refuses it with `Exceeds the
+limit (4300 digits) for integer string conversion: value has 5000 digits; use
+sys.set_int_max_str_digits() to increase the limit` — neither `JSONDecodeError` nor
+`UnicodeDecodeError`. Found by review of `type-the-refusal-channel`, where the guard's first draft
+caught the base class and answered it with "the body is not JSON" and "It is an upstream fault",
+both false: the body is JSON and the limit is ours, liftable with one call at startup. The guard
+was narrowed to the two leaves in response, which is what parks this rather than mis-reporting it.
+Closing it properly means deciding whether to raise the limit or to refuse with a message that
+names it.
 
 ## 12. Three pieces of stale prose (Tier 0)
 
