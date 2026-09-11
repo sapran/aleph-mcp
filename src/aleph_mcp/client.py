@@ -153,6 +153,20 @@ _FALLBACK_CAPTION_NOTE = (
     "briefly, so an immediate retry returns this same answer without asking the instance."
 )
 
+# A deliberate cross-collection search must still read as one in a transcript. Without it,
+# `"*"` and a scoped search are indistinguishable in the rows.
+#
+# A module constant because both scoped search tools emit it. It sat inline in
+# `search_entities` while `match_entity` emitted nothing at all, which is how a match
+# against every readable collection came back saying so nowhere -- the failure scope.py's
+# module docstring names as its reason to exist. Copying the sentence to the second call
+# site is how the collection filter's wire spelling ended up written three times.
+_EVERY_COLLECTION_NOTE = (
+    "EVERY COLLECTION: this search was not scoped to a collection, so hits may come from "
+    "any dataset this key can read — check each hit's `collection_id` before treating it "
+    "as evidence about one subject."
+)
+
 
 def _quoted(name: str) -> str:
     """One upstream schema name as a bounded, balanced quoted token.
@@ -710,10 +724,10 @@ class AlephClient:
         is both, and a caller needs to be told both.
 
         The server's own statement goes first. Nothing upstream-authored can reach `existing`
-        today -- every shaped endpoint builds its top-level keys itself, and only
-        `search_entities` sets `_note`, from its own constants -- but this is the ordering that
-        would not hurt if that ever changed: upstream text prefixed to a server sentence reads
-        as its opening clause.
+        today -- every shaped endpoint builds its top-level keys itself, and the two that set
+        `_note`, `search_entities` and `match_entity`, both set it from this module's own
+        constants -- but this is the ordering that would not hurt if that ever changed:
+        upstream text prefixed to a server sentence reads as its opening clause.
         """
         schemata = await self._schemata()
         shaped = cast(dict[str, Any], _shape(built, schemata, endpoint))
@@ -1073,13 +1087,7 @@ class AlephClient:
         # window is both truncated and unenumerated, and a caller needs to be told both.
         notes: list[str] = []
         if scope.is_every_collection:
-            # A deliberate cross-collection search must still read as one in a transcript.
-            # Without this, `"*"` and a scoped search are indistinguishable in the rows.
-            notes.append(
-                "EVERY COLLECTION: this search was not scoped to a collection, so hits may "
-                "come from any dataset this key can read — check each hit's `collection_id` "
-                "before treating it as evidence about one subject."
-            )
+            notes.append(_EVERY_COLLECTION_NOTE)
         returned = len(result["results"])
         if page != limit and returned:
             resume = offset + returned
@@ -1211,7 +1219,16 @@ class AlephClient:
         payload = await self._transport.request(
             "POST", "/api/2/match", context="match_entity", params=params, json=sample
         )
-        return _slim_result(payload)
+        result = _slim_result(payload)
+        # The same report `search_entities` makes, for the same reason: requiring the
+        # argument makes the scope chosen, and reporting it is what makes the choice
+        # visible in the reply. `collection` alone -- the schema is stated by the caller
+        # inside `sample`, so there is no schema scope for this server to report back, and
+        # inventing one would describe a decision nobody made.
+        result["searched"] = {"collection": scope.reported()}
+        if scope.is_every_collection:
+            result["_note"] = _EVERY_COLLECTION_NOTE
+        return result
 
     # -- profiles --------------------------------------------------------------
 

@@ -110,7 +110,8 @@ async def test_get_collection_by_foreign_id(
 ) -> None:
     lookup = respx_mock.get("/api/2/collections").mock(
         return_value=httpx.Response(
-            200, json={"results": [{"id": "42", "foreign_id": "case", "label": "Case"}]}
+            200,
+            json={"total": 1, "results": [{"id": "42", "foreign_id": "case", "label": "Case"}]},
         )
     )
     fetch = respx_mock.get("/api/2/collections/42").mock(
@@ -137,7 +138,9 @@ async def test_foreign_id_lookup_still_returns_statistics(
     foreign_id branch straight from the listing hit returned `statistics: null` while
     the numeric branch returned the real block. Same tool, same promise, both branches."""
     respx_mock.get("/api/2/collections").mock(
-        return_value=httpx.Response(200, json={"results": [{"id": "42", "foreign_id": "case"}]})
+        return_value=httpx.Response(
+            200, json={"total": 1, "results": [{"id": "42", "foreign_id": "case"}]}
+        )
     )
     respx_mock.get("/api/2/collections/42").mock(
         return_value=httpx.Response(
@@ -1456,7 +1459,9 @@ async def test_list_entitysets_resolves_a_foreign_id_to_the_numeric_filter(
     and a foreign_id forwarded verbatim would filter the listing down to nothing.
     """
     lookup = respx_mock.get("/api/2/collections").mock(
-        return_value=httpx.Response(200, json={"results": [{"id": "42", "foreign_id": "my-case"}]})
+        return_value=httpx.Response(
+            200, json={"total": 1, "results": [{"id": "42", "foreign_id": "my-case"}]}
+        )
     )
     route = respx_mock.get("/api/2/entitysets").mock(
         return_value=httpx.Response(200, json={"total": 0, "results": []})
@@ -1538,7 +1543,9 @@ async def test_xref_results_resolves_a_foreign_id_before_fetching(
     "my-case" and be answered 404.
     """
     lookup = respx_mock.get("/api/2/collections").mock(
-        return_value=httpx.Response(200, json={"results": [{"id": "42", "foreign_id": "my-case"}]})
+        return_value=httpx.Response(
+            200, json={"total": 1, "results": [{"id": "42", "foreign_id": "my-case"}]}
+        )
     )
     xref = respx_mock.get("/api/2/collections/42/xref").mock(
         return_value=httpx.Response(200, json={"total": 0, "results": []})

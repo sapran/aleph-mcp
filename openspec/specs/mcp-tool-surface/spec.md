@@ -297,6 +297,8 @@ A value that names no collection SHALL be refused locally, before any request: t
 
 The all-collections literal SHALL mean the same thing in either spelling: a list whose every element is `"*"` names every readable collection, exactly as the scalar `"*"` does, and SHALL NOT be refused. Only a list that pairs `"*"` with at least one *named collection* is ambiguous about what the caller wants, and only that list is refused. A single-element list is what a caller building the argument programmatically produces, and refusing it with the mixed-scope message — "cannot be combined with named collections" — describes a mistake the caller did not make and costs a turn to recover from. A list that merely repeats the literal names no other collection either, so it is read the same way — the same reading the deduplication of repeated named collections already applies one step later.
 
+Both scoped search tools SHALL report the collection scope they actually searched, under `searched.collection`, and SHALL carry the all-collections note when that scope is the literal. Requiring the argument only makes the scope *chosen*; reporting it is what makes the choice visible in the reply, and a cross-collection result that says nowhere that it is one is the same contaminated answer whether it was reached by omission or on purpose. `match_entity` reports `collection` alone within `searched`: the schema is stated by the caller inside `sample`, so unlike `search_entities` there is no schema scope for this server to report back.
+
 #### Scenario: An omitted scope is refused
 
 - **WHEN** `search_entities` is called without `collection`
@@ -321,7 +323,7 @@ The all-collections literal SHALL mean the same thing in either spelling: a list
 - **WHEN** `search_entities` is called with `collection` set to the single-element list `["*"]`, or to a list whose every element is `"*"`
 - **THEN** the call is treated exactly as the scalar `"*"`: no collection filter is applied and no lookup is made
 - **AND** the response reports `"*"` under `searched.collection`, not a single-element list
-- **AND** the same list passed to `match_entity` likewise sends no collection constraint and costs no lookup — `match_entity` reports no `searched` key in either spelling, which is its existing behaviour for the scalar and is unchanged here
+- **AND** the same list passed to `match_entity` likewise sends no collection constraint, costs no lookup, and is reported the same way — `"*"` under `searched.collection`, in either spelling
 
 #### Scenario: A scope naming nothing is refused without a request
 
@@ -336,6 +338,13 @@ The all-collections literal SHALL mean the same thing in either spelling: a list
 - **THEN** no collection constraint is sent to Aleph, which is its all-collections behaviour
 - **AND** a `match_entity` call omitting `collection` fails with an error naming the missing argument
 
+#### Scenario: A match reports the collection scope it searched
+
+- **WHEN** `match_entity` is called with a named collection, by numeric id or by `foreign_id`
+- **THEN** the response reports the resolved numeric ids as a list under `searched.collection`, and carries no all-collections note
+- **AND** the same call with `"*"` reports `"*"` under `searched.collection` and carries a `_note` stating that the result spans every readable collection
+- **AND** `searched` carries no schema scope for this tool, because the schema is stated by the caller inside `sample`
+
 ### Requirement: One vocabulary for collection scope across the tool surface
 
 Every tool taking a collection SHALL name that argument `collection`, and SHALL accept a numeric collection id or a `foreign_id`. `search_entities` and `match_entity`, which search across collections, SHALL additionally accept a list of either. This applies to `get_collection`, `search_entities`, `match_entity`, `list_entitysets` and `xref_results`.
@@ -349,6 +358,12 @@ The three tools that address exactly one collection SHALL refuse `"*"` rather th
 Resolving a `foreign_id` reads a listing this server did not produce, so the listing's shape SHALL be checked before it is indexed, and SHALL NOT be assumed from the fact that a `results` key is present. A listing that cannot be read as a list of records SHALL raise a legible refusal rather than an untranslated `KeyError` or `TypeError`: the tool seam translates one error type, and anything else reaches the model as a server fault carrying no usable next step.
 
 A listing that cannot be read SHALL be distinguished from a listing that was read and held no match, because the two call for opposite responses. One shape means "no such collection": a `results` list that is present, is a list, and is empty — what Aleph answers for a `foreign_id` nobody owns, and equally what a bare empty JSON array arrives as once the transport has wrapped it, since an empty array is an empty result set whoever serialised it. Only that shape SHALL be reported as an authorisation-or-existence problem naming `list_collections`. Every other unusable shape — no `results` key at all, a `results` value that is not a list, a first row that is not a record — SHALL be reported as an upstream malfunction, naming the shape received and not directing the caller to `list_collections`. Reporting a malfunctioning upstream as a missing collection is a confident wrong diagnosis: it sends the caller to check its own permissions when nothing about the call can change the outcome. Both paths SHALL fail closed — no collection is resolved and nothing is cached.
+
+The same separation SHALL extend to the *row* the resolution is read out of, which is upstream data exactly as the envelope around it is. A row SHALL NOT be treated as a collection record on the strength of the listing being readable:
+
+- A row carrying **no `foreign_id` field at all** has made no statement about any collection, and SHALL be refused as an upstream malfunction rather than as a missing collection. A row whose `foreign_id` is present and names a *different* collection has made such a statement and keeps the authorisation-or-existence refusal — including when that value is null, which is how a collection created without a foreign_id truthfully reports itself.
+- A row whose `id` is absent, or is not a numeric collection id, SHALL be refused as an upstream malfunction. It SHALL NOT be reported through the validator written for caller input, whose message offers the caller the `foreign_id` alternative: the caller passed a `foreign_id`, the upstream confirmed it one line earlier, and telling them their value is "neither" is a confident wrong diagnosis about a call that was correct. This refusal is the one place where the upstream *value* rather than its type identifies the malfunction — `"abc"` and `"874"` are both strings — so it SHALL quote that value under the same bound and escaping every other upstream echo in this server uses.
+- Rows SHALL NOT be trusted without a listing envelope. A body carrying a non-empty `results` but none of the keys a listing envelope carries — `status`, `total`, `page`, `limit`, `offset` — SHALL be refused as an upstream malfunction. The transport wraps a non-JSON-object body under `results` and adds nothing else, so without this any JSON array whose first element happens to carry `foreign_id` and `id` resolves and is cached for the process lifetime. An **empty** `results` is deliberately exempt and keeps reading as a miss, as stated above: the requirement is about trusting rows, and there are none to trust.
 
 #### Scenario: A foreign_id is accepted wherever a numeric id is
 
@@ -375,6 +390,30 @@ A listing that cannot be read SHALL be distinguished from a listing that was rea
 - **AND** the refusal does not claim the collection is unreadable with this API key and does not direct the caller to `list_collections`
 - **AND** a lookup answered with an empty `results` list still raises the authorisation-or-existence refusal naming `list_collections`
 
+#### Scenario: A row that is not a collection record is not reported as a missing collection
+
+- **WHEN** a `foreign_id` lookup is answered with a first row carrying no `foreign_id` field
+- **THEN** the refusal names the upstream malfunction and says the row carried no `foreign_id` field
+- **AND** it does not direct the caller to `list_collections` and does not mention the API key
+- **AND** a first row whose `foreign_id` is present but names another collection — including the value null — still raises the authorisation-or-existence refusal naming `list_collections`
+- **AND** nothing is resolved and nothing is cached on either path
+
+#### Scenario: A confirmed row with an unusable id blames the upstream, not the caller
+
+- **WHEN** a `foreign_id` lookup is answered with a row whose `foreign_id` matches the request but whose `id` is absent, null, non-numeric, or not a scalar
+- **THEN** the refusal names the upstream malfunction and quotes the unusable id
+- **AND** it does not say the value passed is "neither" a collection id nor a foreign_id, and does not offer the foreign_id alternative
+- **AND** the quoted id is clipped to the shared echo bound and its control characters are escaped, however long the upstream value was
+- **AND** nothing is resolved and nothing is cached
+
+#### Scenario: Rows outside a listing envelope are not trusted
+
+- **WHEN** a `foreign_id` lookup is answered with a bare JSON array of records — no `status`, `total`, `page`, `limit` or `offset` — whose first element carries a matching `foreign_id` and a usable `id`
+- **THEN** the call raises the upstream-malfunction refusal rather than resolving that id
+- **AND** no search is sent and the foreign_id is not cached
+- **AND** a body carrying any one of those envelope keys beside its rows resolves normally
+- **AND** a bare empty array still raises the authorisation-or-existence refusal naming `list_collections`
+
 #### Scenario: A single-collection tool takes exactly one collection
 
 - **WHEN** `get_collection`, `list_entitysets` or `xref_results` is called with a list, or with the literal `"*"`
@@ -391,6 +430,7 @@ A listing that cannot be read SHALL be distinguished from a listing that was rea
 - **WHEN** `search_entities` or `match_entity` is called with a list naming more collections than one call may resolve
 - **THEN** the call is refused before any request, naming the ceiling
 - **AND** a scope that repeats a collection under two spellings resolves it once and emits one filter for it
+
 
 ### Requirement: A collection scope is stated once, not twice
 

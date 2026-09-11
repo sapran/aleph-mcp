@@ -387,6 +387,12 @@ async def test_an_upstream_id_echoed_into_a_refusal_is_bounded_and_escaped() -> 
     comes from `COLLECTION_ECHO`, and the escaping comes from the `!r` at the call site.
     Keeping the policy while dropping the `!r` would silently unstrip the control
     characters that policy deliberately does not strip itself.
+
+    The value now reaches the model through the upstream-malfunction refusal rather than
+    through the caller-facing validator — the bound and the escaping are unchanged, and
+    this is the test that keeps them covered across that move. The value is quoted at all
+    because it is the one branch where the type name is not the diagnosis: `"abc"` and
+    `"874"` are both `str`.
     """
     upstream = FakeUpstream(
         answer={"total": 1, "results": [{"id": UPSTREAM_ID, "foreign_id": "my-case"}]}
@@ -396,6 +402,8 @@ async def test_an_upstream_id_echoed_into_a_refusal_is_bounded_and_escaped() -> 
     message = str(excinfo.value)
     assert "\x1b" not in message, "a raw control character reached a model-visible message"
     assert "'" + "a" * 60 + "\\x1b" + '"' + "b" * 58 + "… [+2 chars]'" in message
+    assert "upstream malfunction" in message, f"an unusable id is not the caller's: {message}"
+    assert "the value is neither" not in message, message
 
 
 # -- the listing's shape is checked before it is indexed -----------------------
@@ -577,6 +585,177 @@ async def test_a_refused_listing_does_not_poison_a_later_good_one() -> None:
     assert await resolve.resolve_one("my-case", context="search_entities") == ResolvedCollection(
         "874"
     )
+
+
+# -- the row is a collection record, and it arrived inside a listing -----------
+
+# Every row below is a *record*, so each one clears the four envelope guards and is
+# refused for something the row itself says — or fails to say. That is the line this
+# change moves: `guard-scope-resolver-shapes` stopped at "the listing is readable" and
+# read whatever the first record held as an answer.
+UNUSABLE_ROWS: list[tuple[str, dict[str, Any], str]] = [
+    ("no-foreign-id-key", {"id": "874"}, "carried a first row with no foreign_id field"),
+    ("id-absent", {"foreign_id": "my-case"}, "not a numeric collection id"),
+    ("id-null", {"foreign_id": "my-case", "id": None}, "not a numeric collection id"),
+    ("id-not-numeric", {"foreign_id": "my-case", "id": "abc"}, "not a numeric collection id"),
+    ("id-empty", {"foreign_id": "my-case", "id": ""}, "not a numeric collection id"),
+    ("id-mapping", {"foreign_id": "my-case", "id": {"a": 1}}, "not a numeric collection id"),
+    ("id-list", {"foreign_id": "my-case", "id": ["874"]}, "not a numeric collection id"),
+    ("id-bool", {"foreign_id": "my-case", "id": True}, "not a numeric collection id"),
+    # The loose numeric read that `_is_numeric_form` applies to *caller* input has no
+    # counterpart here: an upstream id is either a collection id or it is not.
+    (
+        "id-trailing-newline",
+        {"foreign_id": "my-case", "id": "874\n"},
+        "not a numeric collection id",
+    ),
+    ("id-spaced", {"foreign_id": "my-case", "id": "8 74"}, "not a numeric collection id"),
+]
+
+
+@pytest.mark.parametrize(
+    ("row", "clause"),
+    [(row[1], row[2]) for row in UNUSABLE_ROWS],
+    ids=[row[0] for row in UNUSABLE_ROWS],
+)
+async def test_a_row_that_is_not_a_collection_record_blames_the_upstream(
+    row: dict[str, Any], clause: str
+) -> None:
+    """The diagnosis has to be about the responder, because the call was correct.
+
+    Every one of these used to reach the caller-facing validator or the miss refusal.
+    `{"id": "874"}` was reported as "no collection with foreign_id 'my-case' is readable
+    with this API key"; the rest as "expected a numeric collection id (got 'None'). A
+    foreign_id is accepted directly and resolved for you; this error means the value is
+    neither." The caller passed a foreign_id, and the upstream confirmed it one line
+    earlier — so "the value is neither" is false about the call, and is asserted absent
+    here rather than left to the wording of the replacement.
+    """
+    upstream = FakeUpstream(answer={"total": 1, "results": [row]})
+    resolve = resolver(upstream)
+    with pytest.raises(ValueError) as excinfo:
+        await resolve.resolve_one("my-case", context="search_entities")
+    message = str(excinfo.value)
+    assert clause in message, f"the refusal must say {clause!r}: {message}"
+    assert "upstream malfunction" in message, f"the diagnosis must name the upstream: {message}"
+    assert "list_collections" not in message, (
+        f"a malfunction is not a missing collection: {message}"
+    )
+    assert "API key" not in message, f"nothing here is about authorisation: {message}"
+    assert "the value is neither" not in message, (
+        f"the caller's value was a foreign_id and it resolved; this sentence is false "
+        f"about the call: {message}"
+    )
+    assert resolve.cached == {}, "an unusable row must cache nothing"
+
+
+# A row whose `foreign_id` is *present* has made a statement about which collection it is,
+# and a statement that does not match is the miss the spec already fixes. `None` is in the
+# list because a collection created without a foreign_id serialises exactly that way: it is
+# a real record truthfully saying it is not the one asked for.
+CONFIRMED_MISSES: list[tuple[str, dict[str, Any]]] = [
+    ("different-value", {"id": "874", "foreign_id": "someone-else"}),
+    ("null-value", {"id": "874", "foreign_id": None}),
+    ("empty-value", {"id": "874", "foreign_id": ""}),
+]
+
+
+@pytest.mark.parametrize(
+    "row", [row[1] for row in CONFIRMED_MISSES], ids=[row[0] for row in CONFIRMED_MISSES]
+)
+async def test_a_row_naming_another_collection_is_still_a_miss(row: dict[str, Any]) -> None:
+    """The companion of the test above, and the reason the discriminator is key presence.
+
+    Falsiness would have collapsed `{"foreign_id": None}` into the malfunction branch,
+    which would be wrong twice over: it is a shape a well-behaved Aleph produces, and the
+    refusal it would get names an upstream fault for a listing that is working.
+    """
+    upstream = FakeUpstream(answer={"total": 1, "results": [row]})
+    resolve = resolver(upstream)
+    with pytest.raises(ValueError) as excinfo:
+        await resolve.resolve_one("my-case", context="search_entities")
+    message = str(excinfo.value)
+    assert "no collection with foreign_id" in message, message
+    assert "list_collections" in message, f"a genuine miss keeps its next step: {message}"
+    assert "upstream malfunction" not in message, message
+    assert resolve.cached == {}
+
+
+# One representative value per key, so a check written against presence passes and one
+# written against truthiness fails on `offset`. Aleph's QueryResult emits all five.
+ENVELOPE_KEYS: list[tuple[str, Any]] = [
+    ("status", "ok"),
+    ("total", 1),
+    ("page", 1),
+    ("limit", 1),
+    ("offset", 0),
+]
+
+
+@pytest.mark.parametrize("key,value", ENVELOPE_KEYS, ids=[row[0] for row in ENVELOPE_KEYS])
+async def test_any_one_envelope_key_is_enough_to_trust_the_rows(key: str, value: Any) -> None:
+    """`offset` is the row that matters: it is `0` on the first page of every listing, so
+    a guard written as `if not any(listing.get(k) for k in ...)` refuses a perfectly
+    ordinary Aleph reply. Presence, not truth."""
+    upstream = FakeUpstream(
+        answer={key: value, "results": [{"id": "874", "foreign_id": "my-case"}]}
+    )
+    resolved = await resolver(upstream).resolve_one("my-case", context="search_entities")
+    assert resolved == ResolvedCollection("874")
+
+
+async def test_rows_with_no_listing_envelope_are_not_trusted() -> None:
+    """A bare JSON array of records is what the transport's wrapper produces.
+
+    `Transport.request` turns a non-object body into `{"results": <body>}` and adds
+    nothing else, so before this guard a 200 whose whole body was
+    `[{"foreign_id": "my-case", "id": "874"}]` resolved to 874 and cached it for the
+    process lifetime. Measured. The resolver could not tell an Aleph listing from any
+    array that happened to carry the right two keys.
+    """
+    upstream = FakeUpstream(answer={"results": [{"id": "874", "foreign_id": "my-case"}]})
+    resolve = resolver(upstream)
+    with pytest.raises(ValueError) as excinfo:
+        await resolve.resolve_one("my-case", context="search_entities")
+    message = str(excinfo.value)
+    assert "no listing envelope" in message, f"the refusal must name the shape: {message}"
+    assert "upstream malfunction" in message, message
+    assert "list_collections" not in message, message
+    assert resolve.cached == {}, "rows outside an envelope must not be cached"
+
+
+async def test_an_empty_result_set_is_exempt_from_the_envelope_check() -> None:
+    """A bare `[]` body keeps reading as a genuine miss, which the spec fixes for it.
+
+    The envelope guard is about trusting *rows*; with none to trust, requiring an envelope
+    would reverse a decided question while claiming to be about something else. The test
+    exists because the cheapest implementation — check the envelope first — silently does
+    exactly that, and every other assertion in this file would still pass.
+    """
+    upstream = FakeUpstream(answer={"results": []})
+    resolve = resolver(upstream)
+    with pytest.raises(ValueError) as excinfo:
+        await resolve.resolve_one("no-such-case", context="get_collection")
+    message = str(excinfo.value)
+    assert "list_collections" in message, f"an empty array is still a miss: {message}"
+    assert "no collection with foreign_id" in message, message
+    assert "no listing envelope" not in message, message
+
+
+async def test_the_row_guards_run_after_the_shape_guards() -> None:
+    """A body that is wrong in two ways gets the more specific of the two diagnoses.
+
+    `["x"]` has no envelope *and* a first row that is not a record. Naming the row shape
+    tells an operator which part of the payload to look at; naming the absent envelope
+    does not. Pinned because the branch order is the only thing that decides it, and
+    reordering the two leaves every other test in this file green.
+    """
+    upstream = FakeUpstream(answer={"results": ["x"]})
+    with pytest.raises(ValueError) as excinfo:
+        await resolver(upstream).resolve_one("my-case", context="search_entities")
+    message = str(excinfo.value)
+    assert "carried a first row as str, not a record" in message, message
+    assert "no listing envelope" not in message, message
 
 
 # -- the all-collections literal means the same in either spelling -------------

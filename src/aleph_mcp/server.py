@@ -28,14 +28,14 @@ Working method that fits Aleph's limits:
    search several collections at once; the other three address exactly one. A value of
    only digits is always read as a numeric id.
    Searching everything is available only as the exact literal `collection="*"`, on the
-   two search tools, and `search_entities` says so in the reply's `_note`.
+   two search tools, and both say so in the reply's `_note`.
    This is required rather than defaulted because Aleph answers an unscoped search
    successfully: a query that meant one collection and did not say so returns another
    collection's rows, ranked and plausible, with no error anywhere. For the same reason an
    empty or blank `collection` is refused rather than treated as "no scope". Do not put
    `collection_id` in `filters` — that is refused, so that one scope has one spelling.
-   Every `search_entities` reply states the scope it actually searched under `searched`;
-   read it rather than assuming it.
+   Every `search_entities` and `match_entity` reply states the scope it actually searched
+   under `searched`; read it rather than assuming it.
 1. `list_collections` to see what this key can read, then `get_collection` for stats.
 2. `search_entities` with `facets=[...]` and `limit=0` FIRST, to learn how a result set
    breaks down before pulling rows. Useful facets: schema, collection_id, countries,
@@ -295,6 +295,11 @@ def build_server(settings: Settings) -> tuple[FastMCP, AlephClient]:
         either — the same argument as every other tool here. Pass the exact literal "*" to
         match against every readable collection, which is the right choice when the
         question is "does this person appear anywhere at all".
+
+        The reply states the scope actually searched under `searched.collection`, and adds
+        an EVERY COLLECTION note when that scope was "*" — a match run across every
+        readable collection returns hits from any of them, so check each hit's
+        `collection_id` before treating it as evidence about one subject.
         """
         return await client.match_entity(sample=sample, collection=collection, limit=limit)
 

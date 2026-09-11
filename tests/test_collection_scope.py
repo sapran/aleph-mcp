@@ -154,10 +154,14 @@ async def test_match_entity_reads_the_literal_the_same_way_in_either_spelling(
     """`match_entity` takes the same scope argument, so `["*"]` must widen it there too.
 
     Asserted separately from `search_entities` rather than folded into it, because the two
-    tools report the scope differently: `match_entity` writes no `searched` key at all, in
-    either spelling. Pinning that here is what keeps the spec scenario honest — an earlier
-    draft of it claimed `match_entity` reports `"*"` under `searched.collection`, which it
-    has never done.
+    tools carry different content under `searched`: `match_entity` reports the collection
+    scope alone, since the schema is stated by the caller inside `sample` and there is no
+    schema scope for this server to report back.
+
+    Until `finish-scope-row-shape` this tool reported nothing at all — no `searched`, no
+    note — so a match against every readable collection returned rows from any of them and
+    said so nowhere. That is the failure `scope.py`'s own module docstring names as its
+    reason to exist, reached through the one tool that was exempt from the reporting half.
     """
     route = respx_mock.post("/api/2/match").mock(
         return_value=httpx.Response(200, json={"total": 0, "results": []})
@@ -171,8 +175,38 @@ async def test_match_entity_reads_the_literal_the_same_way_in_either_spelling(
     assert b"collection_ids" not in route.calls.last.request.url.query, (
         "'*' must send no collection constraint to /api/2/match"
     )
-    assert "searched" not in out, (
-        "match_entity reports no scope key; a test asserting one would pin a fiction"
+    assert out["searched"] == {"collection": ALL_COLLECTIONS}, (
+        "the literal is reported as itself, and no schema scope is invented for this tool"
+    )
+    note = out.get("_note") or ""
+    assert "EVERY COLLECTION:" in note, f"an unscoped match must say so in `_note`: {note!r}"
+
+
+async def test_match_entity_reports_the_named_scope_it_searched(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The scalar and the resolved form of the same argument, reported the way
+    `search_entities` reports them: resolved numeric ids, as a list.
+
+    The all-collections note is asserted *absent* here. A note that appears on every reply
+    says nothing, and the one thing it has to distinguish is the scope nobody named.
+    """
+    route = respx_mock.post("/api/2/match").mock(
+        return_value=httpx.Response(200, json={"total": 0, "results": []})
+    )
+    respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(
+            200, json={"total": 1, "results": [{"id": "874", "foreign_id": "my-case"}]}
+        )
+    )
+    sample = {"schema": "Company", "properties": {"name": ["acme"]}}
+    out = await client.match_entity(sample=sample, collection="my-case")
+    assert b"collection_ids=874" in route.calls.last.request.url.query
+    assert out["searched"] == {"collection": ["874"]}, (
+        "the resolved id, not the foreign_id the caller spelled"
+    )
+    assert "EVERY COLLECTION" not in (out.get("_note") or ""), (
+        "a scoped match is not a cross-collection one and must not be labelled as one"
     )
 
 
@@ -440,6 +474,67 @@ async def test_an_unreadable_listing_is_refused_over_the_real_transport(
     assert client._scope.cached == {}, "an unreadable listing must cache nothing"
 
 
+async def test_a_bare_array_of_records_is_not_read_as_a_listing(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The claim this change closes, at the only layer that can prove it.
+
+    A 200 whose whole body is `[{"foreign_id": "my-case", "id": "874"}]` used to resolve
+    to 874, send `filter:collection_id=874`, and cache `my-case -> 874` for the process
+    lifetime — measured on `develop @ af104b7`. The module tests cannot show it, because
+    the wrapper that makes this body look like a listing lives in `transport.py`; only a
+    real response exercises it.
+
+    The cache assertion is the one that matters most. A wrongly resolved id that is also
+    remembered turns one malformed reply into every subsequent call in the session
+    searching a collection nobody named.
+    """
+    entities = respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json=raw_search_payload(raw_entity(), total=1))
+    )
+    respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(200, json=[{"foreign_id": "my-case", "id": "874"}])
+    )
+    with pytest.raises(ValueError) as excinfo:
+        await client.search_entities(collection="my-case", q="acme")
+    message = str(excinfo.value)
+    assert "no listing envelope" in message, message
+    assert "upstream malfunction" in message, message
+    assert "list_collections" not in message, message
+    assert entities.call_count == 0, "a scope that could not be resolved must not be searched"
+    assert client._scope.cached == {}, "rows outside an envelope must not be cached"
+
+
+async def test_a_confirmed_row_with_an_unusable_id_does_not_blame_the_caller(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """Read at the seam the caller actually sees, because the claim is about a message.
+
+    The upstream confirms the foreign_id the caller passed and then hands back an `id` of
+    `null`. Before this change the caller was told *"expected a numeric collection id (got
+    'None'). A foreign_id is accepted directly and resolved for you; this error means the
+    value is neither."* — a sentence that is false in both halves about a call that was
+    correct.
+    """
+    entities = respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json=raw_search_payload(raw_entity(), total=1))
+    )
+    respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(
+            200, json={"total": 1, "results": [{"foreign_id": "my-case", "id": None}]}
+        )
+    )
+    with pytest.raises(ValueError) as excinfo:
+        await client.search_entities(collection="my-case", q="acme")
+    message = str(excinfo.value)
+    assert "not a numeric collection id" in message, message
+    assert "upstream malfunction" in message, message
+    assert "the value is neither" not in message, message
+    assert "list_collections" not in message, message
+    assert entities.call_count == 0, "a scope that could not be resolved must not be searched"
+    assert client._scope.cached == {}, "an unusable row must cache nothing"
+
+
 async def test_paging_is_refused_before_a_foreign_id_costs_a_lookup(
     client: AlephClient, respx_mock: respx.MockRouter
 ) -> None:
@@ -586,7 +681,18 @@ async def test_an_upstream_id_echoed_into_an_error_is_bounded(
     """The `id` read out of a listing hit is upstream text, not caller text, and it reaches
     a model-visible error. This repo caps upstream material that reaches the model
     (the named policies in `echo.py`); an unbounded echo is a write
-    primitive into the model's context."""
+    primitive into the model's context.
+
+    The assertions measure the *echo*, not the message. Since `finish-scope-row-shape` this
+    value arrives through the upstream-malfunction refusal, whose fixed prose is longer
+    than the caller-facing validator's — measured at 581 characters here, of which 444 are
+    this server's own constants and 137 are the clipped echo of a 5000-character id. A
+    whole-message ceiling would therefore be pinning the length of a sentence rather than
+    the bound, and would go red the next time that sentence is reworded while the leak it
+    exists to catch stayed closed. This file has already had one assertion silently
+    disarmed by a rewording; a ceiling that moves with prose is the same trap facing the
+    other way.
+    """
     respx_mock.get("/api/2/collections").mock(
         return_value=httpx.Response(
             200,
@@ -596,8 +702,15 @@ async def test_an_upstream_id_echoed_into_an_error_is_bounded(
     with pytest.raises(ValueError) as excinfo:
         await client.search_entities(collection="my-case", q="acme")
     message = str(excinfo.value)
-    assert len(message) < 500, f"upstream text echoed unbounded: {len(message)} chars"
+    assert "n" * 121 not in message, (
+        "the upstream id was echoed past the COLLECTION_ECHO cap; the run of upstream "
+        f"characters in the message is what this test bounds: {len(message)} chars total"
+    )
     assert "chars]" in message, "the clip must say it clipped"
-    # Which policy this call site names is now a one-word choice, and the two assertions
-    # above hold under any cap below ~440. Pin the number the echo path actually uses.
+    # Which policy this call site names is a one-word choice, and the assertion above holds
+    # under any cap at or below 120. Pin the number the echo path actually uses.
     assert f"'{'n' * 120}… [+4880 chars]'" in message
+    # A coarse backstop on the whole reply, set well clear of the prose so it catches a
+    # second unbounded echo rather than an edited sentence. 5000 characters of upstream
+    # text must never approach it.
+    assert len(message) < 900, f"upstream text echoed unbounded: {len(message)} chars"

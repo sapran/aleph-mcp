@@ -19,69 +19,30 @@ still draws without earning them — all found by review of that change. Item 1 
 refusal channel — was closed by `type-the-refusal-channel` on 2026-09-11, parking three new claims
 in passing — two as a new entry for the decode failures its guard deliberately does not cover, one
 under the ontology-shape entry — and consuming one bullet of the stale-prose entry whose sentences
-that change made false. All three were found by review of it. The plan and the sections below are
-renumbered after each, so twenty-eight claims across twelve entries remain.
+that change made false. All three were found by review of it. Item 1 for the last time — the scope
+path's row shape — was closed by `finish-scope-row-shape` on 2026-09-11, which took all four of its
+claims together because they are one question about whether a row has earned the conclusions drawn
+from it; it parked one new claim in passing, as its own entry, found while giving `match_entity`
+its scope report. The plan and the sections below are renumbered after each, so twenty-five claims
+across twelve entries remain.
 
 ## Work plan
 
-1. Finish the scope path's row shape — a confirmed row with a bad `id` blames the caller.
-2. Make the licence gate able to fail — it passes with the project's own LICENSE deleted.
-3. Answer the entity-shaped spec question — four copy-through slots, one decision, five xfails.
-4. Extend the tool path's guarantees to resources — a `resource()` factory and a wider walk.
-5. Close echo.py's enforcement gaps — an inline policy escapes both guards.
-6. Give `get_entity_text` a derived caption.
-7. Close the tests that cannot fail — four checks that certify nothing.
-8. Decide the private-sibling references — the publication deadline has already passed.
-9. Guard the ontology's shape — a non-dict raises AttributeError, a non-object body reads as empty.
-10. Name the dropped error body — a real complaint reads as no complaint at all.
-11. Classify the decode's two uncaught failures — both reach the caller as a server fault.
+1. Make the licence gate able to fail — it passes with the project's own LICENSE deleted.
+2. Answer the entity-shaped spec question — four copy-through slots, one decision, five xfails.
+3. Extend the tool path's guarantees to resources — a `resource()` factory and a wider walk.
+4. Close echo.py's enforcement gaps — an inline policy escapes both guards.
+5. Give `get_entity_text` a derived caption.
+6. Close the tests that cannot fail — four checks that certify nothing.
+7. Decide the private-sibling references — the publication deadline has already passed.
+8. Guard the ontology's shape — a non-dict raises AttributeError, a non-object body reads as empty.
+9. Name the dropped error body — a real complaint reads as no complaint at all.
+10. Classify the decode's two uncaught failures — both reach the caller as a server fault.
+11. Bound the match reply — `match_entity` has no response-size ceiling.
 12. Correct three pieces of stale prose (Tier 0).
 ---
 
-## 1. The scope path draws four conclusions it has not earned
-
-All four surfaced by review of `guard-scope-resolver-shapes`, which guarded the listing's
-*envelope* and left the row inside it, and the reporting around it, where they were. Recorded
-rather than fixed because that change's spec enumerates the shapes it covers — "no `results` key
-at all, a `results` value that is not a list, a first row that is not a record" — and none of
-these is one of them. All four fail closed; none returns wrong rows.
-
-**A row that matches the foreign_id but carries an unusable `id` blames the caller.**
-`scope.py:409` hands `hit.get("id")` straight to `check_collection_id`, whose message is written
-for caller input. Measured end-to-end through the client on this branch, for `id` null, missing,
-`"abc"` and `{"a": 1}`:
-
-    invalid collection: expected a numeric collection id (got 'None'). A foreign_id is
-    accepted directly and resolved for you; this error means the value is neither.
-
-The caller passed a valid foreign_id that the upstream confirmed one line earlier, and is told
-their value is "neither". That is the same confident wrong diagnosis `guard-scope-resolver-shapes`
-removed from the envelope, one branch further down — and a renamed or slimmed `id` field is a more
-likely upstream malfunction than `{"results": 5}`. Both reviewers of that PR raised it
-independently; one rated it critical. The fix is to check the row's `id` before the caller-facing
-validator and route a bad one to `_unusable_listing`.
-
-**A row with no `foreign_id` key at all is read as a different collection.** `scope.py:407`
-tests `hit.get("foreign_id") != text`, so an absent field and a genuinely different value take the
-same branch and produce the same "no collection with foreign_id X" refusal. Only the second has
-any reading as a miss; the first is a row that is not a collection record.
-
-**A bare JSON array of records resolves and caches, with no listing envelope.** The transport
-wraps a non-dict body as `{"results": <body>}` (`transport.py:398`), so a 200 whose body is
-`[{"foreign_id": "my-case", "id": "874"}]` resolves to 874 and caches it for the process
-lifetime. Measured. Unchanged from `develop` and arguably what the wrapper is for, but it means
-the resolver cannot tell an Aleph listing from any array that happens to carry the right keys.
-Requiring a real envelope — `total` or `page` — before trusting the rows would close it.
-
-**`match_entity` never announces an all-collections scope.** `client.py` writes `searched` only
-inside `search_entities`, so `match_entity(collection="*")` sends no constraint, returns every
-readable collection's rows, and says so nowhere — no `searched`, no EVERY COLLECTION note.
-Measured: the reply carries only `limit`, `offset`, `results`, `total`. Pre-existing for the
-scalar and spec'd that way, but it is the failure `scope.py`'s own module docstring says the
-module exists to prevent, and `guard-scope-resolver-shapes` added a second spelling that reaches
-it.
-
-## 2. The licence gate cannot fail
+## 1. The licence gate cannot fail
 
 Both in `.github/workflows/ci.yml`, the `build` job's licence step; one change. (The SIGPIPE race
 in the same step is fixed — see Retired.)
@@ -107,15 +68,15 @@ which is the first thing anyone debugging a packaging regression wants. Also, tw
 `unzip -p`) — unreachable in CI, where the checkout is fresh and `uv build` is the only writer, but
 it bites anyone running the step locally against a dirty `dist/`.
 
-## 3. Four aggregation slots are copied rather than rebuilt — one spec question
+## 2. Four aggregation slots are copied rather than rebuilt — one spec question
 
 `get_profile.entities`, `_slim_entityset.entities`, a tag row's `value`, and
 `_slim_collection(full=True).statistics` are one decision about what counts as entity-shaped, not
 four refactors. Since T1-FIX-2 each is pinned by a `strict` xfail row in `NOT_SHAPING_CASES`
-(`tests/test_client.py:1637-1669`), so the behaviour cannot change without the suite saying so, and
+(`tests/test_client.py:1790-1822`), so the behaviour cannot change without the suite saying so, and
 fixing any of them forces this note to be closed.
 
-- **`get_profile` passes its `entities` field through unshaped** (`client.py:980`). It holds id
+- **`get_profile` passes its `entities` field through unshaped** (`client.py:1252`). It holds id
   strings in every fixture and on the live instance, so nothing leaks today, but the "binds every
   entity-shaped value in a response" requirement in `openspec/specs/mcp-tool-surface` would be
   violated by an instance that serialised objects there. Since T1 this fails *closed*: `_shape`
@@ -138,7 +99,7 @@ fixing any of them forces this note to be closed.
   that block holds, unread and unbounded; `list_collections` does not, because it slims with
   `full=False`.
 - **An upstream `_note` key makes `get_entityset` return the whole unslimmed payload.**
-  `client.py:1164` short-circuits the slimmer on `if payload.get("_note")`, a branch written for
+  `client.py:1367` short-circuits the slimmer on `if payload.get("_note")`, a branch written for
   the server-authored profile-redirect reply — but the test is on the *decoded upstream body*, so
   an instance or an on-path proxy that adds one `_note` key to a 200 gets the entire payload back
   verbatim, bypassing `_slim_entityset`'s fixed key set, the `bodyText` strip and the 500-char
@@ -150,14 +111,14 @@ fixing any of them forces this note to be closed.
   above: upstream text would then land in `_reply`'s existing-note composition. Fix is to key the
   short-circuit on something upstream cannot set. Pre-existing and outside that change's scope.
 
-## 4. The resource path lacks the tool path's guarantees
+## 3. The resource path lacks the tool path's guarantees
 
 Three findings, closed by a ~4-line local `resource(uri, **kw)` factory mirroring `tool`, plus a
 wider walk in `find_marker`.
 
 **Resources have no counterpart to the fused `tool` helper.** `@mcp.resource` is still reachable raw
-(`server.py:413`, `:418`), and `schema_resource`'s translation is a hand-applied decorator
-(`server.py:430`) nothing enforces. A future *parameterised* resource would silently regress to
+(`server.py:418`, `:423`), and `schema_resource`'s translation is a hand-applied decorator
+(`server.py:435`) nothing enforces. A future *parameterised* resource would silently regress to
 FastMCP's `Error reading resource '<uri>': ` wrapping, and the decorator order is load-bearing but
 fails silently (`@_as_resource_error` above `@mcp.resource` imports, registers and serves the
 untranslated message). `collections_resource` and `schemata_resource` cannot raise `ValueError` at
@@ -168,12 +129,12 @@ all, so decorating them now would be dead code.
 call unshaped client methods that build no markers. It becomes real only if a resource is ever
 pointed at a `@_shaped` method.
 
-**`find_marker` does not traverse tuples, sets or dict keys.** `client.py:370-382` walks dicts by
+**`find_marker` does not traverse tuples, sets or dict keys.** `client.py:524-531` walks dicts by
 value and lists by item only. No client method builds a tuple, a set or a non-string key into a
 reply, so nothing reaches those branches today, and the markers' own serialisation refusal still
 fires there — the outcome degrades to the pre-T1-FIX-2 message rather than leaking.
 
-## 5. echo.py's three enforcement gaps
+## 4. echo.py's three enforcement gaps
 
 **A policy built inline at a call site escapes both guards.** `test_every_policy_has_a_cap_row`
 (`tests/test_echo.py:59`) enumerates `vars(echo)`, so it sees only module-level policies declared in
@@ -184,7 +145,7 @@ enforcement, not a live defect. Closing it means either forbidding non-module po
 asserting the nine call sites against the five names.
 
 **`echo.COLLECTION_ECHO` leaves control characters to its call site's `!r`.** The behaviour the four
-helpers had, preserved deliberately rather than a new gap. `scope.py:81` is the only caller and
+helpers had, preserved deliberately rather than a new gap. `scope.py:92` is the only caller and
 formats the result with `!r`, which escapes controls — so the policy does not strip them itself. A
 second caller that interpolated the rendering plainly would put upstream control characters into a
 model-visible message. Recorded because the coupling is now between two files rather than inside one
@@ -202,25 +163,25 @@ and the content is what was asked for — than to a refusal. Closing it means de
 whole record is `PROPERTY_VALUE`-shaped data with a `_provenance` label, or whether a schema
 description deserves its own bound. A behaviour change to a resource's output either way.
 
-## 6. `get_entity_text` derives no caption
+## 5. `get_entity_text` derives no caption
 
-`client.py:1188` reads `entity.get("caption")` straight off the payload, where every slimmed path
+`client.py:1460` reads `entity.get("caption")` straight off the payload, where every slimmed path
 calls `derive_caption`. Live Aleph sends a null caption, so this is the one tool that can return
 `caption: null` for an entity the other tools would have captioned. Found during T1; fixing it
 changes a tool's output and so is a behaviour change, not a refactor.
 
-## 7. Four checks that certify nothing
+## 6. Four checks that certify nothing
 
 One purely-test change closes all four.
 
 - **`test_search_derives_captions_from_the_instance_model` cannot fail**
-  (`tests/test_client.py:1056`). Its mocked model declares the caption order `["name"]`, which is
+  (`tests/test_client.py:1257`). Its mocked model declares the caption order `["name"]`, which is
   also the first entry of `_CAPTION_FALLBACK`, so it passes whether or not the instance model
   reaches the slimmer. Superseded, not load-bearing: T1's
   `test_every_entity_returning_method_shapes_its_reply` covers the same path with a discriminating
   model. Delete or strengthen.
 - **The `MAX_SCOPE_COLLECTIONS` boundary is unpinned.** Only `MAX + 1` is tested
-  (`tests/test_scope.py:91`); changing `>` to `>=` at `scope.py:210` — which would refuse a
+  (`tests/test_scope.py:97`); changing `>` to `>=` at `scope.py:248` — which would refuse a
   legitimate ten-collection scope — passes the whole suite. Related and also unpinned: the dedup runs
   *before* the bound, so eleven spellings collapsing to ten are accepted. One row in the existing
   parametrised table.
@@ -232,14 +193,14 @@ One purely-test change closes all four.
   `classify-transport-failures`: a TLS refusal now names that setting to the operator, so the
   message is wrong in a new way if the setting never reaches the client.
 
-## 8. A public repo still points at private siblings
+## 7. A public repo still points at private siblings
 
 The publication this was to be decided before has happened — 0.3.0 shipped from a public repo on
 2026-09-10 — so this is now a live defect rather than a pending decision.
 
 **Non-public sibling tools are named outside the README.** The open-source readiness branch removed
 the dead `../aleph-coldbackup` / `../datashare-mcp` links from `README.md`, but the same tool is
-still named in `src/aleph_mcp/server.py:68` (server instructions, so a model sees it),
+still named in `src/aleph_mcp/server.py:69` (server instructions, so a model sees it),
 `src/aleph_mcp/config.py:19` (comment) and
 `plugins/aleph/skills/aleph-entity-graph/SKILL.md:64`. `tests/test_tools.py` asserts on the
 instructions string, so changing it is not free.
@@ -251,7 +212,7 @@ private; `acordia` is also named across the specs, the archived changes and
 contributor cannot see. The declaration is deliberate and documented, so removing it is a design
 decision, not a cleanup.
 
-## 9. The ontology tools trust `model["schemata"]`'s shape
+## 8. The ontology tools trust `model["schemata"]`'s shape
 
 **A non-dict `schemata` inside a valid `model` reaches the caller as an AttributeError.**
 `client.py`'s `list_schemata` does `model.get("schemata") or {}` and then `.items()` on it, and
@@ -279,7 +240,7 @@ decision (reuse `raise_unusable_model`, or degrade) rather than a one-liner.
 
 **A metadata body that is valid JSON but not an object is served as an ontology declaring
 nothing, silently.** A third branch of the same defect, one level further out: the transport wraps
-a non-dict body as `{"results": <body>}` (`transport.py:398`), so a `200` whose body is the JSON
+a non-dict body as `{"results": <body>}` (`transport.py:416`), so a `200` whose body is the JSON
 string `"<html>down</html>"`, or the array `[1,2,3]`, reaches `get_model` as a payload with no
 `model` key at all. `raise_unusable_model`'s guard is `model and not isinstance(model, dict)` and
 cannot fire on a value that is *absent* rather than wrong-typed, so the model caches as `{}`.
@@ -296,7 +257,7 @@ found by review of it, which noted that the change sharpens the asymmetry: a met
 Closing it means either requiring a real envelope before the wrapper is applied, or having
 `get_model` distinguish "no `model` key in an object body" from "no object body at all".
 
-## 10. An oversized error body is dropped without saying so
+## 9. An oversized error body is dropped without saying so
 
 **`_upstream_detail` discards a JSON error body over 64 KiB and the refusal reads as if none
 arrived.** `errors.py`. For a `400` the quoted `message` is the only actionable content the refusal
@@ -313,7 +274,7 @@ an oversized body and `b""` from an empty one are the same value today) and appe
 the refusal naming the drop. Parsing a truncated prefix is not the fix; the reasoning against that
 is written at `Transport._read_error_body`.
 
-## 11. Two decode failures the guard deliberately does not cover
+## 10. Two decode failures the guard deliberately does not cover
 
 Both at `transport.py`'s `jsonlib.loads(body)`, which `type-the-refusal-channel` guards for
 `json.JSONDecodeError` and `UnicodeDecodeError` only. Both reach the caller as a server fault
@@ -338,6 +299,22 @@ both false: the body is JSON and the limit is ours, liftable with one call at st
 was narrowed to the two leaves in response, which is what parks this rather than mis-reporting it.
 Closing it properly means deciding whether to raise the limit or to refuse with a message that
 names it.
+
+## 11. `match_entity` has no response-size ceiling
+
+Found while giving that tool its `searched` report in `finish-scope-row-shape`, and recorded
+rather than fixed because that change is about which scope a reply names, not about how large the
+reply is.
+
+**The shrink loop is `search_entities`-only.** `client.py` enforces `MAX_RESPONSE_BYTES` by
+measuring the built reply and retrying with a smaller page (`_shrunk_page`), and only
+`search_entities` runs it. `match_entity` builds its reply with the same `_slim_result` over rows
+from the same index, caps `limit` at 100, and then returns whatever that came to. Nothing measures
+it and nothing announces a truncation, so the ceiling the spec states for search is simply absent
+next door. Not reached in any fixture — matched entities are slimmed, and 100 of them stay well
+under the ceiling — which is why this is a gap rather than a defect today. Closing it means either
+running the same loop for the match path or stating in the spec that the ceiling is a
+`search_entities` guarantee; the two tools currently disagree without saying so anywhere.
 
 ## 12. Three pieces of stale prose (Tier 0)
 
