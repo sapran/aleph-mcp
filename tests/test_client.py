@@ -1,3 +1,4 @@
+import re
 from collections.abc import Callable, Iterator
 from itertools import pairwise
 from typing import Any, NamedTuple
@@ -17,6 +18,8 @@ from aleph_mcp.client import (
     MAX_FACET_SIZE,
     MAX_PAGE,
     MAX_SEARCH_SHRINKS,
+    MAX_SUGGESTION_CHARS,
+    MAX_SUGGESTIONS,
     AlephClient,
     _AsIs,
     _Ent,
@@ -27,6 +30,7 @@ from aleph_mcp.client import (
     derive_caption,
     slim_entity,
 )
+from aleph_mcp.echo import SCHEMA_NAME
 from aleph_mcp.transport import MAX_RESPONSE_BYTES
 from tests.conftest import assert_model_not_fetched
 from tests.shapes import (
@@ -968,6 +972,86 @@ async def test_unknown_schema_suggests_alternatives(
     )
     with pytest.raises(ValueError, match="Did you mean"):
         await client.get_schema(name="Persson")
+
+
+# -- the ontology echo ---------------------------------------------------------
+
+# A schema key is upstream text: whoever runs or proxies the instance chooses it. This one
+# carries the four families that matter in a message rendered into a terminal and read by a
+# model -- an ANSI escape, a NUL, a bidi override, and a raw double quote.
+HOSTILE_SCHEMA_NAME = 'Pers\x1b[31mon\x00‮B"quote"'
+
+
+def _suggested(message: str) -> list[str]:
+    """The names a refusal offered, or [] if it offered none."""
+    match = re.search(r"Did you mean one of: (.*)\? Read", message)
+    return match.group(1).split(", ") if match else []
+
+
+async def _refusal(
+    client: AlephClient, respx_mock: respx.MockRouter, schemata: dict[str, Any], name: str
+) -> str:
+    respx_mock.get("/api/2/metadata").mock(
+        return_value=httpx.Response(200, json={"model": {"schemata": schemata}})
+    )
+    with pytest.raises(ValueError) as excinfo:
+        await client.get_schema(name=name)
+    return str(excinfo.value)
+
+
+async def test_refusal_neutralises_upstream_schema_names(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The suggested names are interpolated bare, so nothing downstream escapes them.
+
+    `name!r` sits in the same f-string and is caller input, and `!r` escapes it; the upstream
+    half had no such protection. This message leaves through `aleph://schema/{name}`
+    unprefixed, which is the shape that survives `mask_error_details` -- so an un-neutralised
+    name reaches the model, and the terminal rendering it, intact.
+    """
+    message = await _refusal(client, respx_mock, {HOSTILE_SCHEMA_NAME: {}}, "Persson")
+    assert _suggested(message), "the hostile name is the only near match, so it must be offered"
+    assert all(ch.isprintable() for ch in message), f"unprintable survived: {message!r}"
+    assert "�" in message, "the substitution must be visible as damage, not silent"
+
+
+async def test_refusal_is_not_sized_by_an_upstream_schema_name(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """One 20,000-character key produced a 20,100-character refusal before this bound."""
+    message = await _refusal(client, respx_mock, {"Pers" + "o" * 20_000: {}}, "Persson")
+    (only,) = _suggested(message)
+    assert len(only) <= SCHEMA_NAME.max_chars + 1, "the per-name bound is the cap plus its tail"
+
+
+async def test_many_near_matches_cannot_together_restore_the_echo(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The per-name cap alone does not bound the message -- ten names at the cap is the same
+    defect one order of magnitude smaller. The joined list is what has to be bounded.
+
+    240 is written out rather than read from `MAX_SUGGESTION_CHARS`, for the reason
+    `tests/test_echo.py` gives about the policy caps: an expectation computed from the
+    constant it guards moves with it. Derived, raising the bound to 600 left this green while
+    the upstream text in the message grew by a third.
+    """
+    schemata: dict[str, Any] = {f"Per{'o' * 80}{i:02d}": {} for i in range(MAX_SUGGESTIONS + 5)}
+    message = await _refusal(client, respx_mock, schemata, "Persson")
+    names = _suggested(message)
+    assert names, "a bound that offers nothing has degraded the refusal, not shortened it"
+    assert len(names) < MAX_SUGGESTIONS, "the total-length bound must bite before the count cap"
+    assert MAX_SUGGESTION_CHARS == 240
+    assert len(", ".join(names)) <= 240
+
+
+async def test_an_ordinary_near_match_is_offered_verbatim(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """Every bound above is inert on a real ontology, and that is the point: the stock
+    FollowTheMoney names are far under the caps, so no legitimate suggestion changes."""
+    schemata: dict[str, Any] = {"Person": {}, "Passport": {}, "Ownership": {}}
+    message = await _refusal(client, respx_mock, schemata, "Persson")
+    assert _suggested(message) == ["Person"]
 
 
 # -- mandatory schema scope (regression: live 400 "No schema is specified") -----

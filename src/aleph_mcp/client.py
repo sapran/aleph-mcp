@@ -13,7 +13,7 @@ import httpx
 from fastmcp.exceptions import ResourceError, ToolError
 
 from .config import Settings
-from .echo import PROPERTY_VALUE, render
+from .echo import PROPERTY_VALUE, SCHEMA_NAME, render
 from .errors import ResponseTooLarge, raise_unusable_model
 from .readonly import ReadOnlyViolation
 from .scope import ALL_COLLECTIONS, CollectionResolver
@@ -53,6 +53,25 @@ MAX_FACET_SIZE = 200
 # does not shrink with `limit` at all, so those calls spend every hop and still fail; the
 # deadline in search_entities is what bounds that case, not this count.
 MAX_SEARCH_SHRINKS = 3
+
+# The three bounds on ontology text. FtM schema names are upstream text -- whoever runs or
+# proxies the instance chooses them -- so `echo.SCHEMA_NAME` bounds each name and these bound
+# how many of them are put together. Measured against followthemoney 4.11.0: 71 schemata,
+# longest name `ProjectParticipant` at 18 characters, and the worst three-character prefix
+# cluster (`con` -> Contract, ContractAward, Control) joining to 32 characters.
+#
+# MAX_SUGGESTION_CHARS is the one that does the work. A per-name cap alone leaves ten names at
+# the cap, which is the same unbounded echo one order of magnitude smaller, so the joined list
+# is bounded too. At 7.5x the worst real cluster it never clips a legitimate suggestion set,
+# and when it does clip nothing is lost that the caller cannot recover: the refusal already
+# ends by naming `aleph://schemata` as the full list.
+MAX_SUGGESTIONS = 10
+MAX_SUGGESTION_CHARS = 240
+
+# Roughly 7x the stock ontology, applied to each of the three lists `list_schemata` returns.
+# `matchable` and `edges` are subsets of `all`, so bounding only `all` would leave a shorter
+# but still unbounded path through either subset.
+MAX_SCHEMA_NAMES = 500
 
 # Properties that carry whole documents. Never worth spending context on inside a
 # search hit; get_entity_text exists to read them deliberately and in bounded slices.
@@ -125,6 +144,32 @@ _FALLBACK_CAPTION_NOTE = (
     "caption as a convenience label, not as the instance's own. The fault is remembered "
     "briefly, so an immediate retry returns this same answer without asking the instance."
 )
+
+
+def _suggestion_list(names: list[str]) -> str:
+    """The near-match names a refusal offers, rendered and bounded as one string.
+
+    Two bounds, because one is not enough. `SCHEMA_NAME` bounds each name, and without it a
+    single 20,000-character key produced a 20,100-character refusal. But ten names each at
+    that cap is the same unbounded echo one order of magnitude smaller, so the *joined* list
+    is bounded too -- which is the bound the count cap was mistaken for.
+
+    Clipping loses nothing the caller cannot recover: the refusal this feeds already ends by
+    naming `aleph://schemata` as the full list, and the suggestions are only a shortcut to it.
+    That is what makes the exact number a judgement rather than a contract.
+
+    Returns `""` when there is nothing to offer, which the call site reads as "emit no clause"
+    -- an empty list would otherwise render as `Did you mean one of: ?`.
+    """
+    offered: list[str] = []
+    used = 0
+    for name in names[:MAX_SUGGESTIONS]:
+        rendered = render(name, SCHEMA_NAME)
+        used += len(rendered) + (2 if offered else 0)
+        if offered and used > MAX_SUGGESTION_CHARS:
+            break
+        offered.append(rendered)
+    return ", ".join(offered)
 
 
 def derive_caption(entity: dict[str, Any], schemata: dict[str, Any] | None = None) -> str | None:
@@ -681,14 +726,40 @@ class AlephClient:
         return schemata if isinstance(schemata, dict) else None
 
     async def list_schemata(self) -> dict[str, Any]:
+        """Every schema name this instance declares, bounded, rendered and labelled.
+
+        `count` is the instance's own total, not the length of the list served. The resource
+        answers *what this instance declares*, so reporting a clipped count alongside a clipped
+        list would state something false about the instance -- the same reading the refusal of
+        an unusable model already establishes, where an ontology that could not be read must
+        not be served as one declaring nothing.
+
+        All three lists are bounded, not just `all`. `matchable` and `edges` are subsets of it,
+        so bounding only `all` would leave a shorter but equally unbounded path out through
+        either subset.
+        """
         model = await self.get_model()
         schemata = model.get("schemata") or {}
-        return {
-            "count": len(schemata),
+        lists = {
             "matchable": sorted(n for n, s in schemata.items() if s.get("matchable")),
             "edges": sorted(n for n, s in schemata.items() if s.get("edge")),
             "all": sorted(schemata),
         }
+        out: dict[str, Any] = {"count": len(schemata)}
+        omitted = {}
+        for key, names in lists.items():
+            out[key] = [render(n, SCHEMA_NAME) for n in names[:MAX_SCHEMA_NAMES]]
+            if len(names) > MAX_SCHEMA_NAMES:
+                omitted[key] = len(names) - MAX_SCHEMA_NAMES
+        if omitted:
+            # Announced rather than served short. A confidently incomplete answer is the one
+            # shape this server treats as a defect, so a cut list says what it cut.
+            out["_omitted_schemata"] = omitted
+        out["_provenance"] = {
+            "trust": "untrusted",
+            "origin": "schema names declared by the Aleph instance, not this server's vocabulary",
+        }
+        return out
 
     async def get_schema(self, *, name: str) -> dict[str, Any]:
         model = await self.get_model()
@@ -696,9 +767,10 @@ class AlephClient:
         schema = schemata.get(name)
         if schema is None:
             close = sorted(n for n in schemata if n.lower().startswith(name[:3].lower()))
+            suggestions = _suggestion_list(close)
             raise ValueError(
                 f"unknown followthemoney schema {name!r}. "
-                + (f"Did you mean one of: {', '.join(close[:10])}?" if close else "")
+                + (f"Did you mean one of: {suggestions}?" if suggestions else "")
                 + " Read aleph://schemata for the full list."
             )
         return {

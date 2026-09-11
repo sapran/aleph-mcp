@@ -16,6 +16,7 @@ it, and let each call site ask for it by name rather than restate it in a commen
     PROPERTY_VALUE    500  kept         no           kept    count
     COLLECTION_ECHO   120  kept         no           kept    count
     REQUEST_TARGET    120  -> U+FFFD    no           kept    ellipsis
+    SCHEMA_NAME        64  -> U+FFFD    no           kept    ellipsis
     UPSTREAM_ERROR    200  -> space     yes          -> '    ellipsis
 
 Two of these keep unprintable characters because their only call sites render the result
@@ -82,6 +83,22 @@ COLLECTION_ECHO: Final = Policy(name="collection_echo", max_chars=120, overflow=
 # controls go: ANSI escapes and bidi overrides survive `str.split()`, which collapses
 # whitespace only. U+FFFD rather than a space so the substitution is visible as damage.
 REQUEST_TARGET: Final = Policy(name="request_target", max_chars=120, unprintable="\ufffd")
+
+# An FtM schema name declared by the instance, quoted back into a refusal or served in the
+# ontology listing. Upstream text: whoever runs or proxies the instance chooses it. The cap is
+# 3.5x the longest name in the stock ontology (`ProjectParticipant`, 18 characters), so it is
+# inert on anything real.
+#
+# U+FFFD for the same reason REQUEST_TARGET gives: the name is interpolated *without* `!r` and
+# nothing downstream escapes it, so the substitution has to be visible as damage rather than
+# quietly closing the gap. It also removes the need for a whitespace collapse -- `\n`, `\r` and
+# `\t` are not printable, so a multi-line name is flattened by the substitution itself.
+#
+# Quotes are kept, unlike UPSTREAM_ERROR. That policy neutralises `"` because its call site
+# wraps the text in a quoted region a `"` could close early; a schema name is interpolated bare
+# into a comma-separated list, with no delimiter of the server's to close, so the substitution
+# would only corrupt a legitimate name.
+SCHEMA_NAME: Final = Policy(name="schema_name", max_chars=64, unprintable="�")
 
 # Aleph's own error text, or a transport exception's message, quoted as data inside a
 # model-visible message. The label is the only other mitigation on this path and a single

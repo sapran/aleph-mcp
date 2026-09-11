@@ -9,7 +9,9 @@ import respx
 from fastmcp import Client as MCPClient
 from fastmcp import FastMCP
 
+from aleph_mcp.client import MAX_SCHEMA_NAMES
 from aleph_mcp.config import Settings
+from aleph_mcp.echo import SCHEMA_NAME
 from aleph_mcp.server import build_server
 from tests.shapes import raw_model
 
@@ -54,6 +56,47 @@ async def test_schemata_resource_splits_matchable_and_edges(
     assert out["count"] == 4
     assert out["matchable"] == ["Person"]
     assert out["edges"] == ["Ownership"]
+
+
+async def test_schemata_resource_bounds_and_labels_upstream_names(
+    server: FastMCP, respx_mock: respx.MockRouter
+) -> None:
+    """Every name here is upstream text, and the model has no other way to know that.
+
+    Before this bound the resource returned `sorted(schemata)` -- every key, unbounded in
+    count and in length, held back only by the 25 MiB response ceiling -- and carried no
+    provenance label, so the names read as this server's own vocabulary.
+    """
+    model = raw_model()
+    model["model"]["schemata"]["Pers" + "o" * 20_000] = {"matchable": True}
+    respx_mock.get("/api/2/metadata").mock(return_value=httpx.Response(200, json=model))
+    async with MCPClient(server) as mcp:
+        out = _payload(await mcp.read_resource("aleph://schemata"))
+    assert max(len(n) for n in out["all"]) <= SCHEMA_NAME.max_chars + 1
+    assert max(len(n) for n in out["matchable"]) <= SCHEMA_NAME.max_chars + 1
+    assert out["_provenance"]["trust"] == "untrusted"
+    assert "_omitted_schemata" not in out, "five names is under the cap; nothing was dropped"
+
+
+async def test_schemata_resource_reports_what_it_dropped(
+    server: FastMCP, respx_mock: respx.MockRouter
+) -> None:
+    """A confidently incomplete answer is a defect in this server, so a cut list says so --
+    and `count` keeps naming the instance's own total rather than the length served.
+
+    The numbers are written out rather than derived from `MAX_SCHEMA_NAMES`, for the reason
+    `tests/test_echo.py` gives about the policy caps: an expectation computed from the
+    constant it guards moves with it, so widening the bound would leave this green while the
+    echo it bounds grew. Pinned here, raising the cap goes red and has to be chosen again.
+    """
+    model = {"model": {"schemata": {f"S{i:05d}": {"matchable": True} for i in range(507)}}}
+    respx_mock.get("/api/2/metadata").mock(return_value=httpx.Response(200, json=model))
+    async with MCPClient(server) as mcp:
+        out = _payload(await mcp.read_resource("aleph://schemata"))
+    assert MAX_SCHEMA_NAMES == 500
+    assert out["count"] == 507, "count is the instance's own total, not the length served"
+    assert len(out["all"]) == 500
+    assert out["_omitted_schemata"] == {"all": 7, "matchable": 7}
 
 
 async def test_schema_resource_exposes_edge_and_range(
