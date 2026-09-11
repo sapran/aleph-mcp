@@ -2,8 +2,15 @@
 
 `AlephClient` asks this module for a decoded JSON body and gets back a dict or an MCP
 error. Everything between those two points is here: the retry budget charged once across
-sleep and connect time, the separate connect cap, the streaming size ceiling, the
-read-only allowlist hook, and the status-to-MCP-error translation.
+sleep, connect and response time, the separate connect cap, the two streaming size bounds
+— one for a body this server will decode, a much smaller one for a body it will only quote
+from — the redirect ceiling, the read-only allowlist hook, and the status-to-MCP-error
+translation.
+
+One term stays outside the budget on purpose: the time spent reading the body of the
+response the loop finally accepts. It is bounded by size rather than by the clock, because
+abandoning a response already arriving would spend an upstream request and throw its answer
+away.
 
 Nothing in here knows what an Aleph payload looks like. That is the point of the seam: the
 retry budget and the gzip ceiling can be tested against a route answering `{}`, and the
@@ -192,6 +199,8 @@ class Transport:
         query = httpx.QueryParams(params) if params else None
         resp: httpx.Response | None = None
         body = b""
+        spent = 0
+        by_budget = False
         follow = self._http.follow_redirects if follow_redirects is None else follow_redirects
         # One tool call, one budget. Each hop's backoff is clamped, but an upstream that
         # answers every attempt with a Retry-After — or a host that swallows every connect
@@ -221,11 +230,17 @@ class Transport:
                         # answering 503 after ten seconds cost four attempts and 47 seconds
                         # against a 25-second budget.
                         #
-                        # What is charged is the time to the headers. On a retry the body is
-                        # never read -- the stream context exits and discards it -- and on
-                        # the give-up path below the loop breaks immediately after, so there
-                        # is no later charge to miss.
+                        # What is charged is the time to the headers. The body read that may
+                        # follow is bounded by size instead -- see the module docstring.
+                        #
+                        # `started` moves with the charge so that the handler below, which
+                        # charges the same span again from the same mark, cannot double-count
+                        # it. Today every arm reachable after this point raises, so the second
+                        # charge is never read back; resetting keeps that true for an arm
+                        # nobody has written yet, whose symptom would be a call quietly cut
+                        # short by a budget short of one whole round trip.
                         budget -= self._monotonic() - started
+                        started = self._monotonic()
                         # A zero delay still retries; only an exhausted budget stops the loop.
                         give_up = (
                             resp.status_code not in _RETRY_STATUS
@@ -234,6 +249,15 @@ class Transport:
                         )
                         delay = 0.0 if give_up else min(_retry_delay(resp, attempt), budget)
                         if give_up:
+                            # Which of the two ended the loop, recorded for the refusal. The
+                            # status must have been retryable and the count must have had
+                            # attempts left, or the budget is not what stopped anything.
+                            spent = attempt
+                            by_budget = (
+                                resp.status_code in _RETRY_STATUS
+                                and attempt < attempts
+                                and budget <= 0
+                            )
                             body = await self._read_body(resp, context=context, resource=resource)
                             break
                 except (httpx.RequestError, ssl.SSLError) as e:
@@ -292,13 +316,25 @@ class Transport:
                         # and not the possibly-delivered one either: nothing was lost, there
                         # is just no final response. Not retried, because the next attempt
                         # walks the identical chain.
+                        #
+                        # The hop count comes from the client that enforced it, not from the
+                        # constant it was built with. The refusal's whole claim is that an
+                        # operator can read which bound was hit, so it must not be able to
+                        # name a number nothing applied.
                         raise_redirect_loop(
-                            e, context=context, hops=MAX_REDIRECTS, resource=resource
+                            e,
+                            context=context,
+                            hops=self._http.max_redirects,
+                            resource=resource,
                         )
                     if isinstance(e, httpx.DecodingError):
-                        # Raised while the body is iterated, so the response arrived in full.
-                        # Not retried for the same reason: an instance encoding its responses
-                        # wrongly does so on every attempt.
+                        # Raised while a body is iterated, so the status and headers arrived.
+                        # Reached only from a *successful* body's read: `_read_error_body`
+                        # absorbs its own, because for a failing response the status is the
+                        # better answer. A 200 is not a retried status, so nothing here
+                        # decides whether to retry -- and the refusal deliberately does not
+                        # claim to know, since a broken encoder and a body corrupted in
+                        # transit look the same from here.
                         raise_undecodable_body(e, context=context, resource=resource)
                     # Delivery is settled *before* the TLS question, and the order is
                     # load-bearing. A TLS failure mid-body arrives as `ReadError` with an
@@ -334,7 +370,14 @@ class Transport:
         except ReadOnlyViolation as e:
             raise_read_only(e, context=context, resource=resource)
         assert resp is not None
-        raise_for_status(resp, context=context, resource=resource, body=body)
+        raise_for_status(
+            resp,
+            context=context,
+            resource=resource,
+            body=body,
+            attempts=spent,
+            budget_spent=by_budget,
+        )
         data: Any = jsonlib.loads(body)
         if not isinstance(data, dict):
             return {"results": data}
@@ -364,14 +407,31 @@ class Transport:
         already what `_upstream_detail` does with an over-sized body, and a prefix cut mid
         string is not JSON, so parsing one could only ever reach the same answer by a longer
         route. Stopping the iteration also means the rest of the body is never received.
+
+        A read that fails part-way is answered the same way, and that is the point of doing
+        it here rather than letting the exception out. The status is the one fact worth
+        having about a failing response, and it is already in hand; letting a `ReadError` or
+        a `DecodingError` out of this frame would hand the caller a network diagnosis or a
+        Content-Encoding lecture with the `502` nowhere in it -- the same trap this whole
+        change exists to close, one axis over. A body that could not be read is exactly as
+        quotable as one too big to quote, which is the case already answered with `b""`.
+        Nothing is lost: no failure is being swallowed, a more specific one is being
+        preferred. It does not apply to a successful body, where the body *is* the answer --
+        `_read_bounded` still lets its failures out.
+
+        Unlike `_read_bounded` this does not clear its buffers before returning. It returns
+        rather than raises, so no traceback keeps the frame -- and its locals -- alive.
         """
         total = 0
         chunks: list[bytes] = []
-        async for chunk in resp.aiter_bytes():
-            total += len(chunk)
-            if total > MAX_ERROR_BODY_BYTES:
-                return b""
-            chunks.append(chunk)
+        try:
+            async for chunk in resp.aiter_bytes():
+                total += len(chunk)
+                if total > MAX_ERROR_BODY_BYTES:
+                    return b""
+                chunks.append(chunk)
+        except (httpx.RequestError, ssl.SSLError):
+            return b""
         return b"".join(chunks)
 
     async def _read_bounded(self, resp: httpx.Response, *, context: str, resource: bool) -> bytes:

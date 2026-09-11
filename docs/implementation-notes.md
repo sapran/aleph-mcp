@@ -11,9 +11,10 @@ priority order, not an id. Item 1 of that plan — the metadata path — was clo
 classification — by `classify-transport-failures` the same day. Item 1 again — the ontology echo
 — was closed by `bound-ontology-echo` on 2026-09-11, which parked two new claims in passing: one
 under echo.py's enforcement gaps, and one as its own entry. Item 1 once more — the response path —
-was closed by `charge-and-account-response-path` on 2026-09-11, parking one new claim under the
-stale-prose entry. The plan and the sections below are renumbered after each, so twenty-six claims
-across eleven entries remain.
+was closed by `charge-and-account-response-path` on 2026-09-11, parking two new claims in passing:
+one under the stale-prose entry and one as its own entry, both found by review of that change. The
+plan and the sections below are renumbered after each, so twenty-seven claims across twelve entries
+remain.
 
 ## Work plan
 
@@ -27,7 +28,8 @@ across eleven entries remain.
 8. Close the tests that cannot fail — four checks that certify nothing.
 9. Decide the private-sibling references — the publication deadline has already passed.
 10. Guard `model["schemata"]`'s shape — a non-dict raises AttributeError at the caller.
-11. Correct four pieces of stale prose (Tier 0).
+11. Name the dropped error body — a real complaint reads as no complaint at all.
+12. Correct four pieces of stale prose (Tier 0).
 ---
 
 ## 1. The scope resolver mishandles three upstream shapes
@@ -269,7 +271,24 @@ not reach this value. Found while implementing `bound-ontology-echo` on 2026-09-
 pre-existing on `develop`, unrelated to that change's scope, and the fix is a refusal-shape
 decision (reuse `raise_unusable_model`, or degrade) rather than a one-liner.
 
-## 11. Four pieces of stale prose (Tier 0)
+## 11. An oversized error body is dropped without saying so
+
+**`_upstream_detail` discards a JSON error body over 64 KiB and the refusal reads as if none
+arrived.** `errors.py`. For a `400` the quoted `message` is the only actionable content the refusal
+carries, so an instance that answers with a real complaint plus a large trace is reported
+identically to one that sent nothing at all — and the model, told only "bad request", re-guesses
+its arguments. Measured during review of `charge-and-account-response-path`: `empty`, `small` and
+`big` bodies produced `bad request (400).`, the same with the message quoted, and `bad request
+(400).` again.
+
+Pre-existing and unchanged by that change — it read the whole body and then dropped it, the same
+message either way — so it was recorded rather than fixed. Closing it means returning the fact
+alongside the bytes (a `(body, dropped)` pair, or a sentinel distinct from `b""`, since `b""` from
+an oversized body and `b""` from an empty one are the same value today) and appending one clause to
+the refusal naming the drop. Parsing a truncated prefix is not the fix; the reasoning against that
+is written at `Transport._read_error_body`.
+
+## 12. Four pieces of stale prose (Tier 0)
 
 - **`openspec/config.yaml`'s layout paragraph is three modules stale**
   (`openspec/config.yaml:23-26`). It lists `server.py`, `client.py`, `readonly.py`, `config.py` and
@@ -279,11 +298,14 @@ decision (reuse `raise_unusable_model`, or degrade) rather than a one-liner.
   `tests/test_collection_scope.py:339` and `:454` still say "no tool's `except ValueError`
   translates". The claims stay true of the single seam, but send a reader looking for per-tool arms
   that no longer exist.
-- **`transport.py:89` names a `_classify` function that does not exist.** The comment above
-  `_CONNECT_ERRORS` calls it "one bucket of the classification in `_classify`"; the classification
-  is an inline dispatch in `Transport.request` and there is no such function, so a reader greps for
-  it and finds nothing. Found while widening that dispatch to `httpx.RequestError`, and left alone
-  because the seam's own comments were in scope and this one is not about the seam.
+- **`transport.py:89` names a `_classify` function that does not exist, and counts the wrong
+  family.** The comment above `_CONNECT_ERRORS` calls it "one bucket of the classification in
+  `_classify`"; the classification is an inline dispatch in `Transport.request` and there is no
+  such function, so a reader greps for it and finds nothing. The same sentence then says "the other
+  thirteen `httpx.TransportError` subclasses", which described the seam before
+  `charge-and-account-response-path` widened it to `httpx.RequestError` — eighteen subclasses, of
+  which two are dispatched by name. Found while widening that dispatch, and left alone because the
+  seam's own comments were in scope and this one is not about the seam.
 
 - **`pyproject.toml` sets `line-length = 100` while `[tool.ruff.lint]` ignores `E501`**
   (`pyproject.toml:64`, `:69`), so line length is enforced only by `ruff format`, never by

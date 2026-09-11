@@ -65,3 +65,44 @@
 - [x] 5.5 Close work-plan item 1 in `docs/implementation-notes.md`, renumber the plan, the section
       headings and every in-prose cross-reference.
 - [x] 5.6 Delete `tests/test_zz_repro.py`.
+
+## 6. Review round
+
+Three reviewers on the PR diff. Findings fixed rather than parked, because each was about the
+behaviour this change introduces.
+
+- [x] 6.1 A refusal the budget ended now says so, names the attempts made and names
+      `ALEPH_MCP_TIMEOUT_SECS`. Charging the response path made the budget able to end the loop,
+      and measured, a `503` answered 30s into a 25s budget made one attempt and produced a message
+      byte-identical to the four-attempt case.
+- [x] 6.2 The `429` refusal stops asserting "retries are exhausted" when the clock rather than the
+      count ended it — measured at three of four attempts, followed by advice to narrow a query
+      that was never the problem.
+- [x] 6.3 `_read_error_body` absorbs its own read failures, so a failing status outlives a body
+      that cannot be decoded or read. Measured before: a `502` with a bad `Content-Encoding`
+      answered with a Content-Encoding diagnosis and a `502` whose read died answered with a
+      network diagnosis, the status in neither — the same trap this change exists to close.
+- [x] 6.4 `raise_undecodable_body` stops excluding the network path and stops calling the fault
+      deterministic. httpx's decoder raises on any chunk, so a mid-stream corruption and a broken
+      encoder arrive identically; both claims were wrong for the first.
+- [x] 6.5 The redirect refusal reports the hop count the client enforced, not the constant it was
+      built with.
+- [x] 6.6 `MAX_REDIRECTS` is pinned from both sides — a chain of exactly the bound succeeds, one
+      hop more is refused, and the loop test's expected request count is a literal. Review
+      measured the gap: with the expectation computed from the constant, `MAX_REDIRECTS` could be
+      put back to httpx's 20 and the suite stayed green.
+- [x] 6.7 Drop the assertion that a bad `Content-Encoding` "is not retried" — a `200` is not a
+      retried status, so it held for a reason unrelated to the claim.
+- [x] 6.8 Correct the module docstring (the budget is charged across sleep, connect *and* response
+      time; two streaming bounds, not one), `raise_transport_failed`'s docstring (the fall-through
+      family widened), and the enumeration test's "two of the fifteen".
+- [x] 6.9 Name the `httpx.StreamError` exclusion in the walk's docstring: those are raised when
+      this code uses a stream wrongly, not when an upstream misbehaves.
+- [x] 6.10 Reset `started` after the response charge, so the handler below cannot double-count a
+      round trip if a future arm falls through instead of raising.
+- [x] 6.11 Add the two spec sentences the fixes make true, in the published spec and in this
+      delta: what a budget-ended refusal must say, and that a failing status outlives an unreadable
+      body.
+- [x] 6.12 Re-prove: 19 mutations, every one caught, green control between each. 518 tests pass.
+- [x] 6.13 Park what review found that this change did not introduce: the oversized error body
+      dropped without saying so (its own entry) and the second way `transport.py:89` is stale.

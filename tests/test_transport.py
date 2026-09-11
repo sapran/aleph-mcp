@@ -204,7 +204,14 @@ def _request_error_subclasses() -> list[type[httpx.RequestError]]:
     Walked from `RequestError` rather than `TransportError` since this change: the three
     members that differ -- `TransportError` itself, `DecodingError` and `TooManyRedirects`
     -- are exactly the ones the narrower walk certified while two of them still reached the
-    caller as themselves.
+    caller as themselves. A walk rooted at the class the `except` clause names can only
+    certify that clause against itself, which is how those two stayed invisible.
+
+    `httpx.StreamError` and its subclasses are outside both the clause and this walk, and
+    that is deliberate rather than an oversight the next bump will catch: `StreamConsumed`,
+    `ResponseNotRead` and their siblings are raised when *this* code uses a stream wrongly,
+    not when an upstream misbehaves. Refusing them as upstream failures would label a bug
+    here as a fault there.
     """
     found: list[type[httpx.RequestError]] = []
     queue = list(httpx.RequestError.__subclasses__())
@@ -223,7 +230,7 @@ async def test_every_request_error_is_refused_through_this_servers_error_path(
     no_sleep: None,
     error_cls: type[httpx.RequestError],
 ) -> None:
-    """The partition, verified. Before this, two of the fifteen were handled and the rest
+    """The partition, verified. Before this, two of the eighteen were handled and the rest
     left this process as themselves: measured through the shipped MCP path, an
     `httpx.ProxyError` reached the model as 4102 characters of proxy-authored text with the
     ESC bytes intact.
@@ -238,7 +245,7 @@ async def test_every_request_error_is_refused_through_this_servers_error_path(
     message = str(excinfo.value)
     assert message.startswith("probe:"), f"the refusal must name the call site: {message}"
     assert "untrusted transport text" in message, "foreign text must be labelled"
-    assert not isinstance(excinfo.value, httpx.TransportError)
+    assert not isinstance(excinfo.value, httpx.RequestError)
 
 
 async def test_an_attacker_authored_proxy_phrase_is_capped_and_stripped(
@@ -865,6 +872,70 @@ async def test_a_slow_failing_response_is_charged_to_the_retry_budget(
     )
 
 
+@pytest.mark.parametrize("status", [503, 429], ids=["503", "429"])
+async def test_a_refusal_says_when_the_clock_rather_than_the_count_ended_it(
+    settings: Settings, respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """Charging the response path made the budget able to end the retry loop, and a refusal
+    that does not say so is indistinguishable from one that spent every attempt.
+
+    Review measured both halves of the harm. A route answering 503 thirty seconds into a
+    25-second budget made **one** attempt and produced a message byte-identical to the
+    four-attempt case -- so an instance that is merely slow silently gets fewer requests than
+    ALEPH_MCP_MAX_RETRIES promises, and the setting that actually governs it is never named.
+    The 429 is worse than silent: it asserted "retries are exhausted" having made three of
+    four attempts, and then advised the model to slow down and widen its query -- a
+    confident wrong diagnosis of a problem that was never about queries.
+
+    The connect half has always named its cost ("could not reach Aleph after N attempts"),
+    for the reason written into `raise_unreachable`'s own docstring. This is that reason
+    applied to the half that just acquired the same power.
+    """
+    now = 0.0
+
+    async def _sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    def _slow(request: httpx.Request) -> httpx.Response:
+        nonlocal now
+        now += 10.0
+        return httpx.Response(status)
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+    monkeypatch.setattr(settings, "timeout_secs", 25.0)
+    transport = Transport(settings, monotonic=lambda: now)
+    route = respx_mock.get(PROBE).mock(side_effect=_slow)
+    try:
+        with pytest.raises(ToolError) as excinfo:
+            await transport.request("GET", PROBE, context="probe")
+    finally:
+        await transport.aclose()
+    message = str(excinfo.value)
+    assert route.call_count < settings.max_retries, "the budget, not the count, ended this"
+    assert f"after {route.call_count} attempt" in message, message
+    assert "wall-clock budget rather than by its retry count" in message, message
+    assert "ALEPH_MCP_TIMEOUT_SECS" in message, "name the setting that governs it"
+    assert "retries are exhausted" not in message, (
+        "they were not: the count still had attempts left"
+    )
+
+
+async def test_a_refusal_that_did_spend_its_retries_still_says_so(
+    transport: Transport, respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    """The other side of the clause. Withholding it whenever the wording got awkward would
+    be the same defect mirrored -- and the 429 branch's "retries are exhausted" is true, and
+    load-bearing, in exactly this case."""
+    route = respx_mock.get(PROBE).mock(return_value=httpx.Response(429))
+    with pytest.raises(ToolError) as excinfo:
+        await transport.request("GET", PROBE, context="probe")
+    message = str(excinfo.value)
+    assert route.call_count == transport._settings.max_retries
+    assert "retries are exhausted" in message, message
+    assert "wall-clock budget" not in message, "the count ran out, not the clock"
+
+
 async def test_a_failing_status_over_the_ceiling_is_reported_as_the_status(
     transport: Transport, respx_mock: respx.MockRouter, no_sleep: None
 ) -> None:
@@ -960,7 +1031,7 @@ async def test_a_body_that_contradicts_its_content_encoding_is_refused_with_cont
         async def __aiter__(self) -> AsyncIterator[bytes]:
             yield b"not gzip at all"
 
-    route = respx_mock.get(PROBE).mock(
+    respx_mock.get(PROBE).mock(
         return_value=httpx.Response(200, headers={"content-encoding": "gzip"}, stream=_Raw())
     )
     with pytest.raises(ToolError) as excinfo:
@@ -969,12 +1040,75 @@ async def test_a_body_that_contradicts_its_content_encoding_is_refused_with_cont
     assert message.startswith("probe:"), f"the refusal must name the call site: {message}"
     assert "untrusted transport text" in message, "foreign text must be labelled"
     assert "could not be decoded" in message
-    assert not isinstance(excinfo.value, httpx.DecodingError)
-    assert route.call_count == 1, "a body the instance encodes wrongly is not retried"
+    # The refusal must not pick a side it cannot see. httpx's decoder raises on any chunk,
+    # not only the first, so an instance with a broken encoder and a body corrupted in
+    # transit arrive here identically -- an earlier draft excluded the network path and
+    # called the fault deterministic, and review measured a mid-stream corruption that made
+    # both claims false.
+    assert "cannot tell" in message, message
+    assert "network path" not in message.split("cannot tell")[0], (
+        "the fault must not be located on a side this seam cannot see"
+    )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["encoding", "read", "gzip-bomb"],
+    ids=["undecodable", "read-fails", "gzip-bomb"],
+)
+async def test_a_failing_status_survives_a_body_that_cannot_be_read(
+    transport: Transport, respx_mock: respx.MockRouter, no_sleep: None, fault: str
+) -> None:
+    """The status is the one fact worth having about a failing response, and this change
+    exists because reading its body was allowed to destroy it.
+
+    The size axis was the reported symptom, but it is not the only one: a 502 whose body
+    contradicts its Content-Encoding, or whose read dies part-way, or which arrives as a
+    compressed bomb, must still be reported as a 502. Review measured the first two
+    answering with a Content-Encoding lecture and a network diagnosis respectively, the 502
+    nowhere in either -- the same trap one axis over.
+
+    `_read_error_body` therefore absorbs its own read failures. That is a preference, not a
+    swallow: the more specific fact is already in hand, and a body that could not be read is
+    exactly as quotable as one too big to quote.
+    """
+
+    class _RaisesMidRead(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b'{"message": "par'
+            raise httpx.ReadError("connection reset")
+
+    class _NotGzip(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b"not gzip at all"
+
+    if fault == "read":
+        response = httpx.Response(502, stream=_RaisesMidRead())
+    elif fault == "encoding":
+        response = httpx.Response(502, headers={"content-encoding": "gzip"}, stream=_NotGzip())
+    else:
+        bomb = gzip.compress(b'{"padding": "' + b"z" * (MAX_RESPONSE_BYTES + 1) + b'"}')
+        response = httpx.Response(
+            502, content=bomb, headers={"content-encoding": "gzip", "content-type": "text/plain"}
+        )
+    respx_mock.get(PROBE).mock(return_value=response)
+    with pytest.raises(ToolError) as excinfo:
+        await transport.request("GET", PROBE, context="probe")
+    message = str(excinfo.value)
+    assert "unexpected HTTP 502" in message, message
+    assert not isinstance(excinfo.value, ResponseTooLarge)
 
 
 def _loops_to(path: str) -> httpx.Response:
     return httpx.Response(302, headers={"Location": f"https://aleph.test{path}"})
+
+
+# The hop ceiling, written out rather than imported. `MAX_REDIRECTS + 1` was the first
+# spelling and review measured what it certified: with the expectation computed from the
+# constant under test, `MAX_REDIRECTS` could be put back to httpx's own default of 20 --
+# undoing the whole point of the bound -- and the suite stayed green. A literal on this side
+# is the only thing that can disagree with the source.
+EXPECTED_REDIRECT_REQUESTS = 6
 
 
 async def test_a_redirect_loop_is_bounded_by_this_server_and_refused(
@@ -995,23 +1129,55 @@ async def test_a_redirect_loop_is_bounded_by_this_server_and_refused(
     assert message.startswith("probe:"), f"the refusal must name the call site: {message}"
     assert "did not end" in message
     assert "will not help" in message, "a loop is served the same way on every attempt"
-    assert not isinstance(excinfo.value, httpx.TooManyRedirects)
-    assert route.call_count == MAX_REDIRECTS + 1, (
+    # The bound the refusal names has to be the bound that was applied. Read from the client
+    # rather than from the constant, a refusal cannot advertise a number nothing enforced.
+    assert f"within {MAX_REDIRECTS} hops" in message, message
+    assert route.call_count == EXPECTED_REDIRECT_REQUESTS, (
         f"the hop ceiling is this server's: {route.call_count} requests for one call"
     )
 
 
-async def test_a_redirect_chain_within_the_bound_is_still_followed(
+async def test_a_chain_of_exactly_the_bound_is_still_followed(
     transport: Transport, respx_mock: respx.MockRouter
 ) -> None:
-    """Bounding the chain must not stop following one. Aleph's own canonical-host redirect
+    """The bound pinned from the other side. Paired with the loop test above, a chain of
+    exactly `MAX_REDIRECTS` hops succeeding and one hop more being refused is what fixes the
+    constant: either test alone leaves every value from 2 to 200 passing, which review
+    measured before this pair existed.
+
+    Bounding the chain must also not stop following one. Aleph's own canonical-host redirect
     is a single hop, and a reverse proxy in front of it may add another, so a bound that
-    refused a short chain would break a working deployment rather than a broken one."""
-    respx_mock.get(PROBE).mock(return_value=_loops_to("/api/2/collections/42"))
-    respx_mock.get("/api/2/collections/42").mock(
+    refused a short chain would break a working deployment rather than a broken one.
+    """
+    for hop in range(MAX_REDIRECTS):
+        respx_mock.get(f"/api/2/collections/{hop}").mock(
+            return_value=_loops_to(f"/api/2/collections/{hop + 1}")
+        )
+    respx_mock.get(f"/api/2/collections/{MAX_REDIRECTS}").mock(
         return_value=httpx.Response(200, json={"followed": True})
     )
-    assert await transport.request("GET", PROBE, context="probe") == {"followed": True}
+    out = await transport.request("GET", "/api/2/collections/0", context="probe")
+    assert out == {"followed": True}
+
+
+async def test_a_redirect_chain_costs_its_hops_on_every_retry(
+    transport: Transport, respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    """The two bounds multiply, and the product is the real cost of a redirecting instance
+    that is also failing. Recorded as a number rather than left to be discovered: at the
+    httpx default this call would have cost 84 upstream requests.
+
+    Not a separate mechanism -- it is the hop ceiling and the retry count meeting -- but it
+    is the figure an operator sees in an access log, and nothing else asserts it.
+    """
+    hop = respx_mock.get(PROBE).mock(return_value=_loops_to("/api/2/collections/42"))
+    final = respx_mock.get("/api/2/collections/42").mock(return_value=httpx.Response(503))
+    with pytest.raises(ToolError, match="unexpected HTTP 503"):
+        await transport.request("GET", PROBE, context="probe")
+    assert final.call_count == 4, "one retry budget of final answers"
+    assert hop.call_count + final.call_count == 8, (
+        "four attempts, each paying its one redirect hop and the answer after it"
+    )
 
 
 async def test_every_redirect_hop_is_still_matched_against_the_allowlist(

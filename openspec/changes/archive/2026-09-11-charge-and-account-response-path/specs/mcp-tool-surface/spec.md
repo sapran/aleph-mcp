@@ -35,11 +35,26 @@ proxy is a supported deployment shape, so that text is authored by anything on t
   bytes
 - **AND** the message labels that text untrusted
 
+A failure raised while the body of a *non-2xx* response is being read SHALL NOT replace that
+status in the refusal. The status is the one fact worth having about a failing response and it is
+already in hand; a decoding fault or a broken read is a fact about a body nothing will quote.
+Measured against an earlier draft of this requirement: a `502` whose body contradicted its
+`Content-Encoding` was refused with a Content-Encoding diagnosis, and one whose read failed
+part-way with a network diagnosis, the `502` appearing in neither. A failure reading a *successful*
+body is not covered by this: there the body is the answer.
+
 #### Scenario: An unrecognised transport failure is still refused
 
 - **WHEN** any `httpx.RequestError` subclass is raised for a request
 - **THEN** the caller receives a tool or resource error naming the call context, never the
   request exception itself
+
+#### Scenario: A failing status outlives a body that cannot be read
+
+- **WHEN** a non-2xx response carries a body that cannot be decoded, cannot be read to the end, or
+  expands past what this server will hold
+- **THEN** the call is refused with that status
+- **AND** the refusal does not report the body failure in its place
 
 #### Scenario: A body that contradicts its own Content-Encoding is refused with context
 
@@ -117,7 +132,31 @@ request, with a 25-second timeout: four attempts and **47 seconds** of wall cloc
 the 7 seconds of backoff were charged. The connect half was charged and the response half was not.
 
 A single call MAY overrun the budget by at most the one request already in flight when the budget
-ran out, since this server does not abandon a response it is already receiving.
+ran out, plus the time to read that response's body, since this server does not abandon a response
+it is already receiving. The body is bounded by size rather than by the clock, which is a
+deliberate limit of this requirement rather than an omission from it: abandoning a response part
+way spends an upstream request and throws its answer away.
+
+A refusal that the budget ended SHALL say so, name the number of attempts actually made, and name
+the setting that governs the budget. It SHALL NOT claim the retry count was exhausted when it was
+not. Which of the two ended the loop decides what an operator should change, and the two are
+otherwise indistinguishable: measured, a route answering `503` thirty seconds into a 25-second
+budget made one attempt and produced a message byte-identical to the four-attempt case, while the
+rate-limit refusal asserted "retries are exhausted" after three of four attempts and advised
+narrowing a query that was never the problem.
+
+#### Scenario: A budget-ended refusal names the budget, not exhausted retries
+
+- **WHEN** a retryable status is answered slowly enough that the wall-clock budget ends the loop
+  with attempts still allowed
+- **THEN** the refusal states that the budget rather than the retry count ended it
+- **AND** it names the number of attempts made and the setting that governs the budget
+- **AND** it does not claim that retries were exhausted
+
+#### Scenario: A refusal that did exhaust its retries still says so
+
+- **WHEN** every allowed attempt is made and the budget is not what ran out
+- **THEN** the refusal states that retries were exhausted and does not mention the budget
 
 #### Scenario: A slow failing response is charged, not free
 
