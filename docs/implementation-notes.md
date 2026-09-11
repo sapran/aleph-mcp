@@ -12,14 +12,16 @@ classification — by `classify-transport-failures` the same day. Item 1 again �
 — was closed by `bound-ontology-echo` on 2026-09-11, which parked two new claims in passing: one
 under echo.py's enforcement gaps, and one as its own entry. Item 1 once more — the response path —
 was closed by `charge-and-account-response-path` on 2026-09-11, parking two new claims in passing:
-one under the stale-prose entry and one as its own entry, both found by review of that change. The
-plan and the sections below are renumbered after each, so twenty-seven claims across twelve entries
-remain.
+one under the stale-prose entry and one as its own entry, both found by review of that change. Item
+1 again — the scope resolver's upstream shapes — was closed by `guard-scope-resolver-shapes` on
+2026-09-11, parking four new claims in passing as one new entry — the conclusions the scope path
+still draws without earning them — all found by review of that change. The plan and the sections
+below are renumbered after each, so twenty-eight claims across twelve entries remain.
 
 ## Work plan
 
-1. Guard the scope resolver's upstream shapes — untranslated errors, confident wrong diagnosis.
-2. Give refusals a type — a dead upstream is reported as a bad argument.
+1. Give refusals a type — a dead upstream is reported as a bad argument.
+2. Finish the scope path's row shape — a confirmed row with a bad `id` blames the caller.
 3. Make the licence gate able to fail — it passes with the project's own LICENSE deleted.
 4. Answer the entity-shaped spec question — four copy-through slots, one decision, five xfails.
 5. Extend the tool path's guarantees to resources — a `resource()` factory and a wider walk.
@@ -32,31 +34,7 @@ remain.
 12. Correct four pieces of stale prose (Tier 0).
 ---
 
-## 1. The scope resolver mishandles three upstream shapes
-
-All three in `scope.py`, adjacent lines, one change.
-
-**A non-list `results` from the collection listing escapes the `except ValueError` seam.**
-`scope.py:312`. The `isinstance(results[0], dict)` guard covers a body that arrives as a list or a
-scalar, because `Transport.request` wraps a non-dict body as `{"results": <body>}` — but an Aleph
-*dict* body whose own `results` key is not a list reaches `results[0]` on a truthy non-list.
-Measured on both `develop` and the T5 branch, byte-identical: `{"results": {"a": 1}}` raises
-`KeyError`, `{"results": 5}` and `{"results": true}` raise `TypeError`. `server.py` translates
-`ValueError` only, so these reach the model untranslated rather than as a legible refusal.
-
-**"no collection with foreign_id X" absorbs an upstream malfunction.** `scope.py:321-325`. Any
-lookup payload without a usable `results[0]` — including `{"status": "error"}` with no `results` key
-at all, and `{"results": [null]}` — is reported to the model as an authorisation-or-existence
-problem naming `list_collections`. A proxy, an SSO interstitial or an unfamiliar Aleph version
-therefore produces a confident wrong diagnosis and a dead-end next step. Fail-closed, so no wrong
-rows are returned.
-
-**A single-element `["*"]` is refused with the wrong reason.** `scope.py:150` fires the mixed-scope
-message — "cannot be combined with named collections" — for a list that names no other collection.
-The scalar `"*"` is accepted at `scope.py:141`. Unchanged from `develop`, untested anywhere.
-Correcting it changes a refusal message.
-
-## 2. Bare `ValueError` is the wrong refusal channel, in both directions
+## 1. Bare `ValueError` is the wrong refusal channel, in both directions
 
 Both halves close with one type: a dedicated `Refusal(ValueError)` raised at the client's own
 refusal sites and caught in place of bare `ValueError` — the pattern `errors.py` already sets for
@@ -74,6 +52,49 @@ and retry, against an upstream that is down. Run-verified identical on `main @ 1
 replaced wrapped only the `await client.X(...)` call. Equivalent today — every body is one
 forwarding call — but a future in-body `int()`, `datetime.fromisoformat()` or nested `json.loads`
 would be relabelled as a client refusal with nothing to catch it.
+
+## 2. The scope path draws four conclusions it has not earned
+
+All four surfaced by review of `guard-scope-resolver-shapes`, which guarded the listing's
+*envelope* and left the row inside it, and the reporting around it, where they were. Recorded
+rather than fixed because that change's spec enumerates the shapes it covers — "no `results` key
+at all, a `results` value that is not a list, a first row that is not a record" — and none of
+these is one of them. All four fail closed; none returns wrong rows.
+
+**A row that matches the foreign_id but carries an unusable `id` blames the caller.**
+`scope.py:394` hands `hit.get("id")` straight to `check_collection_id`, whose message is written
+for caller input. Measured end-to-end through the client on this branch, for `id` null, missing,
+`"abc"` and `{"a": 1}`:
+
+    invalid collection: expected a numeric collection id (got 'None'). A foreign_id is
+    accepted directly and resolved for you; this error means the value is neither.
+
+The caller passed a valid foreign_id that the upstream confirmed one line earlier, and is told
+their value is "neither". That is the same confident wrong diagnosis `guard-scope-resolver-shapes`
+removed from the envelope, one branch further down — and a renamed or slimmed `id` field is a more
+likely upstream malfunction than `{"results": 5}`. Both reviewers of that PR raised it
+independently; one rated it critical. The fix is to check the row's `id` before the caller-facing
+validator and route a bad one to `_unusable_listing`.
+
+**A row with no `foreign_id` key at all is read as a different collection.** `scope.py:393`
+tests `hit.get("foreign_id") != text`, so an absent field and a genuinely different value take the
+same branch and produce the same "no collection with foreign_id X" refusal. Only the second has
+any reading as a miss; the first is a row that is not a collection record.
+
+**A bare JSON array of records resolves and caches, with no listing envelope.** The transport
+wraps a non-dict body as `{"results": <body>}` (`transport.py:383`), so a 200 whose body is
+`[{"foreign_id": "my-case", "id": "874"}]` resolves to 874 and caches it for the process
+lifetime. Measured. Unchanged from `develop` and arguably what the wrapper is for, but it means
+the resolver cannot tell an Aleph listing from any array that happens to carry the right keys.
+Requiring a real envelope — `total` or `page` — before trusting the rows would close it.
+
+**`match_entity` never announces an all-collections scope.** `client.py` writes `searched` only
+inside `search_entities`, so `match_entity(collection="*")` sends no constraint, returns every
+readable collection's rows, and says so nowhere — no `searched`, no EVERY COLLECTION note.
+Measured: the reply carries only `limit`, `offset`, `results`, `total`. Pre-existing for the
+scalar and spec'd that way, but it is the failure `scope.py`'s own module docstring says the
+module exists to prevent, and `guard-scope-resolver-shapes` added a second spelling that reaches
+it.
 
 ## 3. The licence gate cannot fail
 
@@ -214,7 +235,7 @@ One purely-test change closes all four.
   `test_every_entity_returning_method_shapes_its_reply` covers the same path with a discriminating
   model. Delete or strengthen.
 - **The `MAX_SCOPE_COLLECTIONS` boundary is unpinned.** Only `MAX + 1` is tested
-  (`tests/test_scope.py:91`); changing `>` to `>=` at `scope.py:161` — which would refuse a
+  (`tests/test_scope.py:91`); changing `>` to `>=` at `scope.py:210` — which would refuse a
   legitimate ten-collection scope — passes the whole suite. Related and also unpinned: the dedup runs
   *before* the bound, so eleven spellings collapsing to ten are accepted. One row in the existing
   parametrised table.
@@ -294,10 +315,12 @@ is written at `Transport._read_error_body`.
   (`openspec/config.yaml:23-26`). It lists `server.py`, `client.py`, `readonly.py`, `config.py` and
   `errors.py` and names none of `echo.py` (T2), `scope.py` (T5) or `transport.py` (T4). No spec
   assertion depends on it.
-- **Comment drift naming the structure T3 deleted.** `scope.py:320`,
-  `tests/test_collection_scope.py:339` and `:454` still say "no tool's `except ValueError`
+- **Comment drift naming the structure T3 deleted.** `scope.py:375`,
+  `tests/test_collection_scope.py:364` and `:486` still say "no tool's `except ValueError`
   translates". The claims stay true of the single seam, but send a reader looking for per-tool arms
-  that no longer exist.
+  that no longer exist. Line references refreshed after `guard-scope-resolver-shapes` moved them;
+  the `scope.py` instance is the same sentence, rewritten in place by that change and still using
+  the plural.
 - **`transport.py:89` names a `_classify` function that does not exist, and counts the wrong
   family.** The comment above `_CONNECT_ERRORS` calls it "one bucket of the classification in
   `_classify`"; the classification is an inline dispatch in `Transport.request` and there is no

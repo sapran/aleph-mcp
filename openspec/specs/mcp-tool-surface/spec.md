@@ -264,6 +264,8 @@ The requirement is stated as a required argument rather than as a validated defa
 
 A value that names no collection SHALL be refused locally, before any request: the empty or blank string, the empty list, and `"*"` combined with named collections. A blank value is singled out because Aleph does not read it as naming nothing — it sanitises the filter away and answers `match_all`, so the listing returns whichever collection the key can read first. That is the same silent misdirection as an omitted scope, reached through a value that looks like an answer.
 
+The all-collections literal SHALL mean the same thing in either spelling: a list whose every element is `"*"` names every readable collection, exactly as the scalar `"*"` does, and SHALL NOT be refused. Only a list that pairs `"*"` with at least one *named collection* is ambiguous about what the caller wants, and only that list is refused. A single-element list is what a caller building the argument programmatically produces, and refusing it with the mixed-scope message — "cannot be combined with named collections" — describes a mistake the caller did not make and costs a turn to recover from. A list that merely repeats the literal names no other collection either, so it is read the same way — the same reading the deduplication of repeated named collections already applies one step later.
+
 #### Scenario: An omitted scope is refused
 
 - **WHEN** `search_entities` is called without `collection`
@@ -283,11 +285,19 @@ A value that names no collection SHALL be refused locally, before any request: t
 - **AND** the response reports `"*"` under `searched.collection`
 - **AND** the `_note` states that the result spans every readable collection
 
+#### Scenario: The all-collections literal is accepted in either spelling
+
+- **WHEN** `search_entities` is called with `collection` set to the single-element list `["*"]`, or to a list whose every element is `"*"`
+- **THEN** the call is treated exactly as the scalar `"*"`: no collection filter is applied and no lookup is made
+- **AND** the response reports `"*"` under `searched.collection`, not a single-element list
+- **AND** the same list passed to `match_entity` likewise sends no collection constraint and costs no lookup — `match_entity` reports no `searched` key in either spelling, which is its existing behaviour for the scalar and is unchanged here
+
 #### Scenario: A scope naming nothing is refused without a request
 
 - **WHEN** `search_entities` is called with `collection` set to an empty or blank string, to an empty list, or to a list containing `"*"` alongside named collections
 - **THEN** the call raises a tool error naming what to pass instead
 - **AND** no request is sent to Aleph
+- **AND** the refusal for a list mixing `"*"` with named collections names both alternatives, and is not reached by a list whose every element is `"*"`
 
 #### Scenario: A match against every collection is asked for by name
 
@@ -305,17 +315,34 @@ Accepting both id forms is part of the same requirement: a caller commonly holds
 
 The three tools that address exactly one collection SHALL refuse `"*"` rather than looking it up as a foreign_id, because the same argument on the search tools uses that literal for every collection.
 
+Resolving a `foreign_id` reads a listing this server did not produce, so the listing's shape SHALL be checked before it is indexed, and SHALL NOT be assumed from the fact that a `results` key is present. A listing that cannot be read as a list of records SHALL raise a legible refusal rather than an untranslated `KeyError` or `TypeError`: the tool seam translates one error type, and anything else reaches the model as a server fault carrying no usable next step.
+
+A listing that cannot be read SHALL be distinguished from a listing that was read and held no match, because the two call for opposite responses. One shape means "no such collection": a `results` list that is present, is a list, and is empty — what Aleph answers for a `foreign_id` nobody owns, and equally what a bare empty JSON array arrives as once the transport has wrapped it, since an empty array is an empty result set whoever serialised it. Only that shape SHALL be reported as an authorisation-or-existence problem naming `list_collections`. Every other unusable shape — no `results` key at all, a `results` value that is not a list, a first row that is not a record — SHALL be reported as an upstream malfunction, naming the shape received and not directing the caller to `list_collections`. Reporting a malfunctioning upstream as a missing collection is a confident wrong diagnosis: it sends the caller to check its own permissions when nothing about the call can change the outcome. Both paths SHALL fail closed — no collection is resolved and nothing is cached.
+
 #### Scenario: A foreign_id is accepted wherever a numeric id is
 
 - **WHEN** any collection-taking tool is called with a `foreign_id` instead of a numeric id
 - **THEN** the foreign_id is resolved to its numeric id and the call proceeds
-- **AND** a foreign_id that resolves to nothing raises an error naming `list_collections`
+- **AND** a foreign_id that resolves to nothing — an empty `results` list — raises an error naming `list_collections`
 
 #### Scenario: A resolution is verified against what was asked for
 
 - **WHEN** the collection listing answers a `foreign_id` lookup with a record whose own `foreign_id` is not the one requested
 - **THEN** the call raises an error naming `list_collections` rather than searching the returned collection
 - **AND** the rejected resolution is not cached
+
+#### Scenario: An unreadable listing is refused rather than crashing
+
+- **WHEN** a `foreign_id` lookup is answered with a body whose `results` key is not a list — a mapping, a number, a boolean, or a non-JSON-object body the transport wrapped under that key
+- **THEN** the call raises the refusal every tool translates, not an `IndexError`, `KeyError` or `TypeError` reaching the caller as a server fault
+- **AND** no collection is resolved and nothing is cached
+
+#### Scenario: A malfunctioning upstream is not reported as a missing collection
+
+- **WHEN** a `foreign_id` lookup is answered with a body carrying no `results` key, a non-list `results`, or a first row that is not a record
+- **THEN** the refusal names the upstream malfunction and the shape received
+- **AND** the refusal does not claim the collection is unreadable with this API key and does not direct the caller to `list_collections`
+- **AND** a lookup answered with an empty `results` list still raises the authorisation-or-existence refusal naming `list_collections`
 
 #### Scenario: A single-collection tool takes exactly one collection
 

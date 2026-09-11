@@ -123,6 +123,59 @@ async def test_the_all_collections_literal_drops_the_filter_and_annotates_the_re
     assert "EVERY COLLECTION:" in note, f"an unscoped search must say so in `_note`: {note!r}"
 
 
+async def test_the_all_collections_literal_reads_the_same_as_a_single_element_list(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """`["*"]` is the same scope as `"*"`, end to end.
+
+    The module-level test pins that `parse_scope` returns the all-collections scope for
+    it; this pins what the caller actually sees — no filter on the wire, no foreign_id
+    lookup spent on the literal, and `"*"` reported back rather than a single-element
+    list. Before this it was refused with "cannot be combined with named collections",
+    naming a mistake the caller did not make.
+    """
+    route = respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json=raw_search_payload(raw_entity(), total=1))
+    )
+    lookup = respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    out = await client.search_entities(collection=[ALL_COLLECTIONS], q="acme")
+    assert _scopes(route.calls.last.request) == [], "'*' must not be sent as a filter value"
+    assert out["searched"]["collection"] == ALL_COLLECTIONS
+    assert lookup.call_count == 0, "the literal must never be looked up as a foreign_id"
+    note = out.get("_note") or ""
+    assert "EVERY COLLECTION:" in note, f"an unscoped search must say so in `_note`: {note!r}"
+
+
+async def test_match_entity_reads_the_literal_the_same_way_in_either_spelling(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """`match_entity` takes the same scope argument, so `["*"]` must widen it there too.
+
+    Asserted separately from `search_entities` rather than folded into it, because the two
+    tools report the scope differently: `match_entity` writes no `searched` key at all, in
+    either spelling. Pinning that here is what keeps the spec scenario honest — an earlier
+    draft of it claimed `match_entity` reports `"*"` under `searched.collection`, which it
+    has never done.
+    """
+    route = respx_mock.post("/api/2/match").mock(
+        return_value=httpx.Response(200, json={"total": 0, "results": []})
+    )
+    lookup = respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    sample = {"schema": "Company", "properties": {"name": ["acme"]}}
+    out = await client.match_entity(sample=sample, collection=[ALL_COLLECTIONS])
+    assert lookup.call_count == 0, "the literal must never be looked up as a foreign_id"
+    assert b"collection_ids" not in route.calls.last.request.url.query, (
+        "'*' must send no collection constraint to /api/2/match"
+    )
+    assert "searched" not in out, (
+        "match_entity reports no scope key; a test asserting one would pin a fiction"
+    )
+
+
 async def test_the_every_collection_note_composes_with_the_unenumerated_note(
     client: AlephClient, respx_mock: respx.MockRouter
 ) -> None:
@@ -337,10 +390,54 @@ async def test_a_non_dict_listing_row_is_a_tool_error_not_an_attribute_error(
     """`Transport.request` wraps a non-dict JSON body as `{"results": <body>}`, so a bare array
     upstream makes `results[0]` a string. `.get` on it would raise AttributeError, which
     no tool's `except ValueError` translates — the caller would see an unhandled exception
-    instead of a legible refusal."""
+    instead of a legible refusal.
+
+    The refusal it gets is the upstream-malfunction one, not "no collection with that
+    foreign_id": a bare array where a listing belongs says nothing about whether the
+    collection exists or the key may read it, and this test asserted that wrong diagnosis
+    until `guard-scope-resolver-shapes` separated the two.
+    """
+    entities = respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json=raw_search_payload(raw_entity(), total=1))
+    )
     respx_mock.get("/api/2/collections").mock(return_value=httpx.Response(200, json=["x"]))
-    with pytest.raises(ValueError, match="list_collections"):
+    with pytest.raises(ValueError, match="upstream malfunction") as excinfo:
         await client.search_entities(collection="my-case", q="acme")
+    assert "list_collections" not in str(excinfo.value), str(excinfo.value)
+    assert entities.call_count == 0, "a scope that could not be resolved must not be searched"
+    assert client._scope.cached == {}, "an unreadable listing must cache nothing"
+
+
+@pytest.mark.parametrize(
+    ("label", "body", "clause"),
+    [
+        ("no-results-key", {"status": "error"}, "carried no results at all"),
+        ("non-list-results", "not-a-listing", "carried results as str, not a list"),
+    ],
+    ids=["no-results-key", "non-list-results"],
+)
+async def test_an_unreadable_listing_is_refused_over_the_real_transport(
+    client: AlephClient, respx_mock: respx.MockRouter, label: str, body: object, clause: str
+) -> None:
+    """The other two malfunction branches, over HTTP rather than an in-process callable.
+
+    Worth the duplication because the reachability argument is transport-dependent: the
+    module tests hand-build `{"results": 5}`, and only `Transport.request` decides whether
+    such a body can actually arrive. The `non-list-results` row is a bare JSON string,
+    which is the wrapper's doing — the resolver never sees the body this server was sent.
+    """
+    entities = respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json=raw_search_payload(raw_entity(), total=1))
+    )
+    respx_mock.get("/api/2/collections").mock(return_value=httpx.Response(200, json=body))
+    with pytest.raises(ValueError) as excinfo:
+        await client.search_entities(collection="my-case", q="acme")
+    message = str(excinfo.value)
+    assert clause in message, message
+    assert "upstream malfunction" in message, message
+    assert "list_collections" not in message, message
+    assert entities.call_count == 0, "a scope that could not be resolved must not be searched"
+    assert client._scope.cached == {}, "an unreadable listing must cache nothing"
 
 
 async def test_paging_is_refused_before_a_foreign_id_costs_a_lookup(
