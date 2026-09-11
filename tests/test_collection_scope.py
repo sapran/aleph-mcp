@@ -148,6 +148,34 @@ async def test_the_all_collections_literal_reads_the_same_as_a_single_element_li
     assert "EVERY COLLECTION:" in note, f"an unscoped search must say so in `_note`: {note!r}"
 
 
+async def test_match_entity_reads_the_literal_the_same_way_in_either_spelling(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """`match_entity` takes the same scope argument, so `["*"]` must widen it there too.
+
+    Asserted separately from `search_entities` rather than folded into it, because the two
+    tools report the scope differently: `match_entity` writes no `searched` key at all, in
+    either spelling. Pinning that here is what keeps the spec scenario honest — an earlier
+    draft of it claimed `match_entity` reports `"*"` under `searched.collection`, which it
+    has never done.
+    """
+    route = respx_mock.post("/api/2/match").mock(
+        return_value=httpx.Response(200, json={"total": 0, "results": []})
+    )
+    lookup = respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    sample = {"schema": "Company", "properties": {"name": ["acme"]}}
+    out = await client.match_entity(sample=sample, collection=[ALL_COLLECTIONS])
+    assert lookup.call_count == 0, "the literal must never be looked up as a foreign_id"
+    assert b"collection_ids" not in route.calls.last.request.url.query, (
+        "'*' must send no collection constraint to /api/2/match"
+    )
+    assert "searched" not in out, (
+        "match_entity reports no scope key; a test asserting one would pin a fiction"
+    )
+
+
 async def test_the_every_collection_note_composes_with_the_unenumerated_note(
     client: AlephClient, respx_mock: respx.MockRouter
 ) -> None:

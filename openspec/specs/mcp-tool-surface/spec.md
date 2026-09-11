@@ -264,7 +264,7 @@ The requirement is stated as a required argument rather than as a validated defa
 
 A value that names no collection SHALL be refused locally, before any request: the empty or blank string, the empty list, and `"*"` combined with named collections. A blank value is singled out because Aleph does not read it as naming nothing — it sanitises the filter away and answers `match_all`, so the listing returns whichever collection the key can read first. That is the same silent misdirection as an omitted scope, reached through a value that looks like an answer.
 
-The all-collections literal SHALL mean the same thing in either spelling: a list whose only element is `"*"` names every readable collection, exactly as the scalar `"*"` does, and SHALL NOT be refused. Only a list that pairs `"*"` with at least one other element is ambiguous about what the caller wants, and only that list is refused. A single-element list is what a caller building the argument programmatically produces, and refusing it with the mixed-scope message — "cannot be combined with named collections" — describes a mistake the caller did not make and costs a turn to recover from.
+The all-collections literal SHALL mean the same thing in either spelling: a list whose every element is `"*"` names every readable collection, exactly as the scalar `"*"` does, and SHALL NOT be refused. Only a list that pairs `"*"` with at least one *named collection* is ambiguous about what the caller wants, and only that list is refused. A single-element list is what a caller building the argument programmatically produces, and refusing it with the mixed-scope message — "cannot be combined with named collections" — describes a mistake the caller did not make and costs a turn to recover from. A list that merely repeats the literal names no other collection either, so it is read the same way — the same reading the deduplication of repeated named collections already applies one step later.
 
 #### Scenario: An omitted scope is refused
 
@@ -287,16 +287,17 @@ The all-collections literal SHALL mean the same thing in either spelling: a list
 
 #### Scenario: The all-collections literal is accepted in either spelling
 
-- **WHEN** `search_entities` or `match_entity` is called with `collection` set to the single-element list `["*"]`
+- **WHEN** `search_entities` is called with `collection` set to the single-element list `["*"]`, or to a list whose every element is `"*"`
 - **THEN** the call is treated exactly as the scalar `"*"`: no collection filter is applied and no lookup is made
 - **AND** the response reports `"*"` under `searched.collection`, not a single-element list
+- **AND** the same list passed to `match_entity` likewise sends no collection constraint and costs no lookup — `match_entity` reports no `searched` key in either spelling, which is its existing behaviour for the scalar and is unchanged here
 
 #### Scenario: A scope naming nothing is refused without a request
 
 - **WHEN** `search_entities` is called with `collection` set to an empty or blank string, to an empty list, or to a list containing `"*"` alongside named collections
 - **THEN** the call raises a tool error naming what to pass instead
 - **AND** no request is sent to Aleph
-- **AND** the refusal for a list mixing `"*"` with named collections names both alternatives, and is not reached by a list whose only element is `"*"`
+- **AND** the refusal for a list mixing `"*"` with named collections names both alternatives, and is not reached by a list whose every element is `"*"`
 
 #### Scenario: A match against every collection is asked for by name
 
@@ -316,7 +317,7 @@ The three tools that address exactly one collection SHALL refuse `"*"` rather th
 
 Resolving a `foreign_id` reads a listing this server did not produce, so the listing's shape SHALL be checked before it is indexed, and SHALL NOT be assumed from the fact that a `results` key is present. A listing that cannot be read as a list of records SHALL raise a legible refusal rather than an untranslated `KeyError` or `TypeError`: the tool seam translates one error type, and anything else reaches the model as a server fault carrying no usable next step.
 
-A listing that cannot be read SHALL be distinguished from a listing that was read and held no match, because the two call for opposite responses. Exactly one shape means "no such collection": a `results` list that is present, is a list, and is empty — what Aleph answers for a `foreign_id` nobody owns. Only that shape SHALL be reported as an authorisation-or-existence problem naming `list_collections`. Every other unusable shape — no `results` key at all, a `results` value that is not a list, a first row that is not a record — SHALL be reported as an upstream malfunction, naming the shape received and not directing the caller to `list_collections`. Reporting a malfunctioning upstream as a missing collection is a confident wrong diagnosis: it sends the caller to check its own permissions when nothing about the call can change the outcome. Both paths SHALL fail closed — no collection is resolved and nothing is cached.
+A listing that cannot be read SHALL be distinguished from a listing that was read and held no match, because the two call for opposite responses. One shape means "no such collection": a `results` list that is present, is a list, and is empty — what Aleph answers for a `foreign_id` nobody owns, and equally what a bare empty JSON array arrives as once the transport has wrapped it, since an empty array is an empty result set whoever serialised it. Only that shape SHALL be reported as an authorisation-or-existence problem naming `list_collections`. Every other unusable shape — no `results` key at all, a `results` value that is not a list, a first row that is not a record — SHALL be reported as an upstream malfunction, naming the shape received and not directing the caller to `list_collections`. Reporting a malfunctioning upstream as a missing collection is a confident wrong diagnosis: it sends the caller to check its own permissions when nothing about the call can change the outcome. Both paths SHALL fail closed — no collection is resolved and nothing is cached.
 
 #### Scenario: A foreign_id is accepted wherever a numeric id is
 

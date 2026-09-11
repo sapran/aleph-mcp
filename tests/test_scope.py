@@ -333,15 +333,17 @@ async def test_an_upstream_id_echoed_into_a_refusal_is_bounded_and_escaped() -> 
 # -- the listing's shape is checked before it is indexed -----------------------
 
 # Every shape the resolver can be handed that is not a readable list of records. The
-# transport wraps a non-dict JSON body as `{"results": <body>}`, so the string and number
-# rows are real bodies an interstitial or a misrouted proxy produces, not invented ones.
+# transport wraps a non-dict JSON body as `{"results": <body>}`, so the string, number and
+# bool rows are reachable two ways: Aleph's own dict carrying that value, and a JSON body
+# that is not an object at all. An HTML interstitial is deliberately not among them — it
+# never reaches this module, because the transport's decode raises on it first.
 UNUSABLE_LISTINGS: list[tuple[str, dict[str, Any]]] = [
     ("no-results-key", {"status": "error"}),
     ("null-results", {"results": None}),
     ("mapping-results", {"results": {"a": 1}}),
     ("number-results", {"results": 5}),
     ("bool-results", {"results": True}),
-    ("string-results", {"results": "<html>maintenance</html>"}),
+    ("string-results", {"results": "not-a-listing"}),
     ("null-first-row", {"results": [None]}),
     ("string-first-row", {"results": ["my-case"]}),
 ]
@@ -387,7 +389,7 @@ SHAPE_TYPE_NAMES: list[tuple[dict[str, Any], str]] = [
     ({"results": {"a": 1}}, "dict"),
     ({"results": 5}, "int"),
     ({"results": True}, "bool"),
-    ({"results": "<html>"}, "str"),
+    ({"results": "not-a-listing"}, "str"),
     ({"results": [None]}, "NoneType"),
     ({"results": [5]}, "int"),
     ({"results": ["my-case"]}, "str"),

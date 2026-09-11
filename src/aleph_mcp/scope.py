@@ -98,11 +98,15 @@ def _is_numeric_form(text: str) -> bool:
 
 
 def _no_such_collection(text: str) -> ValueError:
-    """The one diagnosis that is about the caller: the listing was read and held no match.
+    """The diagnosis that is about the caller: the listing was read and held no match.
 
-    Reached from exactly two places — an empty `results` list, and a row naming a
-    different collection than the one asked for. Both are the upstream working correctly
-    and saying no.
+    Reached from two places, and only the first is unambiguously the upstream saying no:
+    an empty `results` list, which is what Aleph answers for a foreign_id nobody owns.
+    The second — a row naming a different collection than the one asked for — is more
+    likely an upstream malfunction, since the lookup filters on the foreign_id and a
+    correct responder cannot answer it with another; see the comment at that call site.
+    It keeps this message anyway, because that is the refusal the spec already fixed for
+    it and separating the two is its own change, not this one.
     """
     return ValueError(
         f"no collection with foreign_id {text!r} is readable with this API key; "
@@ -120,17 +124,19 @@ def _unusable_listing(text: str, shape: str) -> ValueError:
     the caller's own foreign_id and is echoed the same way every other refusal here echoes
     it.
 
-    Deliberately less actionable than `_no_such_collection`: it names no next step for the
-    caller because there is none. Nothing about the call can change what the upstream
-    returned, and the failure this replaces was the opposite one — an actionable next step
-    that led nowhere.
+    The next step it names is for whoever runs the instance, not for the caller: nothing
+    about the call can change what the upstream returned. That is the opposite of the
+    failure it replaces, which offered the caller an actionable step that led nowhere.
+    Said plainly rather than by omission, because a refusal that only rules out *some*
+    retries reads as licence for the rest — the same reason `server.py` spells out
+    "retrying will not help" on the marker path.
     """
     return ValueError(
         f"resolving the collection foreign_id {text!r} could not be completed: the "
         f"collection listing {shape}. This is an upstream malfunction rather than a "
-        "problem with the arguments, so retrying with a different collection will not "
-        "help; check that the Aleph instance and any proxy in front of it are answering "
-        "the API rather than an error or a login page."
+        "problem with the arguments: nothing about this call can change it and retrying "
+        "will not help. Whoever runs this Aleph instance needs to know that its "
+        "collections endpoint answered with JSON that is not a listing."
     )
 
 
@@ -361,19 +367,27 @@ class CollectionResolver:
         # The listing's shape is checked before it is indexed, in branches rather than as
         # one predicate. One predicate can only produce one message, which is how a single
         # `isinstance` guard here ended up reporting every upstream malfunction as a
-        # missing collection. Exactly one shape means "no such collection" — a `results`
-        # list that is present, is a list, and is empty, which is what Aleph answers for a
-        # foreign_id nobody owns. Every other unusable shape is a statement about the
-        # responder, not about the collection, and saying otherwise asserts something
-        # about the caller's permissions that the body never said.
+        # missing collection. One shape means "no such collection" — a `results` list that
+        # is present, is a list, and is empty, which is what Aleph answers for a
+        # foreign_id nobody owns. A bare `[]` body reaches the same branch, because the
+        # transport wraps it under the same key; read as a miss deliberately, since an
+        # empty array is an empty result set whoever serialised it. Every other unusable
+        # shape is a statement about the responder, not about the collection, and saying
+        # otherwise asserts something about the caller's permissions that the body never
+        # said.
         results = listing.get("results")
         if results is None:
             raise _unusable_listing(text, "carried no results at all")
         if not isinstance(results, list):
-            # The transport wraps a non-dict JSON body as `{"results": <body>}`, so a
-            # maintenance page or a proxy interstitial arrives here as a str. Indexing it
-            # used to raise KeyError or TypeError, which no tool's `except ValueError`
-            # translates, so it left this server as a server fault rather than a refusal.
+            # Reached two ways: Aleph's own dict carrying a non-list under `results`, and
+            # the transport's wrapper for a JSON body that is not an object — a bare
+            # string, number or array becomes `{"results": <body>}`. An HTML interstitial
+            # is NOT one of them, however much it looks like the likely case: the
+            # transport's `jsonlib.loads` raises on it first, and that unguarded decode is
+            # its own parked claim rather than something this branch can catch. Indexing a
+            # truthy non-list used to raise KeyError or TypeError, which no tool's
+            # `except ValueError` translates, so it left this server as a server fault
+            # rather than a refusal.
             raise _unusable_listing(
                 text, f"carried results as {type(results).__name__}, not a list"
             )

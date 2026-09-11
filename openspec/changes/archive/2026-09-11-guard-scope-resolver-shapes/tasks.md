@@ -67,5 +67,46 @@ The first pass found two survivors — nothing pinned the type name on the first
 nothing pinned that the type name is read rather than hard-coded. Both closed by parametrising
 across distinct types on both branches.
 
-**Gate.** 540 passed, 31 skipped, 5 xfailed (518 before). `ruff check`, `ruff format --check` and
+**Gate.** 541 passed, 31 skipped, 5 xfailed (518 before). `ruff check`, `ruff format --check` and
 `mypy` clean on the package CI checks.
+
+**Tool-path check.** The claim "reaches the model as a legible refusal rather than a server fault"
+is about the MCP seam, so it was read off the seam and not off the client underneath it. All six
+shapes arrive through `mcp.call_tool("search_entities", ...)` as an unprefixed `ToolError`: the
+five malfunction shapes with the new diagnosis, the empty listing with the `list_collections` one.
+
+## Review round
+
+Three reviewers on the diff. The code reviewer independently rebuilt the pre-change tree and
+confirmed 20 of the 21 new parametrised cases fail on `develop` with the recorded symptoms; the
+21st is the empty-listing companion pin, unchanged by design.
+
+Fixed in this change:
+
+- **The spec contradicted the code on `["*", "*"]`.** The prose said a list pairing `"*"` with "at
+  least one other element" is refused; the code accepts a list of only literals. Reworded to "at
+  least one *named collection*", with the repeated spelling added to the scenario.
+- **The spec asserted `match_entity` reports `"*"` under `searched.collection`.** It reports no
+  `searched` key at all, in either spelling — measured. The scenario now says so, and
+  `test_match_entity_reads_the_literal_the_same_way_in_either_spelling` pins the real behaviour.
+- **"Exactly one shape means no such collection" was an overstatement.** A bare `[]` body arrives
+  as `{"results": []}` once the transport has wrapped it, so two bodies reach that branch. Reading
+  both as a miss is deliberate — an empty array is an empty result set — and the spec now says
+  that instead of claiming the shape is unique to Aleph's envelope.
+- **The `str` branch's comment named a body that cannot reach it.** An HTML interstitial raises
+  inside the transport's `jsonlib.loads` and never enters this module — measured. The comment,
+  the test fixture and the refusal text no longer claim otherwise.
+- **Two docstrings contradicted their own code.** `_no_such_collection` claimed both its callers
+  are "the upstream working correctly"; the mismatch branch's own comment lists malfunctions.
+  `_unusable_listing` claimed it "names no next step"; it names one, for the operator.
+- **The refusal ruled out only some retries.** "retrying with a different collection will not
+  help" reads as licence to retry the same call. Now says plainly that retrying will not help.
+
+Recorded and not fixed, as entry 2 of `docs/implementation-notes.md`: a confirmed row carrying an
+unusable `id` still blames the caller (raised independently by both reviewers, one rating it
+critical); a row with no `foreign_id` key takes the mismatch branch; a bare array of records
+resolves with no envelope; `match_entity` never announces an all-collections scope. None is among
+the shapes this change's spec enumerates, and all four fail closed.
+
+**Re-verified after the fixes.** 541 passed; 16 of 16 mutations caught, including a new one for
+the `match_entity` spelling; `ruff` and `mypy` clean; `openspec validate` clean.
