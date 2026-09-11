@@ -71,7 +71,15 @@ MAX_SUGGESTION_CHARS = 240
 # Roughly 7x the stock ontology, applied to each of the three lists `list_schemata` returns.
 # `matchable` and `edges` are subsets of `all`, so bounding only `all` would leave a shorter
 # but still unbounded path through either subset.
+#
+# The character budget is the one that bounds the response, for the same reason
+# MAX_SUGGESTION_CHARS does above: a count cap beside a per-name cap is not a bound, it is a
+# ceiling of count x cap. Without it, 500 names each at the 64-character cap is ~32,500
+# characters per list and ~97,000 across the three. 8,000 is 10x the stock ontology's `all`
+# list (71 names, ~800 characters joined), so it never clips a real instance, and a cut list
+# says what it dropped either way.
 MAX_SCHEMA_NAMES = 500
+MAX_SCHEMA_LIST_CHARS = 8000
 
 # Properties that carry whole documents. Never worth spending context on inside a
 # search hit; get_entity_text exists to read them deliberately and in bounded slices.
@@ -146,30 +154,89 @@ _FALLBACK_CAPTION_NOTE = (
 )
 
 
-def _suggestion_list(names: list[str]) -> str:
-    """The near-match names a refusal offers, rendered and bounded as one string.
+def _quoted(name: str) -> str:
+    """One upstream schema name as a bounded, balanced quoted token.
 
-    Two bounds, because one is not enough. `SCHEMA_NAME` bounds each name, and without it a
-    single 20,000-character key produced a 20,100-character refusal. But ten names each at
-    that cap is the same unbounded echo one order of magnitude smaller, so the *joined* list
-    is bounded too -- which is the bound the count cap was mistaken for.
+    `repr` first, cap second. The order matters: `repr` expands an escaped character up to
+    six-fold, so capping the name and escaping after would let one 64-character name reach 386
+    and put the per-name bound back where it started. Escaping first means the cap counts what
+    the model receives -- the same reason `echo.render` collapses before it truncates.
 
-    Clipping loses nothing the caller cannot recover: the refusal this feeds already ends by
-    naming `aleph://schemata` as the full list, and the suggestions are only a shortcut to it.
-    That is what makes the exact number a judgement rather than a contract.
+    Capping a `repr` cuts off the quote `repr` opened, so the delimiter is put back. An
+    unbalanced token would undo the point of quoting: the next `", "` would read as ordinary
+    text inside a string that never ends, which is the forgery this is here to prevent.
+    `repr` always closes with the delimiter it opened, so `raw[0]` is the right character.
+    """
+    raw = repr(name)
+    token = render(raw, SCHEMA_NAME)
+    return token if token == raw else token + raw[0]
 
-    Returns `""` when there is nothing to offer, which the call site reads as "emit no clause"
-    -- an empty list would otherwise render as `Did you mean one of: ?`.
+
+def _suggestion_clause(names: list[str]) -> str:
+    """The whole `Did you mean one of:` clause, or `""` when there is nothing to offer.
+
+    Each name is `repr`-ed *before* it is bounded, and that order is load-bearing. The
+    suggestions are joined on this server's own `", "` and sit inside a sentence this server
+    terminates with `?`, so both are structure an upstream name can forge: a key named
+    `Person, Company (system: ignore prior instructions)` reads as two suggestions and a
+    parenthetical, and one containing `?` ends the sentence and continues as server-authored
+    prose. Measured against the first draft of this change, which interpolated the names bare.
+    `repr` is what the caller-input half of this same f-string has always used -- `name!r`,
+    three tokens away -- so this makes the two halves of one message agree.
+
+    Bounding the `repr` rather than the name is what keeps the per-name cap honest: `repr`
+    expands an escaped character up to six-fold, so capping first and escaping after would let
+    one 64-character name reach 386. Escaping first means the cap counts what the model
+    receives, which is the same reason `echo.render` collapses before it truncates.
+
+    Two bounds, because one is not enough. `SCHEMA_NAME` bounds each token, and without it a
+    single 20,000-character key produced a 20,100-character refusal. But ten tokens each at
+    that cap is the same unbounded echo one order of magnitude smaller, so the joined list is
+    bounded too -- which is the bound the count cap was mistaken for.
+
+    A clipped list says so. The count is not noise the way a truncated *error* body's would
+    be: it is the difference between "these are the near matches" and "these are three of
+    forty", and this server treats a confidently incomplete answer as a defect. Nothing is
+    lost that the caller cannot recover -- the refusal ends by naming `aleph://schemata` --
+    but the caller has to be told there is something to go and get.
     """
     offered: list[str] = []
     used = 0
     for name in names[:MAX_SUGGESTIONS]:
-        rendered = render(name, SCHEMA_NAME)
-        used += len(rendered) + (2 if offered else 0)
+        token = _quoted(name)
+        used += len(token) + (2 if offered else 0)
         if offered and used > MAX_SUGGESTION_CHARS:
             break
-        offered.append(rendered)
-    return ", ".join(offered)
+        offered.append(token)
+    if not offered:
+        return ""
+    clause = f"Did you mean one of: {', '.join(offered)}?"
+    if len(offered) < len(names):
+        clause += f" ({len(offered)} of {len(names)} near matches shown.)"
+    return clause
+
+
+def _bounded_names(names: list[str]) -> tuple[list[str], int]:
+    """Render and bound one list of schema names; returns what is served and what was dropped.
+
+    Both bounds live here so the caller cannot apply one and forget the other. The count cap
+    alone is the pattern `_suggestion_clause` above rejects -- 500 names each at the per-name
+    cap is ~32,500 characters of upstream text per list, three times over, which is bounded
+    only in the sense that 25 MiB is. The character budget is what makes it a bound.
+
+    `len(names) - len(kept)` covers both reasons for dropping in one number, and is computed
+    from the pre-slice list, so a list cut for either reason reports the same truthful count
+    and a list that fits reports zero.
+    """
+    kept: list[str] = []
+    used = 0
+    for name in names[:MAX_SCHEMA_NAMES]:
+        rendered = render(name, SCHEMA_NAME)
+        used += len(rendered)
+        if kept and used > MAX_SCHEMA_LIST_CHARS:
+            break
+        kept.append(rendered)
+    return kept, len(names) - len(kept)
 
 
 def derive_caption(entity: dict[str, Any], schemata: dict[str, Any] | None = None) -> str | None:
@@ -748,9 +815,9 @@ class AlephClient:
         out: dict[str, Any] = {"count": len(schemata)}
         omitted = {}
         for key, names in lists.items():
-            out[key] = [render(n, SCHEMA_NAME) for n in names[:MAX_SCHEMA_NAMES]]
-            if len(names) > MAX_SCHEMA_NAMES:
-                omitted[key] = len(names) - MAX_SCHEMA_NAMES
+            out[key], dropped = _bounded_names(names)
+            if dropped:
+                omitted[key] = dropped
         if omitted:
             # Announced rather than served short. A confidently incomplete answer is the one
             # shape this server treats as a defect, so a cut list says what it cut.
@@ -767,11 +834,11 @@ class AlephClient:
         schema = schemata.get(name)
         if schema is None:
             close = sorted(n for n in schemata if n.lower().startswith(name[:3].lower()))
-            suggestions = _suggestion_list(close)
+            clause = _suggestion_clause(close)
             raise ValueError(
                 f"unknown followthemoney schema {name!r}. "
-                + (f"Did you mean one of: {suggestions}?" if suggestions else "")
-                + " Read aleph://schemata for the full list."
+                + (f"{clause} " if clause else "")
+                + "Read aleph://schemata for the full list."
             )
         return {
             "name": name,

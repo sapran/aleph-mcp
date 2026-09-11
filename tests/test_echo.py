@@ -6,7 +6,7 @@ both of which survive widening the cap they guard. So a policy's cap and its tre
 asserted here literally — the expected strings are written out rather than derived from the
 policy under test, so a change to the module cannot move the expectation with it.
 
-The four policies differ deliberately; see `aleph_mcp.echo` for why each context needs its
+The five policies differ deliberately; see `aleph_mcp.echo` for why each context needs its
 own number. What must not vary is that each one keeps the number it has.
 """
 
@@ -88,13 +88,14 @@ def test_request_target_replaces_unprintable_characters_and_nothing_else() -> No
 
 
 def test_schema_name_substitutes_visibly_and_leaves_a_real_name_alone() -> None:
-    """An FtM schema name is interpolated bare — no `!r`, no surrounding quotes — into a
-    refusal and into the ontology listing, so nothing downstream escapes it.
+    """The ontology listing serves these names as JSON string values the model reads directly,
+    with no `repr` between them and the reader — so the substitution is what neutralises them.
 
-    The substitution doubles as the line flattening: `\\n`, `\\r` and `\\t` are not printable,
-    so a multi-line name cannot present as separate lines of server-authored text and no
-    separate whitespace collapse is needed. Quotes stay, because there is no quoted region of
-    the server's for one to close — neutralising them would only corrupt a legitimate name.
+    It doubles as the line flattening: `\\n`, `\\r` and `\\t` are not printable, so a multi-line
+    name cannot present as separate lines of server-authored text and no separate whitespace
+    collapse is needed. Quotes stay because neutralising them would not help on the other call
+    site either: a name quoted into a refusal forges structure with a comma or a question mark,
+    not a quote, which is why `_suggestion_clause` adds `repr` rather than asking for more here.
     """
     assert render("Pers\x1b[31mon\x00‮B\ty", SCHEMA_NAME) == "Pers�[31mon��B�y"
     assert render('Person"s', SCHEMA_NAME) == 'Person"s'

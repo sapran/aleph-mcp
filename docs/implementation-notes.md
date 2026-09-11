@@ -209,9 +209,9 @@ fires there — the outcome degrades to the pre-T1-FIX-2 message rather than lea
 (`tests/test_echo.py:59`) enumerates `vars(echo)`, so it sees only module-level policies declared in
 `echo.py`. `render(v, replace(PROPERTY_VALUE, max_chars=77))` at a call site is invisible to it and
 to every cap row, which defeats the "each site asks for the treatment by name" property the module
-exists to establish. All seven call sites today name one of the four policies, so this is a missing
+exists to establish. All nine call sites today name one of the five policies, so this is a missing
 enforcement, not a live defect. Closing it means either forbidding non-module policies at runtime or
-asserting the seven call sites against the four names.
+asserting the nine call sites against the five names.
 
 **`echo.COLLECTION_ECHO` leaves control characters to its call site's `!r`.** The behaviour the four
 helpers had, preserved deliberately rather than a new gap. `scope.py:81` is the only caller and
@@ -292,11 +292,20 @@ the `bound-ontology-echo` branch: `{"model": {"schemata": ["Person"]}}` raises
 this server. `_schemata` already guards the same value for the caption path
 (`return schemata if isinstance(schemata, dict) else None`); the two ontology tools do not.
 
-This is the defect `harden-metadata-path` closed for `model`, one level down — that change refuses
-a truthy non-dict `model` via `raise_unusable_model`, and the spec requirement it added is about
-the model, not its `schemata` member. Found while implementing `bound-ontology-echo` on
-2026-09-11 and parked: pre-existing, unrelated to that change's scope, and the fix is a refusal
-shape decision (reuse `raise_unusable_model`, or degrade) rather than a one-liner.
+**A *falsy* non-dict `schemata` is served as an ontology declaring nothing.** The same
+`or {}` swallows `[]`, `""` and `0`, so `list_schemata` answers `{"count": 0, "all": [], ...}`
+— now stamped `_provenance: untrusted` as if it were a real reading — and `get_schema` reports
+every real schema as unknown. No error anywhere. This is the more dangerous half: the
+AttributeError above at least fails loudly, where this states something false about the instance
+and is indistinguishable from a legitimately minimal ontology.
+
+Both are the defect `harden-metadata-path` closed for `model`, one level down — that change
+refuses a truthy non-dict `model` via `raise_unusable_model`, and the spec requirement it added
+is about the model, not its `schemata` member. The existing requirement "An unusable instance
+model is refused, never cached as an empty ontology" already states the right rule; it just does
+not reach this value. Found while implementing `bound-ontology-echo` on 2026-09-11 and parked:
+pre-existing on `develop`, unrelated to that change's scope, and the fix is a refusal-shape
+decision (reuse `raise_unusable_model`, or degrade) rather than a one-liner.
 
 ## 12. Three pieces of stale prose (Tier 0)
 

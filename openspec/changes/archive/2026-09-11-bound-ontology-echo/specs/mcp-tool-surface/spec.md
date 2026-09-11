@@ -18,7 +18,16 @@ refusal, and an unbounded one is a write primitive into the model's context.
 
 A refusal that suggests near-matching schema names SHALL bound the suggestion list by its total
 rendered length, not only by the number of names it offers, so that the per-name bound cannot be
-defeated by offering many names at once.
+defeated by offering many names at once. When it offers fewer names than matched, it SHALL say
+how many of how many it is showing: a shortened list presented as the whole one is the same
+confidently incomplete answer this server treats as a defect everywhere else.
+
+Bounding and substitution are not sufficient on their own where the message has structure the
+server authors. A suggestion list joined on the server's own separator, inside a sentence the
+server terminates, SHALL be escaped so that an upstream name cannot forge either: every
+character involved is ordinary printable text, so no cap and no substitution can prevent it.
+The escaping SHALL be applied before the length bound, so that escape expansion cannot carry a
+name past the bound.
 
 #### Scenario: A hostile schema name is neutralised in a refusal
 
@@ -44,6 +53,20 @@ defeated by offering many names at once.
 - **THEN** the suggestion list is cut at the total-length bound, offering fewer names rather
   than a longer message
 - **AND** at least one suggestion is still offered
+- **AND** the refusal reports how many of the matching names it is showing
+
+#### Scenario: An upstream name cannot forge the refusal's structure
+
+- **WHEN** the instance ontology declares a schema name containing the separator the server
+  joins suggestions with, or the character it ends the suggestion sentence with
+- **THEN** the name is escaped so that it reads as one suggestion rather than several, and the
+  server's own sentence still ends where the server ends it
+
+#### Scenario: A refusal with no near match offers no empty clause
+
+- **WHEN** `get_schema` is called with a name sharing no prefix with anything the instance
+  declares
+- **THEN** the refusal names the full ontology listing and carries no suggestion clause
 
 #### Scenario: An ordinary near match is unchanged
 
@@ -53,8 +76,12 @@ defeated by offering many names at once.
 
 ### Requirement: The schema listing is bounded, labelled and announces its own truncation
 
-The `aleph://schemata` resource SHALL bound the number of schema names it returns and SHALL
-render each name under the same bound and substitution as a name quoted into a refusal. When the
+The `aleph://schemata` resource SHALL bound both the number of schema names it returns and
+their total length, and SHALL render each name under the same bound and substitution as a name
+quoted into a refusal. Both bounds are required for the same reason the refusal needs both: a
+count cap beside a per-name cap is a ceiling of one times the other, not a bound. Every list the
+resource serves SHALL be bounded, not only the complete one — the matchable and edge lists are
+subsets of it, so bounding it alone would leave a shorter but equally unbounded path out. When the
 instance declares more names than the bound admits, the resource SHALL report how many were
 omitted rather than returning a silently short list: a confidently incomplete answer is a defect
 here, and the resource's `count` is the instance's own total, not the length of the list served.
@@ -69,6 +96,19 @@ choose schema filters, so both keys are additive on an object it already parses.
 - **WHEN** the instance ontology declares a schema name far longer than the per-name bound and
   `aleph://schemata` is read
 - **THEN** the served name is bounded, and the response is not sized by the upstream name
+
+#### Scenario: A hostile schema name is neutralised in every list it appears in
+
+- **WHEN** the instance ontology declares a matchable edge schema whose name carries control,
+  format or bidirectional-override characters, and `aleph://schemata` is read
+- **THEN** every list the resource serves carries the name with those characters replaced by a
+  visible substitution
+
+#### Scenario: Many bounded names cannot together restore the unbounded listing
+
+- **WHEN** the instance ontology declares names enough that their total length crosses the
+  listing's character bound before their count crosses its count bound
+- **THEN** the list is cut at the character bound and reports the names it omitted
 
 #### Scenario: A listing longer than the bound says what it dropped
 
