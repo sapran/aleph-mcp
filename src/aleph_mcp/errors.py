@@ -165,10 +165,11 @@ def raise_undecodable_body(exc: Exception, *, context: str, resource: bool = Fal
     upstream fault a caller cannot fix by changing arguments.
 
     The decoder text is quoted through the same sanitising helper as every other foreign
-    string. zlib's messages come from a fixed C string table and echo no input bytes -- six
-    hostile bodies were measured to produce three distinct messages, none carrying any of
-    them -- so this is the label being applied by convention rather than against a known
-    injection surface, which is the cheaper of the two mistakes.
+    string. zlib's messages come from a fixed C string table and echo no input bytes: six
+    hostile bodies -- injection text, `ESC` sequences, a truncated gzip header, a body of
+    every byte value -- produced three distinct messages between them, none carrying any
+    input. So the label is applied by convention here rather than against a known injection
+    surface, which is the cheaper of the two mistakes to make.
     """
     err_cls = ResourceError if resource else ToolError
     raise err_cls(
@@ -278,8 +279,10 @@ def raise_unusable_model(model: object, *, context: str, resource: bool = False)
 
 
 # An error body worth quoting is never large. Parsing before checking would let the error
-# path allocate without bound, which is the one path the transport ceiling cannot cover:
-# the status is known before the body is.
+# path allocate without bound, and the check below cannot be the only one: it runs on a body
+# already in memory. The transport streams a failing response against this same constant --
+# it is imported there, so the two cannot drift -- which is what makes it bound the
+# allocation rather than only the quote.
 MAX_ERROR_BODY_BYTES = 64 * 1024
 
 
