@@ -388,9 +388,9 @@ async def test_a_non_dict_listing_row_is_a_tool_error_not_an_attribute_error(
     client: AlephClient, respx_mock: respx.MockRouter
 ) -> None:
     """`Transport.request` wraps a non-dict JSON body as `{"results": <body>}`, so a bare array
-    upstream makes `results[0]` a string. `.get` on it would raise AttributeError, which
-    no tool's `except ValueError` translates — the caller would see an unhandled exception
-    instead of a legible refusal.
+    upstream makes `results[0]` a string. `.get` on it would raise AttributeError, which the
+    tool seam does not translate — the caller would see an unhandled exception instead of a
+    legible refusal.
 
     The refusal it gets is the upstream-malfunction one, not "no collection with that
     foreign_id": a bare array where a listing belongs says nothing about whether the
@@ -548,7 +548,7 @@ async def test_a_numeric_json_collection_reaches_the_wire_as_a_filter(
 
     `_resolve_collection_scope` dispatches on shape, and an earlier cut branched on
     `isinstance(collection, str)` — which sent a bare `874` down the list path, where
-    `"*" in 874` raises `TypeError`, a type no tool's `except ValueError` translates. So the
+    `"*" in 874` raises `TypeError`, a type the tool seam does not translate. So the
     schema-only assertion above would have passed with the call still broken.
     """
     route = respx_mock.get("/api/2/entities").mock(

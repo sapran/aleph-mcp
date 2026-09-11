@@ -14,7 +14,7 @@ from fastmcp.exceptions import ResourceError, ToolError
 
 from .config import Settings
 from .echo import PROPERTY_VALUE, SCHEMA_NAME, render
-from .errors import ResponseTooLarge, raise_unusable_model
+from .errors import Refusal, ResponseTooLarge, raise_unusable_model
 from .readonly import ReadOnlyViolation
 from .scope import ALL_COLLECTIONS, CollectionResolver
 from .transport import MAX_RESPONSE_BYTES, Query, Transport
@@ -104,13 +104,13 @@ _ENTITY_ID = re.compile(r"[A-Za-z0-9._:-]+")
 
 def _check_entity_id(value: str, *, field: str = "entity_id") -> str:
     if not isinstance(value, str) or not _ENTITY_ID.fullmatch(value):
-        raise ValueError(f"invalid {field}: must match [A-Za-z0-9._:-]+ (got {value!r})")
+        raise Refusal(f"invalid {field}: must match [A-Za-z0-9._:-]+ (got {value!r})")
     # The charset permits `.`, so an id of only dot segments passes the pattern and is then
     # normalised away at URL construction — `/api/2/entitysets/../entities` becomes
     # `/api/2/entities`, answering a different question than the caller asked. Refuse on
     # content rather than by banning `.`, which legitimate Aleph ids contain.
     if not value.strip("."):
-        raise ValueError(f"invalid {field}: addresses nothing (got {value!r})")
+        raise Refusal(f"invalid {field}: addresses nothing (got {value!r})")
     return value
 
 
@@ -675,11 +675,17 @@ class AlephClient:
             model = payload.get("model")
             if model and not isinstance(model, dict):
                 raise_unusable_model(model, context="aleph://schema", resource=True)
-        except (ResourceError, httpx.HTTPError, ValueError) as e:
+        except (ResourceError, httpx.HTTPError) as e:
             # Exactly the families `_schemata` classifies as upstream faults, which is what
             # this cache is for. A defect in this module is deliberately *not* memoised: it
             # must keep reaching the caller with its own traceback on every call, which is the
             # property `_schemata`'s named except arms exist to preserve.
+            #
+            # `ValueError` was a third member here, absorbing a metadata body that is not
+            # JSON. The transport guards its own decode now and refuses that as a
+            # `ResourceError` -- this call passes `resource=True` -- so the fault still
+            # arrives, through the first arm. What would be left under `ValueError` is a
+            # defect in this module, which is the one thing this tuple exists not to memoise.
             #
             # The frames are cleared before the instance is stored. It now outlives its call
             # by the whole window, and `Transport.request`'s frame holds the response body --
@@ -748,31 +754,28 @@ class AlephClient:
             # Everything else this covers -- a non-2xx, an exhausted connect, a body over
             # the ceiling -- is an upstream fault the caller cannot act on.
             return None
-        except (httpx.HTTPError, ValueError):
-            # Two families, both upstream's fault and neither the caller's.
+        except httpx.HTTPError:
+            # The read-side faults `Transport.request` deliberately does not retry --
+            # ReadTimeout, ReadError, RemoteProtocolError. A slow model is literally the
+            # ReadTimeout in that set, so this is the arm the first paragraph describes.
+            # Upstream's fault, and not the caller's.
             #
-            # httpx.HTTPError covers the read-side faults `Transport.request` deliberately does
-            # not retry -- ReadTimeout, ReadError, RemoteProtocolError. A slow model is
-            # literally the ReadTimeout in that set, so this is the arm the first paragraph
-            # describes.
-            #
-            # ValueError covers the body not parsing, and it has to be the base class rather than
-            # JSONDecodeError. `Transport.request` ends at `jsonlib.loads(body)` where body is
-            # *bytes*: json.loads runs detect_encoding and decodes first, so a body that is not
-            # valid UTF-8 raises UnicodeDecodeError -- a sibling of JSONDecodeError under
-            # ValueError, not a subclass. Measured with JSONDecodeError here: a metadata route
-            # answering 200 with a PNG, a raw gzip or a latin-1 error page hard-failed all ten
-            # shaped tools, permanently (only a success is cached, so every later call refetched and
-            # failed the same way), and UnicodeDecodeError being a ValueError meant `server.py`'s
-            # seam handed the model "'utf-8' codec can't decode byte 0x89..." unprefixed and
-            # surviving masking -- the shape of a deliberate, caller-actionable refusal, naming
-            # nothing the caller can act on.
+            # `ValueError` was the second member, absorbing a metadata body that is not JSON:
+            # `Transport.request` used to end at an unguarded `jsonlib.loads(body)` on
+            # *bytes*, so a route answering 200 with a PNG, a raw gzip or a latin-1 error page
+            # raised `UnicodeDecodeError` -- a sibling of `JSONDecodeError` under `ValueError`
+            # rather than a subclass, which is why the base class was named. Measured with
+            # only `JSONDecodeError` caught, those three hard-failed all ten shaped tools
+            # permanently, since only a success is cached. The transport guards that decode
+            # now and refuses it as a `ResourceError`, which the arm above already degrades
+            # on, so the four bodies still degrade and the test that parametrises them is
+            # unchanged.
             #
             # Still named rather than a bare except: a defect in this module -- an
-            # AttributeError, a TypeError -- reaches the caller instead of silently degrading
-            # every caption on the instance. That property is pinned by a test, because
-            # deleting this arm entirely, or appending `except Exception` after it, both left
-            # the suite green at 380 passed.
+            # AttributeError, a TypeError, and now a ValueError too -- reaches the caller
+            # instead of silently degrading every caption on the instance. That property is
+            # pinned by a test, because deleting this arm entirely, or appending
+            # `except Exception` after it, both left the suite green at 380 passed.
             #
             # The one live counterexample to that reading is gone: an upstream `model` that
             # is truthy but not a dict used to reach `model.get("schemata")` below -- outside
@@ -835,7 +838,7 @@ class AlephClient:
         if schema is None:
             close = sorted(n for n in schemata if n.lower().startswith(name[:3].lower()))
             clause = _suggestion_clause(close)
-            raise ValueError(
+            raise Refusal(
                 f"unknown followthemoney schema {name!r}. "
                 + (f"{clause} " if clause else "")
                 + "Read aleph://schemata for the full list."
@@ -953,7 +956,7 @@ class AlephClient:
         # second one is refused rather than merged. Checked before resolution: the caller
         # needs to be told which argument to use, not which id won.
         if filters and "collection_id" in filters:
-            raise ValueError(
+            raise Refusal(
                 "collection scope belongs in the `collection` argument, not in `filters`: "
                 f"pass collection={filters['collection_id']!r} and remove "
                 "filters['collection_id']. `collection` also accepts a foreign_id or a list, "
@@ -961,17 +964,17 @@ class AlephClient:
             )
 
         if limit < 0:
-            raise ValueError("limit must be >= 0")
+            raise Refusal("limit must be >= 0")
         if offset < 0:
-            raise ValueError("offset must be >= 0")
+            raise Refusal("offset must be >= 0")
         if facet_size < 1 or facet_size > MAX_FACET_SIZE:
-            raise ValueError(
+            raise Refusal(
                 f"facet_size must be between 1 and {MAX_FACET_SIZE}. A facet is a summary; "
                 "if you need more buckets than that, filter to a narrower slice and facet "
                 "again rather than asking for the whole aggregation."
             )
         if limit + offset > MAX_PAGE:
-            raise ValueError(
+            raise Refusal(
                 f"limit + offset must be <= {MAX_PAGE}: Aleph cannot page past result "
                 f"{MAX_PAGE} (Elasticsearch result-window limit), so deep pagination is not a "
                 "way to read a whole collection. Narrow the query instead — add filters, or "
@@ -1123,7 +1126,7 @@ class AlephClient:
     ) -> dict[str, Any]:
         _check_entity_id(entity_id)
         if limit < 1 or limit > MAX_EXPAND:
-            raise ValueError(
+            raise Refusal(
                 f"limit must be between 1 and {MAX_EXPAND}: graph expansion has its own, much "
                 f"lower ceiling than search (ALEPH_MAX_EXPAND_ENTITIES, default {MAX_EXPAND})."
             )
@@ -1185,7 +1188,7 @@ class AlephClient:
         limit: int = 10,
     ) -> dict[str, Any]:
         if "schema" not in sample:
-            raise ValueError(
+            raise Refusal(
                 "sample must include a followthemoney 'schema' key, e.g. "
                 '{"schema": "Person", "properties": {"name": ["Jane Doe"]}}'
             )
@@ -1258,7 +1261,7 @@ class AlephClient:
         # Aleph clamps here rather than erroring (QueryParser max_limit); refusing is
         # deliberately stricter, so a truncated expansion is never mistaken for a whole one.
         if limit < 1 or limit > MAX_EXPAND:
-            raise ValueError(
+            raise Refusal(
                 f"limit must be between 1 and {MAX_EXPAND}: graph expansion has its own, much "
                 f"lower ceiling than search (ALEPH_MAX_EXPAND_ENTITIES, default {MAX_EXPAND})."
             )
@@ -1392,9 +1395,9 @@ class AlephClient:
         """
         _check_entity_id(entity_id)
         if offset < 0:
-            raise ValueError("offset must be >= 0")
+            raise Refusal("offset must be >= 0")
         if limit < 1 or limit > 200_000:
-            raise ValueError("limit must be between 1 and 200000 characters")
+            raise Refusal("limit must be between 1 and 200000 characters")
 
         entity = await self._transport.request(
             "GET", f"/api/2/entities/{entity_id}", context="get_entity_text"
@@ -1508,7 +1511,7 @@ def _shrunk_page(page: int) -> int:
 
 def _page_params(limit: int, offset: int, *, cap: int) -> Query:
     if limit < 0 or limit > cap:
-        raise ValueError(f"limit must be between 0 and {cap}")
+        raise Refusal(f"limit must be between 0 and {cap}")
     if offset < 0:
-        raise ValueError("offset must be >= 0")
+        raise Refusal("offset must be >= 0")
     return [("limit", str(limit)), ("offset", str(offset))]

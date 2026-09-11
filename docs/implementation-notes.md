@@ -15,45 +15,29 @@ was closed by `charge-and-account-response-path` on 2026-09-11, parking two new 
 one under the stale-prose entry and one as its own entry, both found by review of that change. Item
 1 again — the scope resolver's upstream shapes — was closed by `guard-scope-resolver-shapes` on
 2026-09-11, parking four new claims in passing as one new entry — the conclusions the scope path
-still draws without earning them — all found by review of that change. The plan and the sections
-below are renumbered after each, so twenty-eight claims across twelve entries remain.
+still draws without earning them — all found by review of that change. Item 1 once more — the
+refusal channel — was closed by `type-the-refusal-channel` on 2026-09-11, parking one new claim in
+passing as its own entry, and consuming one bullet of the stale-prose entry whose sentences that
+change made false. The plan and the sections below are renumbered after each, so twenty-six
+claims across twelve entries remain.
 
 ## Work plan
 
-1. Give refusals a type — a dead upstream is reported as a bad argument.
-2. Finish the scope path's row shape — a confirmed row with a bad `id` blames the caller.
-3. Make the licence gate able to fail — it passes with the project's own LICENSE deleted.
-4. Answer the entity-shaped spec question — four copy-through slots, one decision, five xfails.
-5. Extend the tool path's guarantees to resources — a `resource()` factory and a wider walk.
-6. Close echo.py's enforcement gaps — an inline policy escapes both guards.
-7. Give `get_entity_text` a derived caption.
-8. Close the tests that cannot fail — four checks that certify nothing.
-9. Decide the private-sibling references — the publication deadline has already passed.
-10. Guard `model["schemata"]`'s shape — a non-dict raises AttributeError at the caller.
-11. Name the dropped error body — a real complaint reads as no complaint at all.
-12. Correct four pieces of stale prose (Tier 0).
+1. Finish the scope path's row shape — a confirmed row with a bad `id` blames the caller.
+2. Make the licence gate able to fail — it passes with the project's own LICENSE deleted.
+3. Answer the entity-shaped spec question — four copy-through slots, one decision, five xfails.
+4. Extend the tool path's guarantees to resources — a `resource()` factory and a wider walk.
+5. Close echo.py's enforcement gaps — an inline policy escapes both guards.
+6. Give `get_entity_text` a derived caption.
+7. Close the tests that cannot fail — four checks that certify nothing.
+8. Decide the private-sibling references — the publication deadline has already passed.
+9. Guard `model["schemata"]`'s shape — a non-dict raises AttributeError at the caller.
+10. Name the dropped error body — a real complaint reads as no complaint at all.
+11. Bound the decode's recursion — a deeply nested 2xx body is a server fault.
+12. Correct three pieces of stale prose (Tier 0).
 ---
 
-## 1. Bare `ValueError` is the wrong refusal channel, in both directions
-
-Both halves close with one type: a dedicated `Refusal(ValueError)` raised at the client's own
-refusal sites and caught in place of bare `ValueError` — the pattern `errors.py` already sets for
-`ResponseTooLarge`.
-
-**Too wide.** `Transport.request` (`transport.py:180`) decodes the body with an unguarded
-`jsonlib.loads`. `json.JSONDecodeError` and `UnicodeDecodeError` are both `ValueError` subclasses,
-so a 2xx whose body is not JSON — an HTML maintenance page, a proxy interstitial, a truncated body
-— reaches the model as a refusal reading `Expecting value: line 1 column 1 (char 0)`,
-indistinguishable from "you passed a bad id". The rational reply to a refusal is to change arguments
-and retry, against an upstream that is down. Run-verified identical on `main @ 1952232`;
-`errors.py:74` already guards the analogous connect case.
-
-**Too narrow.** The refusal seam wraps the whole tool body (`server.py:132`), where the arms it
-replaced wrapped only the `await client.X(...)` call. Equivalent today — every body is one
-forwarding call — but a future in-body `int()`, `datetime.fromisoformat()` or nested `json.loads`
-would be relabelled as a client refusal with nothing to catch it.
-
-## 2. The scope path draws four conclusions it has not earned
+## 1. The scope path draws four conclusions it has not earned
 
 All four surfaced by review of `guard-scope-resolver-shapes`, which guarded the listing's
 *envelope* and left the row inside it, and the reporting around it, where they were. Recorded
@@ -62,7 +46,7 @@ at all, a `results` value that is not a list, a first row that is not a record" 
 these is one of them. All four fail closed; none returns wrong rows.
 
 **A row that matches the foreign_id but carries an unusable `id` blames the caller.**
-`scope.py:394` hands `hit.get("id")` straight to `check_collection_id`, whose message is written
+`scope.py:409` hands `hit.get("id")` straight to `check_collection_id`, whose message is written
 for caller input. Measured end-to-end through the client on this branch, for `id` null, missing,
 `"abc"` and `{"a": 1}`:
 
@@ -76,13 +60,13 @@ likely upstream malfunction than `{"results": 5}`. Both reviewers of that PR rai
 independently; one rated it critical. The fix is to check the row's `id` before the caller-facing
 validator and route a bad one to `_unusable_listing`.
 
-**A row with no `foreign_id` key at all is read as a different collection.** `scope.py:393`
+**A row with no `foreign_id` key at all is read as a different collection.** `scope.py:407`
 tests `hit.get("foreign_id") != text`, so an absent field and a genuinely different value take the
 same branch and produce the same "no collection with foreign_id X" refusal. Only the second has
 any reading as a miss; the first is a row that is not a collection record.
 
 **A bare JSON array of records resolves and caches, with no listing envelope.** The transport
-wraps a non-dict body as `{"results": <body>}` (`transport.py:383`), so a 200 whose body is
+wraps a non-dict body as `{"results": <body>}` (`transport.py:398`), so a 200 whose body is
 `[{"foreign_id": "my-case", "id": "874"}]` resolves to 874 and caches it for the process
 lifetime. Measured. Unchanged from `develop` and arguably what the wrapper is for, but it means
 the resolver cannot tell an Aleph listing from any array that happens to carry the right keys.
@@ -96,7 +80,7 @@ scalar and spec'd that way, but it is the failure `scope.py`'s own module docstr
 module exists to prevent, and `guard-scope-resolver-shapes` added a second spelling that reaches
 it.
 
-## 3. The licence gate cannot fail
+## 2. The licence gate cannot fail
 
 Both in `.github/workflows/ci.yml`, the `build` job's licence step; one change. (The SIGPIPE race
 in the same step is fixed — see Retired.)
@@ -122,7 +106,7 @@ which is the first thing anyone debugging a packaging regression wants. Also, tw
 `unzip -p`) — unreachable in CI, where the checkout is fresh and `uv build` is the only writer, but
 it bites anyone running the step locally against a dirty `dist/`.
 
-## 4. Four aggregation slots are copied rather than rebuilt — one spec question
+## 3. Four aggregation slots are copied rather than rebuilt — one spec question
 
 `get_profile.entities`, `_slim_entityset.entities`, a tag row's `value`, and
 `_slim_collection(full=True).statistics` are one decision about what counts as entity-shaped, not
@@ -165,7 +149,7 @@ fixing any of them forces this note to be closed.
   above: upstream text would then land in `_reply`'s existing-note composition. Fix is to key the
   short-circuit on something upstream cannot set. Pre-existing and outside that change's scope.
 
-## 5. The resource path lacks the tool path's guarantees
+## 4. The resource path lacks the tool path's guarantees
 
 Three findings, closed by a ~4-line local `resource(uri, **kw)` factory mirroring `tool`, plus a
 wider walk in `find_marker`.
@@ -188,7 +172,7 @@ value and lists by item only. No client method builds a tuple, a set or a non-st
 reply, so nothing reaches those branches today, and the markers' own serialisation refusal still
 fires there — the outcome degrades to the pre-T1-FIX-2 message rather than leaking.
 
-## 6. echo.py's three enforcement gaps
+## 5. echo.py's three enforcement gaps
 
 **A policy built inline at a call site escapes both guards.** `test_every_policy_has_a_cap_row`
 (`tests/test_echo.py:59`) enumerates `vars(echo)`, so it sees only module-level policies declared in
@@ -217,14 +201,14 @@ and the content is what was asked for — than to a refusal. Closing it means de
 whole record is `PROPERTY_VALUE`-shaped data with a `_provenance` label, or whether a schema
 description deserves its own bound. A behaviour change to a resource's output either way.
 
-## 7. `get_entity_text` derives no caption
+## 6. `get_entity_text` derives no caption
 
 `client.py:1188` reads `entity.get("caption")` straight off the payload, where every slimmed path
 calls `derive_caption`. Live Aleph sends a null caption, so this is the one tool that can return
 `caption: null` for an entity the other tools would have captioned. Found during T1; fixing it
 changes a tool's output and so is a behaviour change, not a refactor.
 
-## 8. Four checks that certify nothing
+## 7. Four checks that certify nothing
 
 One purely-test change closes all four.
 
@@ -247,7 +231,7 @@ One purely-test change closes all four.
   `classify-transport-failures`: a TLS refusal now names that setting to the operator, so the
   message is wrong in a new way if the setting never reaches the client.
 
-## 9. A public repo still points at private siblings
+## 8. A public repo still points at private siblings
 
 The publication this was to be decided before has happened — 0.3.0 shipped from a public repo on
 2026-09-10 — so this is now a live defect rather than a pending decision.
@@ -266,7 +250,7 @@ private; `acordia` is also named across the specs, the archived changes and
 contributor cannot see. The declaration is deliberate and documented, so removing it is a design
 decision, not a cleanup.
 
-## 10. The ontology tools trust `model["schemata"]`'s shape
+## 9. The ontology tools trust `model["schemata"]`'s shape
 
 **A non-dict `schemata` inside a valid `model` reaches the caller as an AttributeError.**
 `client.py`'s `list_schemata` does `model.get("schemata") or {}` and then `.items()` on it, and
@@ -292,7 +276,7 @@ not reach this value. Found while implementing `bound-ontology-echo` on 2026-09-
 pre-existing on `develop`, unrelated to that change's scope, and the fix is a refusal-shape
 decision (reuse `raise_unusable_model`, or degrade) rather than a one-liner.
 
-## 11. An oversized error body is dropped without saying so
+## 10. An oversized error body is dropped without saying so
 
 **`_upstream_detail` discards a JSON error body over 64 KiB and the refusal reads as if none
 arrived.** `errors.py`. For a `400` the quoted `message` is the only actionable content the refusal
@@ -309,18 +293,30 @@ an oversized body and `b""` from an empty one are the same value today) and appe
 the refusal naming the drop. Parsing a truncated prefix is not the fix; the reasoning against that
 is written at `Transport._read_error_body`.
 
-## 12. Four pieces of stale prose (Tier 0)
+## 11. The decode's recursion is unbounded
+
+**A deeply nested 2xx body raises `RecursionError`, which is not a `ValueError` and so escapes the
+guard beside it.** `transport.py`, the `jsonlib.loads(body)` that `type-the-refusal-channel`
+wrapped in `except ValueError`. Measured on this branch with plain CPython 3.12:
+`json.loads(b"[" * 200000 + b"]" * 200000)` raises
+`RecursionError: Stack overflow (used 16352 kB) while decoding a JSON array from a unicode string`,
+and `isinstance(e, ValueError)` is `False`. It therefore reaches the caller as a server fault
+carrying no call context — the same shape the entry above closed for the two `ValueError` halves,
+one exception family over.
+
+Bounded in size by `MAX_RESPONSE_BYTES` (25 MiB), which is plenty for the nesting depth needed, and
+not a crash: CPython raises rather than segfaulting. Recorded rather than fixed because the closed
+entry's spec enumerates the shapes it covers — bytes that are not UTF-8, and text that is not JSON
+— and this is neither; widening the `except` to `(ValueError, RecursionError)` would also give a
+body nested 200000 deep a message saying it "is not JSON", which is false. Closing it means its own
+arm and its own sentence.
+
+## 12. Three pieces of stale prose (Tier 0)
 
 - **`openspec/config.yaml`'s layout paragraph is three modules stale**
   (`openspec/config.yaml:23-26`). It lists `server.py`, `client.py`, `readonly.py`, `config.py` and
   `errors.py` and names none of `echo.py` (T2), `scope.py` (T5) or `transport.py` (T4). No spec
   assertion depends on it.
-- **Comment drift naming the structure T3 deleted.** `scope.py:375`,
-  `tests/test_collection_scope.py:364` and `:486` still say "no tool's `except ValueError`
-  translates". The claims stay true of the single seam, but send a reader looking for per-tool arms
-  that no longer exist. Line references refreshed after `guard-scope-resolver-shapes` moved them;
-  the `scope.py` instance is the same sentence, rewritten in place by that change and still using
-  the plural.
 - **`transport.py:89` names a `_classify` function that does not exist, and counts the wrong
   family.** The comment above `_CONNECT_ERRORS` calls it "one bucket of the classification in
   `_classify`"; the classification is an inline dispatch in `Transport.request` and there is no

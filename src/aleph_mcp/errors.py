@@ -10,6 +10,37 @@ from .echo import UPSTREAM_ERROR, render
 from .readonly import ReadOnlyViolation
 
 
+class Refusal(ValueError):
+    """This server declining a call on its own judgement, as opposed to anything failing.
+
+    The tool and resource seams in `server.py` translate this type and nothing wider, which
+    is the whole reason it exists. They used to select on `ValueError`, and `ValueError` is
+    what Python raises for argument validation, for `int("abc")`, for `json.loads` on an
+    HTML page and for `bytes.decode` on non-UTF-8 alike -- so the seam was selecting on a
+    category of Python failure when what it wanted was *a failure this server chose to
+    produce*. The two sets overlapped by accident, in both directions:
+
+    - A `200` whose body was not JSON reached the model as `Expecting value: line 1 column 1
+      (char 0)` -- unprefixed and surviving `mask_error_details`, which is the shape this
+      repo reserves for a deliberate refusal. The rational reply to a refusal is to change
+      arguments and retry, against an instance that is down.
+    - The seam wraps the whole tool body, where the arms it replaced wrapped only the
+      `await client.X(...)` call, so an in-body `int()` or nested `json.loads` was relabelled
+      as this server's considered judgement with nothing anywhere to catch it.
+
+    It subclasses `ValueError` rather than `Exception` on purpose. `AlephClient` is
+    importable as a library and its refusals have always been `ValueError`; a caller with
+    `except ValueError` around a client call would otherwise stop catching them silently,
+    which is the kind of break that surfaces as a crash in someone else's process rather
+    than as a red test in this one.
+
+    Raised in `client.py` and `scope.py`, the two modules that refuse a *call*. Deliberately
+    not in `config.py`, whose validators run inside pydantic before any tool exists, nor in
+    `echo.py`, whose guards fire on a malformed policy literal in this repo -- a defect,
+    which must keep reading as one.
+    """
+
+
 def _budget_clause(attempts: int) -> str:
     """Why a retryable status stopped being retried, when the clock rather than the count
     ended it.
@@ -222,6 +253,53 @@ def raise_undecodable_body(exc: Exception, *, context: str, resource: bool = Fal
         "way -- from a body corrupted in transit, where it may well succeed, so it does not "
         "advise either. Nothing upstream can have changed regardless: this server issues "
         "only read requests."
+    ) from exc
+
+
+def raise_unparsable_body(
+    exc: Exception, *, context: str, status: int, resource: bool = False
+) -> NoReturn:
+    """Refuse a *successful* response whose body is not JSON.
+
+    The last response failure that left this server as itself. `Transport.request` ended at
+    an unguarded `jsonlib.loads`, and both shapes it can fail with -- `json.JSONDecodeError`
+    for text that is not JSON, `UnicodeDecodeError` for bytes that are not UTF-8, siblings
+    under `ValueError` rather than one subclassing the other -- were translated by the tool
+    seam into the shape reserved for a deliberate refusal. Measured on `develop @ 7f9c139`
+    through the shipped MCP path: an HTML maintenance page on a `200` reached the model as
+    `Expecting value: line 1 column 1 (char 0)` and a PNG as `'utf-8' codec can't decode
+    byte 0x89 in position 0: invalid start byte`, neither naming the call, the status, or
+    the fact that anything upstream was wrong.
+
+    Modelled on `raise_undecodable_body`, which covers the adjacent case, and copies three
+    of its properties deliberately:
+
+    - It names the status. The response arrived, which is more than `raise_transport_failed`
+      can claim, and the status is the fact a reader wants first.
+    - It advises neither retrying nor giving up. A maintenance page, an SSO interstitial and
+      an instance serving the wrong content type are indistinguishable here and are
+      transient on entirely different clocks; recommending either would send the caller to
+      hammer a dead instance or to abandon a live one.
+    - It quotes the decoder through `_reported` and the body not at all. The decoder's text
+      carries no body content -- `json`'s messages come from a fixed table plus a position,
+      `UnicodeDecodeError` adds one byte in hex -- while the body is unbounded
+      attacker-influenced text, which is why `_upstream_detail` already drops any error body
+      that is not Aleph's own `message` field rather than echoing it.
+
+    It says the arguments are not the cause because the failure mode being closed is a model
+    reading a bare decoder string and rewriting its arguments in reply. Saying only "this
+    failed" leaves that the default move.
+    """
+    err_cls = ResourceError if resource else ToolError
+    raise err_cls(
+        f"{context}: Aleph answered {status} but the body is not JSON ({_reported(exc)}). "
+        "The response arrived and its status was a success; what failed is the body. "
+        "Nothing about this call produced it -- the arguments are not the cause, and "
+        "changing them will not help. It is an upstream fault: a maintenance page, an SSO "
+        "or proxy interstitial in front of the instance, a body cut in transit, or a route "
+        "serving something other than the API. This server cannot tell those apart, so it "
+        "recommends neither retrying nor giving up. Nothing upstream can have changed "
+        "regardless: this server issues only read requests."
     ) from exc
 
 

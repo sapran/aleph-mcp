@@ -45,6 +45,7 @@ from .errors import (
     raise_too_large,
     raise_transport_failed,
     raise_undecodable_body,
+    raise_unparsable_body,
     raise_unreachable,
 )
 from .readonly import ReadOnlyViolation, read_only_hook
@@ -378,7 +379,21 @@ class Transport:
             attempts=spent,
             budget_spent=by_budget,
         )
-        data: Any = jsonlib.loads(body)
+        # Guarded, because both shapes this can fail with are `ValueError` subclasses and
+        # the tool seam used to translate that whole family: a 2xx serving an HTML
+        # maintenance page reached the model as `Expecting value: line 1 column 1 (char 0)`,
+        # in the shape reserved for a deliberate refusal. `body` is bytes, so `json.loads`
+        # runs `detect_encoding` and decodes before parsing -- non-UTF-8 bytes raise
+        # `UnicodeDecodeError`, a sibling of `JSONDecodeError` under `ValueError` rather
+        # than a subclass, which is why this catches the base class and not either leaf.
+        try:
+            data: Any = jsonlib.loads(body)
+        except ValueError as e:
+            raise_unparsable_body(e, context=context, status=resp.status_code, resource=resource)
+        # Only parsing is guarded, never shape. A bare array, string or number parsed fine
+        # and keeps its wrapper; whether an envelope should be required before the rows are
+        # trusted is a separate parked claim, and deciding it here would change what
+        # `scope.py` sees without saying so anywhere.
         if not isinstance(data, dict):
             return {"results": data}
         return data

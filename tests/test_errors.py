@@ -1,8 +1,18 @@
+import json
+import re
+from pathlib import Path
+
 import httpx
 import pytest
 from fastmcp.exceptions import ResourceError, ToolError
 
-from aleph_mcp.errors import raise_for_status, raise_unreachable
+import aleph_mcp
+from aleph_mcp.errors import (
+    Refusal,
+    raise_for_status,
+    raise_unparsable_body,
+    raise_unreachable,
+)
 
 
 def _resp(status: int, text: str = "") -> httpx.Response:
@@ -126,3 +136,80 @@ def test_the_transport_echo_is_capped_at_the_length_this_path_chose() -> None:
         raise_unreachable(RuntimeError("z" * 201), context="ctx", attempts=1)
     quoted = str(exc.value).split('untrusted transport text: "', 1)[1].split('"', 1)[0]
     assert quoted == "z" * 200 + "\u2026"
+
+
+# -- the refusal channel -------------------------------------------------------
+
+
+def test_a_refusal_is_still_a_value_error() -> None:
+    """`AlephClient` is importable as a library and its refusals have always been
+    `ValueError`. A caller with `except ValueError` around a client call must keep catching
+    them -- that break would show up as a crash in someone else's process rather than as a
+    red test in this one."""
+    assert issubclass(Refusal, ValueError)
+
+
+def test_a_decoder_value_error_is_not_a_refusal() -> None:
+    """The whole point of the type, stated as the property that failed before it existed.
+
+    `json.JSONDecodeError` and `UnicodeDecodeError` are `ValueError` subclasses, so a seam
+    selecting on `ValueError` could not tell either from a refusal this server chose to
+    make.
+    """
+    assert not isinstance(json.JSONDecodeError("Expecting value", "<html>", 0), Refusal)
+    assert not isinstance(UnicodeDecodeError("utf-8", b"\x89", 0, 1, "invalid"), Refusal)
+    assert not isinstance(ValueError("invalid literal for int()"), Refusal)
+
+
+@pytest.mark.parametrize("module", ["client.py", "scope.py"])
+def test_no_refusal_site_still_raises_a_bare_value_error(module: str) -> None:
+    """A refusal site added later copies its spelling from the ones beside it.
+
+    Nothing about `raise ValueError(...)` fails loudly once the seam stops translating it:
+    the refusal still reaches the caller, just prefixed by FastMCP and deleted entirely
+    under `mask_error_details`. A test that reads the source is the cheap way to catch the
+    copy before it ships, and these two modules are the only ones that refuse a *call* --
+    `config.py` validates at startup and `echo.py` guards its own literals.
+    """
+    source = (Path(aleph_mcp.__file__).parent / module).read_text()
+    bare = [
+        line.strip()
+        for line in source.splitlines()
+        if re.search(r"\b(raise|return) ValueError\(", line)
+    ]
+    assert bare == [], f"{module}: refusals are raised as `Refusal`, not `ValueError`: {bare}"
+
+
+def _unparsable(exc: Exception, *, resource: bool = False) -> str:
+    with pytest.raises(ResourceError if resource else ToolError) as excinfo:
+        raise_unparsable_body(exc, context="ctx", status=200, resource=resource)
+    return str(excinfo.value)
+
+
+def test_the_unparsable_body_refusal_names_the_context_and_the_status() -> None:
+    """A `200` that is not JSON used to reach the model as the decoder's bare string, which
+    names neither. The status is the first fact worth having and it is already in hand."""
+    message = _unparsable(json.JSONDecodeError("Expecting value", "<html>", 0))
+    assert message.startswith("ctx:")
+    assert "200" in message
+
+
+def test_the_unparsable_body_refusal_labels_the_decoder_text() -> None:
+    """The decoder's message is foreign text quoted to a model. `json` builds it from a
+    fixed table and echoes no input, and `UnicodeDecodeError` adds one byte in hex -- so
+    the label is applied by convention rather than against a known injection surface, which
+    is the cheaper of the two mistakes. Every other quoted upstream string carries it."""
+    message = _unparsable(json.JSONDecodeError("Expecting value", "<html>", 0))
+    assert 'untrusted transport text: "Expecting value: line 1 column 1 (char 0)"' in message
+
+
+def test_the_unparsable_body_refusal_takes_the_resource_flag() -> None:
+    assert _unparsable(ValueError("x"), resource=True).startswith("ctx:")
+
+
+def test_the_unparsable_body_refusal_is_not_itself_a_refusal() -> None:
+    """It is raised for an upstream fault, so it must not be catchable as this server's own
+    refusal -- and must not be a `ValueError` at all, which is how it reached the seam."""
+    with pytest.raises(ToolError) as exc:
+        raise_unparsable_body(ValueError("x"), context="ctx", status=200)
+    assert not isinstance(exc.value, ValueError)

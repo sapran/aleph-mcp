@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from aleph_mcp.errors import Refusal
 from aleph_mcp.scope import (
     ALL_COLLECTIONS,
     MAX_SCOPE_COLLECTIONS,
@@ -134,6 +135,39 @@ async def test_a_single_collection_is_refused_without_a_lookup(
     argument on the search tools uses that literal for every collection."""
     with pytest.raises(ValueError, match=fragment):
         await resolver().resolve_one(collection, context="get_collection")
+
+
+@pytest.mark.parametrize(
+    ("collection", "fragment"),
+    SCOPE_REFUSALS + ONE_COLLECTION_REFUSALS,
+    ids=[str(row[0]) for row in SCOPE_REFUSALS + ONE_COLLECTION_REFUSALS],
+)
+async def test_every_scope_refusal_carries_the_refusal_type(collection: Any, fragment: str) -> None:
+    """The `pytest.raises(ValueError)` above is now the weaker half of the contract.
+
+    It still holds -- `Refusal` subclasses `ValueError` so a library caller keeps catching
+    them -- but it no longer distinguishes a refusal this module chose to make from a
+    decoder failure that merely landed on the same base class. The tool seam translates the
+    subclass, so a site left bare reaches the model prefixed and is deleted under
+    `mask_error_details`.
+    """
+    call = (
+        resolver().resolve_scope(collection, context="search_entities")
+        if (collection, fragment) in SCOPE_REFUSALS
+        else resolver().resolve_one(collection, context="get_collection")
+    )
+    with pytest.raises(Refusal):
+        await call
+
+
+async def test_an_unusable_listing_is_refused_by_type_too() -> None:
+    """The two upstream-shape refusals are built by factory functions rather than raised
+    inline, which is the spelling most likely to be missed when the type changes."""
+    for answer in ({"total": 0, "results": []}, {"status": "error"}):
+        with pytest.raises(Refusal):
+            await resolver(FakeUpstream(answer=answer)).resolve_one(
+                "my-case", context="search_entities"
+            )
 
 
 def test_parse_needs_no_resolver_at_all() -> None:
