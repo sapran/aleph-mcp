@@ -221,6 +221,26 @@ Every tool SHALL translate an argument-validation failure into an MCP tool error
 
 Validation SHALL be anchored so that no trailing character escapes it, and SHALL reject an id that carries no addressable content. Every path segment interpolated from a caller-supplied value SHALL pass a validator before the request is constructed; no method may match an id inline and skip the shared check.
 
+A refusal this server makes on its own judgement SHALL be a distinct exception type, raised only at
+the sites that make such a refusal, and the tool and resource seams SHALL translate that type
+rather than a category of Python failure. Any other exception raised inside a tool or resource body
+SHALL NOT be presented to the caller as a refusal. The distinction the type draws is *authored
+rather than escaped* -- a message this server composed and meant the caller to read -- and NOT
+*caller-fixable*: several refusals correctly tell the caller the fault is upstream and that
+retrying will not help, and those must still reach the model unwrapped. What must never be
+presented as a refusal is an exception nobody here composed, because its text was written for a
+Python traceback rather than for the caller, and reading it as this server's considered answer
+directs the caller to rewrite arguments that were never the cause. Measured on
+`develop @ 7f9c139`, where the seam selected on `ValueError`: a `200` carrying an HTML maintenance
+page reached the model as `Expecting value: line 1 column 1 (char 0)` and a tool body calling
+`int()` on upstream text as `invalid literal for int() with base 10: 'not-a-number'` — both
+unprefixed and both surviving `mask_error_details`, which is the shape reserved for a deliberate
+refusal.
+
+The refusal type SHALL remain a subclass of `ValueError`, which is what this client's refusals have
+always been, so that a library caller catching `ValueError` around a client call keeps catching
+them.
+
 #### Scenario: Invalid entity id from a tool
 
 - **WHEN** a tool is called with an `entity_id` outside the accepted character set
@@ -253,6 +273,17 @@ Validation SHALL be anchored so that no trailing character escapes it, and SHALL
 - **WHEN** `get_collection` is called with a value that looks numeric but carries a trailing newline
 - **THEN** it raises a tool error from the shared collection-id validator
 - **AND** no request is sent to Aleph
+
+#### Scenario: A failure that is not a refusal is not dressed as one
+
+- **WHEN** a tool or resource body raises a `ValueError` that this server did not raise as a refusal — an `int()` on upstream text, a nested `json.loads`, a `datetime.fromisoformat`
+- **THEN** the seam does not translate it, so it reaches the caller as the server fault it is rather than as a message telling the caller to change its arguments
+
+#### Scenario: A refusal is catchable by type from a library caller
+
+- **WHEN** `AlephClient` is used directly and a call is refused for a bad argument
+- **THEN** the refusal is an instance of the dedicated refusal type
+- **AND** it is still an instance of `ValueError`
 
 ### Requirement: A search must name its collection scope
 
@@ -611,6 +642,18 @@ Measured against an earlier draft of this requirement: a `502` whose body contra
 part-way with a network diagnosis, the `502` appearing in neither. A failure reading a *successful*
 body is not covered by this: there the body is the answer.
 
+A *successful* response whose body is not JSON SHALL be refused the same way: as an upstream fault,
+naming the call context and the status that arrived, never as a caller refusal and never as the
+decoder's exception. Both failure shapes SHALL be covered — bytes that are not valid UTF-8 and
+valid text that is not JSON — because `json.loads` on bytes decodes first, so the two arrive as
+`UnicodeDecodeError` and `json.JSONDecodeError`, siblings rather than one subclassing the other.
+The decoder's own text SHALL be sanitised and labelled untrusted by the policy governing every
+other quoted upstream string, and the body itself SHALL NOT be quoted: it is unbounded
+attacker-influenced text, which is why an error body that is not JSON is already dropped rather
+than echoed. The refusal SHALL NOT advise either retrying or not retrying, because a maintenance
+page, an SSO interstitial and an instance serving a wrong content type are indistinguishable here
+and are transient on different clocks.
+
 #### Scenario: An unrecognised transport failure is still refused
 
 - **WHEN** any `httpx.RequestError` subclass is raised for a request
@@ -630,6 +673,18 @@ body is not covered by this: there the body is the answer.
 - **THEN** the caller receives a tool error naming the call context, never the decoding exception
 - **AND** the quoted decoder text is labelled untrusted and capped by the upstream-error policy
 - **AND** the message states that the response arrived and that the fault is in the body
+
+#### Scenario: A successful response that is not JSON is an upstream fault
+
+- **WHEN** a `200` carries a body that is not JSON — an HTML maintenance page, a proxy
+  interstitial, a truncated body, or bytes that are not valid UTF-8 at all — and a tool or resource
+  is called
+- **THEN** the caller receives a tool or resource error naming the call context and the status that
+  arrived, never the decoder exception and never a bare decoder string
+- **AND** the message states that the fault is upstream and that the call's arguments are not the
+  cause
+- **AND** the quoted decoder text is labelled untrusted and capped by the upstream-error policy,
+  and no part of the body is quoted
 
 ### Requirement: A refusal states whether the request can have been delivered
 

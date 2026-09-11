@@ -37,6 +37,7 @@ from types import MappingProxyType
 from typing import Any, Final
 
 from .echo import COLLECTION_ECHO, render
+from .errors import Refusal
 
 # Query parameters this module emits. Deliberately narrower than `transport.Query` — every
 # collection filter value is a numeric id, already a string — so the module that owns the
@@ -71,7 +72,7 @@ _MATCH_FILTER: Final = "collection_ids"
 def check_collection_id(value: object) -> str:
     text = str(value)
     if not _COLLECTION_ID.fullmatch(text):
-        raise ValueError(
+        raise Refusal(
             # `value` is caller input on every path but one: the id read out of a
             # foreign_id lookup is upstream text, so it is bounded under the shared rule
             # in echo.py — an unbounded echo is a write primitive into the model's
@@ -97,7 +98,7 @@ def _is_numeric_form(text: str) -> bool:
     return not text.strip("0123456789 \t\r\n")
 
 
-def _no_such_collection(text: str) -> ValueError:
+def _no_such_collection(text: str) -> Refusal:
     """The diagnosis that is about the caller: the listing was read and held no match.
 
     Reached from two places, and only the first is unambiguously the upstream saying no:
@@ -108,13 +109,13 @@ def _no_such_collection(text: str) -> ValueError:
     It keeps this message anyway, because that is the refusal the spec already fixed for
     it and separating the two is its own change, not this one.
     """
-    return ValueError(
+    return Refusal(
         f"no collection with foreign_id {text!r} is readable with this API key; "
         "call list_collections to see what is available"
     )
 
 
-def _unusable_listing(text: str, shape: str) -> ValueError:
+def _unusable_listing(text: str, shape: str) -> Refusal:
     """The upstream answered, but not with something this server can read as a listing.
 
     `shape` names a type, never a value: the body is upstream text of unknown length and
@@ -131,7 +132,7 @@ def _unusable_listing(text: str, shape: str) -> ValueError:
     retries reads as licence for the rest — the same reason `server.py` spells out
     "retrying will not help" on the marker path.
     """
-    return ValueError(
+    return Refusal(
         f"resolving the collection foreign_id {text!r} could not be completed: the "
         f"collection listing {shape}. This is an upstream malfunction rather than a "
         "problem with the arguments: nothing about this call can change it and retrying "
@@ -154,12 +155,12 @@ def parse_collection(collection: str | int) -> str:
     # can read and `limit=1` takes it. That is a silently misdirected search, which is
     # the exact failure this argument exists to prevent.
     if not text.strip():
-        raise ValueError(
+        raise Refusal(
             "collection must not be empty: pass a numeric collection id, a foreign_id, "
             f"or {ALL_COLLECTIONS!r} to search every readable collection"
         )
     if text == ALL_COLLECTIONS:
-        raise ValueError(
+        raise Refusal(
             f"this tool addresses exactly one collection, so {ALL_COLLECTIONS!r} is not "
             "meaningful here; it is the all-collections literal for search_entities and "
             "match_entity only. Pass one collection id or foreign_id."
@@ -190,7 +191,7 @@ def parse_scope(collection: str | int | list[str | int]) -> tuple[str, ...] | No
         return (str(collection),)
 
     if not collection:
-        raise ValueError(
+        raise Refusal(
             "collection must name at least one collection, or the literal '*' to search "
             "every readable collection"
         )
@@ -203,7 +204,7 @@ def parse_scope(collection: str | int | list[str | int]) -> tuple[str, ...] | No
     if all(c == ALL_COLLECTIONS for c in collection):
         return None
     if ALL_COLLECTIONS in collection:
-        raise ValueError(
+        raise Refusal(
             "collection='*' searches every readable collection and cannot be combined "
             "with named collections; pass either '*' or the ids you want"
         )
@@ -214,7 +215,7 @@ def parse_scope(collection: str | int | list[str | int]) -> tuple[str, ...] | No
     # Stringified first, so a list mixing 874 and "874" dedups as one spelling.
     unique = tuple(dict.fromkeys(str(c) for c in collection))
     if len(unique) > MAX_SCOPE_COLLECTIONS:
-        raise ValueError(
+        raise Refusal(
             f"collection may name at most {MAX_SCOPE_COLLECTIONS} collections in one "
             f"call (got {len(unique)}). Each one may cost a lookup, so query the slices "
             "separately, or pass '*' and filter the hits by collection_id."
@@ -263,9 +264,16 @@ class CollectionScope:
         building the type wrongly. `parse_scope` cannot produce it, and this is what keeps
         that true rather than merely stated. `echo.Policy` refuses a fail-open cap the same
         way and for the same reason.
+
+        Deliberately NOT a `Refusal`, and the comparison to `echo.Policy` is why: both fire
+        on this repo building its own type wrongly, which is a defect and must keep reading
+        as one. A `Refusal` here would reach the model unprefixed as this server's considered
+        answer, telling it to "pass None for the all-collections scope" -- a parameter no
+        tool has and no caller can reach. Review caught this retyped along with the genuine
+        refusals around it.
         """
         if self.collections is not None and not self.collections:
-            raise ValueError(
+            raise ValueError(  # not a refusal: a defect guard, see this method's docstring
                 "CollectionScope: an empty scope names no collection and would search "
                 "every readable one; pass None for the all-collections scope"
             )
@@ -383,11 +391,11 @@ class CollectionResolver:
             # the transport's wrapper for a JSON body that is not an object — a bare
             # string, number or array becomes `{"results": <body>}`. An HTML interstitial
             # is NOT one of them, however much it looks like the likely case: the
-            # transport's `jsonlib.loads` raises on it first, and that unguarded decode is
-            # its own parked claim rather than something this branch can catch. Indexing a
-            # truthy non-list used to raise KeyError or TypeError, which no tool's
-            # `except ValueError` translates, so it left this server as a server fault
-            # rather than a refusal.
+            # transport's `jsonlib.loads` raises on it first, and the transport refuses it
+            # there as an upstream fault naming the status, so it never reaches this branch.
+            # Indexing a truthy non-list used to raise KeyError or TypeError, which the tool
+            # seam does not translate, so it left this server as a server fault rather than
+            # a refusal.
             raise _unusable_listing(
                 text, f"carried results as {type(results).__name__}, not a list"
             )
@@ -432,7 +440,7 @@ class CollectionResolver:
         resolved: list[ResolvedCollection] = []
         for item in spellings:
             if resolved and self._monotonic() >= deadline:
-                raise ValueError(
+                raise Refusal(
                     f"resolving the collection scope exceeded this call's "
                     f"{budget}s budget after {len(resolved)} of "
                     f"{len(spellings)} collections. Pass numeric ids, which need no lookup, or "

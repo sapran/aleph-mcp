@@ -9,6 +9,7 @@ from fastmcp.exceptions import ResourceError, ToolError
 
 from .client import MAX_EXPAND, MAX_PAGE, AlephClient, find_marker
 from .config import Settings
+from .errors import Refusal
 
 INSTRUCTIONS = f"""
 Read-only access to an Aleph instance (OCCRP investigative data platform).
@@ -80,10 +81,22 @@ def _refusing[**P, R](
 ) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
     """Build the decorator that translates a client refusal into one MCP error type.
 
-    The client raises ValueError for every refusal it makes itself, and that message is
+    The client raises `Refusal` for every refusal it makes itself, and that message is
     the part worth reading — it names the limit and the value that broke it. Left alone
     it still reaches the model, but wrapped in FastMCP's own "Error calling tool ..."
     text, which reads as a server fault rather than as an answer.
+
+    The type is what is selected on, and it is deliberately narrower than what it replaced.
+    This arm caught `ValueError`, which Python raises for argument validation, for
+    `int("abc")`, for `json.loads` on an HTML page and for `bytes.decode` on non-UTF-8
+    alike — so it was selecting on a category of Python failure rather than on a decision
+    this server made. Because it wraps the whole function body, where the arms it replaced
+    wrapped only the `await client.X(...)` call, an in-body `int()` was relabelled as this
+    server's considered judgement. Under `Refusal` such a failure reaches the caller
+    prefixed, and is erased entirely by `mask_error_details`. That is the intended outcome:
+    it is a defect in this server, the prefix is how FastMCP says so, and the alternative —
+    a message that reads as a refusal — spends the model's turns rewriting arguments that
+    were never the cause.
 
     functools.wraps is load-bearing here, not tidiness: FastMCP builds each tool's
     description from __doc__ and its input schema from the signature, so the wrapper has
@@ -95,7 +108,7 @@ def _refusing[**P, R](
         async def guarded(*args: P.args, **kwargs: P.kwargs) -> R:
             try:
                 result = await fn(*args, **kwargs)
-            except ValueError as e:
+            except Refusal as e:
                 raise error(str(e)) from e
             # The last point at which the reply is still ours. A shaping marker here means
             # the client built a reply and never passed it through its own seam, which is a

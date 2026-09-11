@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from aleph_mcp.errors import Refusal
 from aleph_mcp.scope import (
     ALL_COLLECTIONS,
     MAX_SCOPE_COLLECTIONS,
@@ -136,6 +137,48 @@ async def test_a_single_collection_is_refused_without_a_lookup(
         await resolver().resolve_one(collection, context="get_collection")
 
 
+# The method to drive is carried in the row rather than looked up from the value, because
+# two `ONE_COLLECTION_REFUSALS` rows are byte-identical to `SCOPE_REFUSALS` rows: a
+# membership test routed both to `resolve_scope` and ran them as duplicates. Harmless today
+# -- `resolve_scope` delegates to `resolve_one` -- but it is a dispatch that mis-routes
+# silently the moment either table changes, which is the shape of bug this file exists to
+# catch elsewhere.
+_TYPED_REFUSALS = [("resolve_scope", *row) for row in SCOPE_REFUSALS] + [
+    ("resolve_one", *row) for row in ONE_COLLECTION_REFUSALS
+]
+
+
+@pytest.mark.parametrize(
+    ("method", "collection", "fragment"),
+    _TYPED_REFUSALS,
+    ids=[f"{row[0]}-{row[1]}" for row in _TYPED_REFUSALS],
+)
+async def test_every_scope_refusal_carries_the_refusal_type(
+    method: str, collection: Any, fragment: str
+) -> None:
+    """The `pytest.raises(ValueError)` above is now the weaker half of the contract.
+
+    It still holds -- `Refusal` subclasses `ValueError` so a library caller keeps catching
+    them -- but it no longer distinguishes a refusal this module chose to make from a
+    decoder failure that merely landed on the same base class. The tool seam translates the
+    subclass, so a site left bare reaches the model prefixed and is deleted under
+    `mask_error_details`.
+    """
+    context = "search_entities" if method == "resolve_scope" else "get_collection"
+    with pytest.raises(Refusal):
+        await getattr(resolver(), method)(collection, context=context)
+
+
+async def test_an_unusable_listing_is_refused_by_type_too() -> None:
+    """The two upstream-shape refusals are built by factory functions rather than raised
+    inline, which is the spelling most likely to be missed when the type changes."""
+    for answer in ({"total": 0, "results": []}, {"status": "error"}):
+        with pytest.raises(Refusal):
+            await resolver(FakeUpstream(answer=answer)).resolve_one(
+                "my-case", context="search_entities"
+            )
+
+
 def test_parse_needs_no_resolver_at_all() -> None:
     """The parse half is a pure function, callable with nothing constructed around it.
 
@@ -199,6 +242,26 @@ def test_a_scope_of_no_collections_cannot_be_constructed() -> None:
     """
     with pytest.raises(ValueError, match="names no collection"):
         CollectionScope(())
+
+
+def test_the_empty_scope_guard_is_a_defect_not_a_refusal() -> None:
+    """The one site in this module that must stay a bare `ValueError`.
+
+    It fires only when this repo builds the type wrongly -- `parse_scope` cannot produce an
+    empty tuple -- which makes it a defect guard, the same shape as `echo.Policy`'s fail-open
+    cap that the refusal retype deliberately left alone. As a `Refusal` it would reach the
+    model unprefixed as this server's considered answer, telling it to "pass None for the
+    all-collections scope": a parameter no tool exposes and no caller can reach.
+
+    Review found it retyped along with the ten genuine refusals beside it, and mutation then
+    showed nothing caught that -- the test above passes for any `ValueError` subclass. This
+    is the assertion that was missing.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        CollectionScope(())
+    assert not isinstance(excinfo.value, Refusal), (
+        "a guard against this repo's own bug must not read as a refusal the caller can act on"
+    )
 
 
 # -- resolve: the lookup, the dedup, the cache, the deadline -------------------
@@ -287,7 +350,7 @@ async def test_the_resolution_deadline_stops_a_scope_that_runs_long() -> None:
     def clock() -> float:
         return ticks.pop(0) if len(ticks) > 1 else ticks[0]
 
-    with pytest.raises(ValueError, match=r"exceeded this call's 30.0s budget after 1 of 2"):
+    with pytest.raises(Refusal, match=r"exceeded this call's 30.0s budget after 1 of 2"):
         await resolver(upstream, monotonic=clock).resolve_scope(
             ["first", "second"], context="search_entities"
         )
@@ -313,7 +376,7 @@ async def test_the_budget_is_read_at_call_time_not_captured() -> None:
 
     resolve = CollectionResolver(lookup=upstream, timeout_secs=lambda: budget[0], monotonic=clock)
     budget[0] = 45.0
-    with pytest.raises(ValueError, match=r"exceeded this call's 45.0s budget"):
+    with pytest.raises(Refusal, match=r"exceeded this call's 45.0s budget"):
         await resolve.resolve_scope(["first", "second"], context="search_entities")
 
 

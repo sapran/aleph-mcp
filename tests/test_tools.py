@@ -1,4 +1,5 @@
 import inspect
+import json
 from collections.abc import AsyncIterator, Callable, Coroutine
 from typing import Any
 
@@ -12,6 +13,7 @@ from fastmcp.exceptions import ResourceError, ToolError
 
 from aleph_mcp.client import AlephClient, _Ent
 from aleph_mcp.config import Settings
+from aleph_mcp.errors import Refusal
 from aleph_mcp.server import _as_resource_error, _as_tool_error, build_server
 from tests.conftest import assert_model_not_fetched
 from tests.shapes import (
@@ -505,26 +507,52 @@ async def test_the_seam_forwards_the_message_and_keeps_the_cause(
 
     @translate
     async def refuses() -> dict[str, Any]:
-        raise ValueError("limit must be between 0 and 100")
+        raise Refusal("limit must be between 0 and 100")
 
     with pytest.raises(expected) as excinfo:
         await refuses()
     assert str(excinfo.value) == "limit must be between 0 and 100"
-    assert isinstance(excinfo.value.__cause__, ValueError)
+    assert isinstance(excinfo.value.__cause__, Refusal)
 
 
-async def test_the_seam_leaves_a_non_refusal_alone() -> None:
-    """A ValueError is the client saying no. Anything else is a fault, and dressing it up
+@pytest.mark.parametrize(
+    "defect",
+    [
+        RuntimeError("upstream fell over"),
+        ValueError("invalid literal for int() with base 10: 'not-a-number'"),
+        json.JSONDecodeError("Expecting value", "<html>", 0),
+        UnicodeDecodeError("utf-8", b"\x89PNG", 0, 1, "invalid start byte"),
+    ],
+    ids=["runtime-error", "in-body-int", "nested-json-loads", "non-utf8-decode"],
+)
+async def test_the_seam_leaves_a_non_refusal_alone(defect: Exception) -> None:
+    """A `Refusal` is the client saying no. Anything else is a fault, and dressing it up
     as a refusal would tell the model to fix its arguments and retry against a broken
-    upstream. This matters more than it looks: the translation wraps the whole function
-    body, so it is the only thing keeping a future in-body error from being relabelled."""
+    upstream.
+
+    Three of these four are `ValueError` subclasses, and that is the point. The seam used
+    to select on `ValueError`, which Python hands out for argument validation, for `int()`,
+    for `json.loads` and for `bytes.decode` alike -- so it could not tell a refusal this
+    server chose to make from any of them. Measured on `develop @ 7f9c139`: a tool body
+    calling `int()` on upstream text reached the caller as `invalid literal for int() with
+    base 10: 'not-a-number'`, unprefixed and surviving `mask_error_details`, which is the
+    shape reserved for a deliberate refusal.
+
+    It matters more than it looks: the translation wraps the whole function body, where the
+    arms it replaced wrapped only the `await client.X(...)` call.
+    """
 
     @_as_tool_error
     async def breaks() -> dict[str, Any]:
-        raise RuntimeError("upstream fell over")
+        raise defect
 
-    with pytest.raises(RuntimeError, match="upstream fell over"):
+    with pytest.raises(type(defect)) as excinfo:
         await breaks()
+    # The load-bearing assertion is the `raises(type(defect))` above: reverting the seam to
+    # `except ValueError` turns three of these four into a `ToolError`. Identity is the
+    # weaker half -- only a seam that caught and rebuilt the exception would break it -- and
+    # it is here to say the original object arrives, cause and traceback intact.
+    assert excinfo.value is defect
 
 
 def test_the_seam_carries_what_fastmcp_reads() -> None:
@@ -606,3 +634,37 @@ async def test_get_entity_text_end_to_end(server: FastMCP, respx_mock: respx.Moc
     assert out["returned_chars"] == 10
     assert out["total_chars"] == len(joined)
     assert out["truncated"] is True
+
+
+async def test_a_maintenance_page_on_200_is_not_answered_as_a_bad_argument(
+    server: FastMCP, respx_mock: respx.MockRouter
+) -> None:
+    """The measurement from the implementation-notes entry, re-run through the shipped path.
+
+    Everything above reaches the seam directly, which is the only way to pin a message
+    exactly -- but the defect was reported as what a *model* receives, and FastMCP rewrites
+    that. So this one goes through `MCPClient`: an instance answering `200` with an HTML
+    maintenance page used to produce `Expecting value: line 1 column 1 (char 0)` here,
+    which is a sentence about the caller's JSON, not about the instance being down.
+    """
+    respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(
+            200,
+            content=b"<!DOCTYPE html><html><body><h1>Scheduled maintenance</h1></body></html>",
+            headers={"content-type": "text/html"},
+        )
+    )
+    async with MCPClient(server) as mcp:
+        with pytest.raises(ToolError) as excinfo:
+            await mcp.call_tool("list_collections", {})
+    message = str(excinfo.value)
+    assert message.startswith("list_collections:"), (
+        f"the refusal must name the tool the caller called: {message!r}"
+    )
+    assert "not JSON" in message and "upstream" in message, message
+    assert "Scheduled maintenance" not in message, "the body is never quoted"
+    # The decoder text is still worth having -- "Expecting value: line 1 column 1" and
+    # "Unterminated string starting at: line 1 column 13" separate a page that is not JSON
+    # at all from a body cut mid-transfer -- but only behind the label, never as the whole
+    # message.
+    assert "untrusted transport text" in message, message

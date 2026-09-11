@@ -31,8 +31,8 @@ from aleph_mcp.client import (
     slim_entity,
 )
 from aleph_mcp.echo import SCHEMA_NAME
-from aleph_mcp.errors import ResponseTooLarge
-from aleph_mcp.transport import MAX_RESPONSE_BYTES
+from aleph_mcp.errors import Refusal, ResponseTooLarge
+from aleph_mcp.transport import MAX_RESPONSE_BYTES, Transport
 from tests.conftest import assert_model_not_fetched
 from tests.shapes import (
     BLOB_PROPS,
@@ -2198,7 +2198,10 @@ async def test_a_metadata_read_timeout_degrades_rather_than_failing(
     assert out["caption"] == "Acme"
 
 
-@pytest.mark.parametrize("defect", [AttributeError("no such attribute"), TypeError("bad call")])
+@pytest.mark.parametrize(
+    "defect",
+    [AttributeError("no such attribute"), TypeError("bad call"), ValueError("bad argument")],
+)
 async def test_a_defect_in_this_module_is_not_swallowed_as_a_slow_model(
     client: AlephClient,
     respx_mock: respx.MockRouter,
@@ -2211,6 +2214,12 @@ async def test_a_defect_in_this_module_is_not_swallowed_as_a_slow_model(
     rather than surfacing a bug in this file, and nothing would ever say so. Measured:
     appending `except Exception: return None` after the narrow arms left the suite green at
     380 passed, so the narrowing was load-bearing and unpinned at the same time.
+
+    `ValueError` is on this list because it used to be on the *caught* list. It was there to
+    absorb an unguarded `jsonlib.loads` in the transport -- a body that is not JSON -- and
+    the transport now refuses that itself, as a `ResourceError` the arm above already
+    catches. What is left under `ValueError` here is what the other two are: a bug in this
+    file, and the most likely one, since argument handling is what raises it.
     """
 
     async def broken(self: AlephClient) -> dict[str, Any]:
@@ -2223,6 +2232,42 @@ async def test_a_defect_in_this_module_is_not_swallowed_as_a_slow_model(
 
     with pytest.raises(type(defect)):
         await client.get_entity(entity_id="e1")
+
+
+async def test_a_value_error_below_get_model_is_neither_degraded_nor_memoised(
+    client: AlephClient, respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`get_model`'s memo tuple and `_schemata`'s degradation arm both dropped `ValueError`,
+    and each needs its own evidence.
+
+    The test above patches `get_model` itself, so it reaches only the degradation arm. This
+    one leaves `get_model` in place and breaks the transport under it, which is where the
+    absorbed fault used to come from: an unguarded `jsonlib.loads`. Now that the transport
+    guards its own decode, a `ValueError` arriving from below is a defect, and a defect must
+    do two things -- reach the caller, and *not* be remembered as an upstream fault for the
+    whole failure window, which would hide it behind a degraded caption on every later call.
+    """
+    real = Transport.request
+    attempts: list[str] = []
+
+    async def broken_metadata(self: Transport, method: str, path: str, **kwargs: Any) -> Any:
+        if path == "/api/2/metadata":
+            attempts.append(path)
+            raise ValueError("a defect below get_model, not an upstream fault")
+        return await real(self, method, path, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Transport, "request", broken_metadata)
+    respx_mock.get("/api/2/entities/e1").mock(
+        return_value=httpx.Response(200, json=_probe_entity())
+    )
+
+    for _ in range(2):
+        with pytest.raises(ValueError, match="a defect below get_model"):
+            await client.get_entity(entity_id="e1")
+    assert len(attempts) == 2, (
+        "a defect was memoised as a model failure: the second call never re-tried it, so "
+        "the bug is invisible for the whole window"
+    )
 
 
 # A `model` that is not an object, and the cost of a metadata route that stays broken.
@@ -2459,3 +2504,75 @@ async def test_the_derived_caption_note_composes_with_the_endpoint_s_own(
 
     assert "EVERY COLLECTION" in out["_note"], "the endpoint's own note must survive"
     assert _FALLBACK_CAPTION_NOTE in out["_note"]
+
+
+# -- refusals are a type, not a category of Python failure ---------------------
+
+_REFUSING_CALLS: tuple[tuple[str, str, dict[str, Any]], ...] = (
+    ("an id outside the charset", "get_entity", {"entity_id": "e 1"}),
+    ("an id addressing nothing", "get_entity", {"entity_id": ".."}),
+    ("a negative offset", "list_collections", {"offset": -1}),
+    ("a collection id with a trailing newline", "get_collection", {"collection": "42\n"}),
+    ("an over-window page", "search_entities", {"collection": "874", "offset": MAX_PAGE}),
+    ("an oversized facet", "search_entities", {"collection": "874", "facet_size": 0}),
+    # Both reachable: the tool signature declares `limit: int = 20` and `offset: int = 0`
+    # with no `ge=` constraint, so a negative value passes pydantic and arrives here. Added
+    # after review mutated exactly these two sites to a bare `ValueError` and measured the
+    # full suite green at 605 passed -- `ERROR_CASES` covers one refusal per tool and this
+    # table had picked three others for `search_entities`.
+    ("a negative search limit", "search_entities", {"collection": "874", "limit": -1}),
+    ("a negative search offset", "search_entities", {"collection": "874", "offset": -1}),
+    ("an over-limit expansion", "expand_entity", {"entity_id": "e1", "limit": MAX_EXPAND + 1}),
+    ("a text slice out of range", "get_entity_text", {"entity_id": "d1", "offset": -1}),
+    ("a sample with no schema", "match_entity", {"sample": {}, "collection": "874"}),
+    (
+        "a collection filter in the wrong argument",
+        "search_entities",
+        {"collection": "874", "filters": {"collection_id": "874"}},
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("label", "method", "kwargs"), _REFUSING_CALLS, ids=[row[0] for row in _REFUSING_CALLS]
+)
+async def test_every_client_refusal_carries_the_refusal_type(
+    client: AlephClient,
+    respx_mock: respx.MockRouter,
+    label: str,
+    method: str,
+    kwargs: dict[str, Any],
+) -> None:
+    """What the tool seam now selects on.
+
+    The `pytest.raises(ValueError)` assertions throughout this file still hold and still
+    matter -- `Refusal` subclasses `ValueError`, which is what keeps a library caller's
+    `except ValueError` working -- but they cannot tell a refusal this client chose to make
+    from a `json.loads` or an `int()` that happened to land on the same base class. That is
+    the confusion the seam was built on: measured on `develop @ 7f9c139`, a `200` serving an
+    HTML page reached the model as `Expecting value: line 1 column 1 (char 0)`, dressed as a
+    refusal because `JSONDecodeError` is a `ValueError`.
+    """
+    wire = respx_mock.route().mock(return_value=httpx.Response(200, json={}))
+    with pytest.raises(Refusal):
+        await getattr(client, method)(**kwargs)
+    assert wire.call_count == 0, f"{label}: a local refusal must cost no upstream request"
+    # The catch-all above cannot see `/api/2/metadata`: respx matches in registration order
+    # and the fixture registers that route first, so `call_count == 0` is silent about the
+    # one request the shaping seam makes on its own. Review demonstrated the blindness --
+    # a call to `get_model` leaves the catch-all at zero while the named route reports
+    # `called`. This is the assertion `conftest` ships for exactly that trap.
+    assert_model_not_fetched(respx_mock)
+
+
+async def test_an_unknown_schema_name_is_refused_by_type(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """The one refusal that needs the instance model first, so it cannot join the table
+    above -- and the one that reaches the caller through a *resource*, where an untranslated
+    exception is masked rather than merely prefixed."""
+    respx_mock.get("/api/2/metadata").mock(
+        return_value=httpx.Response(200, json={"model": {"schemata": {"Person": {}}}})
+    )
+    with pytest.raises(Refusal):
+        await client.get_schema(name="Persson")
