@@ -31,6 +31,7 @@ from aleph_mcp.client import (
     slim_entity,
 )
 from aleph_mcp.echo import SCHEMA_NAME
+from aleph_mcp.errors import ResponseTooLarge
 from aleph_mcp.transport import MAX_RESPONSE_BYTES
 from tests.conftest import assert_model_not_fetched
 from tests.shapes import (
@@ -446,6 +447,34 @@ async def test_a_page_still_over_after_every_shrink_is_refused(
     # A model told only to "narrow the request" satisfies that at limit=19 and pays the
     # whole loop again, so the refusal has to name the pages already tried.
     assert f"from {asked[0]} down to {asked[-1]} rows" in str(excinfo.value)
+
+
+async def test_a_failing_status_over_the_ceiling_is_not_re_asked_smaller(
+    client: AlephClient, respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    """The shrink loop re-asks because the *page* was too big. A 502 is not a paging
+    problem, and re-asking one spends a whole transport retry budget per attempt.
+
+    Measured on `develop @ 37931ea`: a 502 carrying a 25 MiB body cost **16 upstream
+    requests** for one `search_entities` call -- four reductions, each paying four transport
+    retries because 502 is in `_RETRY_STATUS` -- and answered with the ceiling refusal,
+    telling the model to narrow a query that was never the problem.
+
+    The request count is the assertion that matters. A refusal naming the status would still
+    be reachable with the loop intact, and this is the half that costs the instance.
+    """
+    oversized = b'{"padding": "' + b"z" * (MAX_RESPONSE_BYTES + 1) + b'"}'
+    route = respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(
+            502, content=oversized, headers={"content-type": "application/json"}
+        )
+    )
+    with pytest.raises(ToolError, match="unexpected HTTP 502") as excinfo:
+        await client.search_entities(collection="874", q="a", limit=20)
+    assert not isinstance(excinfo.value, ResponseTooLarge)
+    asked = [int(c.request.url.params["limit"]) for c in route.calls]
+    assert len(asked) == 4, f"one transport retry budget, not one per reduction: {asked}"
+    assert set(asked) == {20}, f"a failing status must not be re-asked smaller: {asked}"
 
 
 async def test_a_reduced_page_that_served_no_rows_offers_nothing_to_resume(

@@ -10,20 +10,52 @@ from .echo import UPSTREAM_ERROR, render
 from .readonly import ReadOnlyViolation
 
 
+def _budget_clause(attempts: int) -> str:
+    """Why a retryable status stopped being retried, when the clock rather than the count
+    ended it.
+
+    The connect half of the transport has always named its cost -- `raise_unreachable` says
+    "after N attempts" precisely so a caller can tell one unlucky hop from an instance that
+    is down. The response half became able to end the loop the same way when it started
+    charging its round trips, and a refusal that does not say so is indistinguishable from
+    one that spent every attempt: measured, a route answering `503` after 30 seconds against
+    a 25-second budget made one attempt and produced a message byte-identical to the
+    four-attempt case.
+    """
+    return (
+        f" Stopped after {attempts} attempt{'' if attempts == 1 else 's'}, by this call's "
+        "wall-clock budget rather than by its retry count: ALEPH_MCP_TIMEOUT_SECS was spent "
+        "on the round trips and the waits between them, so a slow instance is answered with "
+        "fewer attempts than ALEPH_MCP_MAX_RETRIES allows. Raise the timeout if the instance "
+        "is merely slow."
+    )
+
+
 def raise_for_status(
-    resp: httpx.Response, *, context: str, resource: bool = False, body: bytes | None = None
+    resp: httpx.Response,
+    *,
+    context: str,
+    resource: bool = False,
+    body: bytes | None = None,
+    attempts: int = 0,
+    budget_spent: bool = False,
 ) -> None:
     """Convert non-2xx HTTP responses to MCP errors. No-op for 2xx.
 
     `context` is a short label (tool name or resource URI) included in the message so
     the model can correlate the failure with the call site, and — where Aleph's status
     codes are ambiguous — the message names the likely cause and the next move.
+
+    `budget_spent` says the caller stopped retrying a retryable status because the
+    wall-clock budget ran out with attempts still allowed. Only the two branches a
+    retryable status can reach report it; the rest cannot be told this and do not ask.
     """
     if resp.is_success:
         return
 
     err_cls = ResourceError if resource else ToolError
     detail = _upstream_detail(resp, body)
+    budget = _budget_clause(attempts) if budget_spent else ""
 
     if resp.status_code == 401:
         raise err_cls(
@@ -44,12 +76,17 @@ def raise_for_status(
     if resp.status_code == 400:
         raise err_cls(f"{context}: bad request (400).{detail}")
     if resp.status_code == 429:
+        # "retries are exhausted" is a claim about the retry count, so it is withheld
+        # exactly when the count was not what ran out. Saying it anyway told the model to
+        # slow down and widen its query -- a confident wrong diagnosis -- when the real
+        # cause was a slow instance spending a wall-clock budget.
+        exhausted = "" if budget_spent else " and retries are exhausted"
         raise err_cls(
-            f"{context}: rate limited (429) and retries are exhausted. "
+            f"{context}: rate limited (429){exhausted}.{budget} "
             "Aleph limits anonymous callers to ~30 requests/minute; slow down or widen "
             "each query instead of issuing many narrow ones."
         )
-    raise err_cls(f"{context}: unexpected HTTP {resp.status_code}.{detail}")
+    raise err_cls(f"{context}: unexpected HTTP {resp.status_code}.{detail}{budget}")
 
 
 def raise_read_only(exc: ReadOnlyViolation, *, context: str, resource: bool = False) -> NoReturn:
@@ -131,6 +168,63 @@ def raise_tls_untrusted(exc: Exception, *, context: str, resource: bool = False)
     ) from exc
 
 
+def raise_redirect_loop(
+    exc: Exception, *, context: str, hops: int, resource: bool = False
+) -> NoReturn:
+    """Refuse a redirect chain that did not reach a final response inside this server's bound.
+
+    Every hop was answered, so this must not claim the request was undelivered -- but unlike
+    `raise_transport_failed` it is not a maybe in either direction: nothing was lost, there
+    simply is no final response to return.
+
+    Not retried, for the reason a TLS trust failure is not: the chain is what this host
+    serves for this path, so the next attempt walks the identical hops. The bound is named
+    because it is this server's rather than httpx's default of 20, and an operator reading
+    the refusal has no other way to know which number was hit.
+    """
+    err_cls = ResourceError if resource else ToolError
+    raise err_cls(
+        f"{context}: the redirect chain from this host did not end within {hops} hops "
+        f"({_reported(exc)}). Every hop answered, so nothing was lost -- there is simply no "
+        "final response to return. This is deterministic: the same chain is served on every "
+        "attempt, so it was not retried and retrying will not help. A loop here is an "
+        "instance or proxy misconfiguration, typically an SSO interstitial or a "
+        "canonical-host redirect that points back at itself. Every hop was still matched "
+        "against this server's read-only allowlist before it was sent."
+    ) from exc
+
+
+def raise_undecodable_body(exc: Exception, *, context: str, resource: bool = False) -> NoReturn:
+    """Refuse a response whose body does not honour the `Content-Encoding` it declares.
+
+    The status and headers arrived, which is more than `raise_transport_failed` can say, so
+    this says it. What it deliberately does *not* say is where the fault lies or whether
+    retrying helps, because neither is decidable here: httpx's decoder raises on any chunk,
+    not only the first, so an instance with a broken encoder and a body corrupted in transit
+    by something on the network path arrive identically. Review measured the second case --
+    a valid gzip body cut at its midpoint -- against an earlier draft of this message that
+    excluded the network path and called the fault deterministic, and it was wrong on both
+    counts.
+
+    The decoder text is quoted through the same sanitising helper as every other foreign
+    string. zlib's messages come from a fixed C string table and echo no input bytes: six
+    hostile bodies -- injection text, `ESC` sequences, a truncated gzip header, a body of
+    every byte value -- produced three distinct messages between them, none carrying any
+    input. So the label is applied by convention here rather than against a known injection
+    surface, which is the cheaper of the two mistakes to make.
+    """
+    err_cls = ResourceError if resource else ToolError
+    raise err_cls(
+        f"{context}: the response arrived but its body could not be decoded "
+        f"({_reported(exc)}). Its status and headers were received; what failed is the body, "
+        "which does not match the Content-Encoding it declares. This server cannot tell an "
+        "instance that encodes its responses wrongly -- where retrying will fail the same "
+        "way -- from a body corrupted in transit, where it may well succeed, so it does not "
+        "advise either. Nothing upstream can have changed regardless: this server issues "
+        "only read requests."
+    ) from exc
+
+
 def raise_transport_failed(exc: Exception, *, context: str, resource: bool = False) -> NoReturn:
     """Refuse a transport failure that may have happened after the request was delivered.
 
@@ -139,8 +233,12 @@ def raise_transport_failed(exc: Exception, *, context: str, resource: bool = Fal
     out of the retried set -- so the message says so, and leans on the guarantee that does
     hold regardless: every request this server issues is a read.
 
-    Also the bucket an unrecognised `TransportError` subclass lands in. That is deliberate:
-    the conservative claim is correct for a failure nobody has classified yet.
+    Also the bucket an unrecognised `httpx.RequestError` subclass lands in -- the whole
+    family the transport catches, not only its `TransportError` half. That is deliberate: the
+    conservative claim is correct for a failure nobody has classified yet. The closing
+    sentence names `TransportError` shapes because those are the ones that reach it today;
+    it is offered as a reading of the class name, not as an exhaustive list, and a new
+    sibling arriving here is the signal to classify it rather than to widen that sentence.
     """
     err_cls = ResourceError if resource else ToolError
     raise err_cls(
@@ -228,9 +326,11 @@ def raise_unusable_model(model: object, *, context: str, resource: bool = False)
 
 
 # An error body worth quoting is never large. Parsing before checking would let the error
-# path allocate without bound, which is the one path the transport ceiling cannot cover:
-# the status is known before the body is.
-_MAX_ERROR_BODY_BYTES = 64 * 1024
+# path allocate without bound, and the check below cannot be the only one: it runs on a body
+# already in memory. The transport streams a failing response against this same constant --
+# it is imported there, so the two cannot drift -- which is what makes it bound the
+# allocation rather than only the quote.
+MAX_ERROR_BODY_BYTES = 64 * 1024
 
 
 def _upstream_detail(resp: httpx.Response, body: bytes | None) -> str:
@@ -244,7 +344,7 @@ def _upstream_detail(resp: httpx.Response, body: bytes | None) -> str:
     if "json" not in resp.headers.get("content-type", "").lower():
         return ""
     raw = resp.content if body is None else body
-    if len(raw) > _MAX_ERROR_BODY_BYTES:
+    if len(raw) > MAX_ERROR_BODY_BYTES:
         return ""
     try:
         payload = json.loads(raw)
