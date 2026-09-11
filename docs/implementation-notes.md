@@ -9,9 +9,9 @@ survived, as fourteen entries. Entries are ordered by the work plan below; the n
 priority order, not an id. Item 1 of that plan — the metadata path — was closed by
 `harden-metadata-path` on 2026-09-10, and item 1 of the renumbered plan — transport failure
 classification — by `classify-transport-failures` the same day. Item 1 again — the ontology echo
-— was closed by `bound-ontology-echo` on 2026-09-11, which recorded one new claim under echo.py's
-enforcement gaps in passing. The plan and the sections below are renumbered after each, so
-twenty-eight claims across eleven entries remain.
+— was closed by `bound-ontology-echo` on 2026-09-11, which parked two new claims in passing: one
+under echo.py's enforcement gaps, and one as its own entry. The plan and the sections below are
+renumbered after each, so twenty-nine claims across twelve entries remain.
 
 ## Work plan
 
@@ -25,7 +25,8 @@ twenty-eight claims across eleven entries remain.
 8. Give `get_entity_text` a derived caption.
 9. Close the tests that cannot fail — four checks that certify nothing.
 10. Decide the private-sibling references — the publication deadline has already passed.
-11. Correct three pieces of stale prose (Tier 0).
+11. Guard `model["schemata"]`'s shape — a non-dict raises AttributeError at the caller.
+12. Correct three pieces of stale prose (Tier 0).
 ---
 
 ## 1. The response path is neither charged nor accounted
@@ -280,7 +281,24 @@ private; `acordia` is also named across the specs, the archived changes and
 contributor cannot see. The declaration is deliberate and documented, so removing it is a design
 decision, not a cleanup.
 
-## 11. Three pieces of stale prose (Tier 0)
+## 11. The ontology tools trust `model["schemata"]`'s shape
+
+**A non-dict `schemata` inside a valid `model` reaches the caller as an AttributeError.**
+`client.py`'s `list_schemata` does `model.get("schemata") or {}` and then `.items()` on it, and
+`get_schema` does `.get(name)` on the same value, neither guarded. Measured on both `develop` and
+the `bound-ontology-echo` branch: `{"model": {"schemata": ["Person"]}}` raises
+`AttributeError: 'list' object has no attribute 'items'` from `list_schemata` and
+`'list' object has no attribute 'get'` from `get_schema`, reported to the model as a defect in
+this server. `_schemata` already guards the same value for the caption path
+(`return schemata if isinstance(schemata, dict) else None`); the two ontology tools do not.
+
+This is the defect `harden-metadata-path` closed for `model`, one level down — that change refuses
+a truthy non-dict `model` via `raise_unusable_model`, and the spec requirement it added is about
+the model, not its `schemata` member. Found while implementing `bound-ontology-echo` on
+2026-09-11 and parked: pre-existing, unrelated to that change's scope, and the fix is a refusal
+shape decision (reuse `raise_unusable_model`, or degrade) rather than a one-liner.
+
+## 12. Three pieces of stale prose (Tier 0)
 
 - **`openspec/config.yaml`'s layout paragraph is three modules stale**
   (`openspec/config.yaml:23-26`). It lists `server.py`, `client.py`, `readonly.py`, `config.py` and
