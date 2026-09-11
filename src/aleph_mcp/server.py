@@ -404,7 +404,13 @@ def build_server(settings: Settings) -> tuple[FastMCP, AlephClient]:
 
     @mcp.resource("aleph://schemata", mime_type="application/json")
     async def schemata_resource() -> dict[str, Any]:
-        """Every FollowTheMoney schema this instance knows, split into matchable and edge types."""
+        """The FollowTheMoney schemata this instance declares, split into matchable and edge types.
+
+        The names are the instance's, not this server's, and `_provenance` says so. `count` is
+        the instance's own total; each list is bounded, so on an instance declaring far more
+        than a normal ontology a list may be shorter than `count` and `_omitted_schemata` then
+        reports how many names that list dropped.
+        """
         return await client.list_schemata()
 
     @mcp.resource("aleph://schema/{name}", mime_type="application/json")
