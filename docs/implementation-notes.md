@@ -12,51 +12,27 @@ classification — by `classify-transport-failures` the same day. Item 1 again �
 — was closed by `bound-ontology-echo` on 2026-09-11, which parked two new claims in passing: one
 under echo.py's enforcement gaps, and one as its own entry. Item 1 once more — the response path —
 was closed by `charge-and-account-response-path` on 2026-09-11, parking two new claims in passing:
-one under the stale-prose entry and one as its own entry, both found by review of that change. The
-plan and the sections below are renumbered after each, so twenty-seven claims across twelve entries
-remain.
+one under the stale-prose entry and one as its own entry, both found by review of that change. Item
+1 again — the scope resolver's upstream shapes — was closed by `guard-scope-resolver-shapes` on
+2026-09-11, parking nothing new. The plan and the sections below are renumbered after each, so
+twenty-four claims across eleven entries remain.
 
 ## Work plan
 
-1. Guard the scope resolver's upstream shapes — untranslated errors, confident wrong diagnosis.
-2. Give refusals a type — a dead upstream is reported as a bad argument.
-3. Make the licence gate able to fail — it passes with the project's own LICENSE deleted.
-4. Answer the entity-shaped spec question — four copy-through slots, one decision, five xfails.
-5. Extend the tool path's guarantees to resources — a `resource()` factory and a wider walk.
-6. Close echo.py's enforcement gaps — an inline policy escapes both guards.
-7. Give `get_entity_text` a derived caption.
-8. Close the tests that cannot fail — four checks that certify nothing.
-9. Decide the private-sibling references — the publication deadline has already passed.
-10. Guard `model["schemata"]`'s shape — a non-dict raises AttributeError at the caller.
-11. Name the dropped error body — a real complaint reads as no complaint at all.
-12. Correct four pieces of stale prose (Tier 0).
+1. Give refusals a type — a dead upstream is reported as a bad argument.
+2. Make the licence gate able to fail — it passes with the project's own LICENSE deleted.
+3. Answer the entity-shaped spec question — four copy-through slots, one decision, five xfails.
+4. Extend the tool path's guarantees to resources — a `resource()` factory and a wider walk.
+5. Close echo.py's enforcement gaps — an inline policy escapes both guards.
+6. Give `get_entity_text` a derived caption.
+7. Close the tests that cannot fail — four checks that certify nothing.
+8. Decide the private-sibling references — the publication deadline has already passed.
+9. Guard `model["schemata"]`'s shape — a non-dict raises AttributeError at the caller.
+10. Name the dropped error body — a real complaint reads as no complaint at all.
+11. Correct four pieces of stale prose (Tier 0).
 ---
 
-## 1. The scope resolver mishandles three upstream shapes
-
-All three in `scope.py`, adjacent lines, one change.
-
-**A non-list `results` from the collection listing escapes the `except ValueError` seam.**
-`scope.py:312`. The `isinstance(results[0], dict)` guard covers a body that arrives as a list or a
-scalar, because `Transport.request` wraps a non-dict body as `{"results": <body>}` — but an Aleph
-*dict* body whose own `results` key is not a list reaches `results[0]` on a truthy non-list.
-Measured on both `develop` and the T5 branch, byte-identical: `{"results": {"a": 1}}` raises
-`KeyError`, `{"results": 5}` and `{"results": true}` raise `TypeError`. `server.py` translates
-`ValueError` only, so these reach the model untranslated rather than as a legible refusal.
-
-**"no collection with foreign_id X" absorbs an upstream malfunction.** `scope.py:321-325`. Any
-lookup payload without a usable `results[0]` — including `{"status": "error"}` with no `results` key
-at all, and `{"results": [null]}` — is reported to the model as an authorisation-or-existence
-problem naming `list_collections`. A proxy, an SSO interstitial or an unfamiliar Aleph version
-therefore produces a confident wrong diagnosis and a dead-end next step. Fail-closed, so no wrong
-rows are returned.
-
-**A single-element `["*"]` is refused with the wrong reason.** `scope.py:150` fires the mixed-scope
-message — "cannot be combined with named collections" — for a list that names no other collection.
-The scalar `"*"` is accepted at `scope.py:141`. Unchanged from `develop`, untested anywhere.
-Correcting it changes a refusal message.
-
-## 2. Bare `ValueError` is the wrong refusal channel, in both directions
+## 1. Bare `ValueError` is the wrong refusal channel, in both directions
 
 Both halves close with one type: a dedicated `Refusal(ValueError)` raised at the client's own
 refusal sites and caught in place of bare `ValueError` — the pattern `errors.py` already sets for
@@ -75,7 +51,7 @@ replaced wrapped only the `await client.X(...)` call. Equivalent today — every
 forwarding call — but a future in-body `int()`, `datetime.fromisoformat()` or nested `json.loads`
 would be relabelled as a client refusal with nothing to catch it.
 
-## 3. The licence gate cannot fail
+## 2. The licence gate cannot fail
 
 Both in `.github/workflows/ci.yml`, the `build` job's licence step; one change. (The SIGPIPE race
 in the same step is fixed — see Retired.)
@@ -101,7 +77,7 @@ which is the first thing anyone debugging a packaging regression wants. Also, tw
 `unzip -p`) — unreachable in CI, where the checkout is fresh and `uv build` is the only writer, but
 it bites anyone running the step locally against a dirty `dist/`.
 
-## 4. Four aggregation slots are copied rather than rebuilt — one spec question
+## 3. Four aggregation slots are copied rather than rebuilt — one spec question
 
 `get_profile.entities`, `_slim_entityset.entities`, a tag row's `value`, and
 `_slim_collection(full=True).statistics` are one decision about what counts as entity-shaped, not
@@ -144,7 +120,7 @@ fixing any of them forces this note to be closed.
   above: upstream text would then land in `_reply`'s existing-note composition. Fix is to key the
   short-circuit on something upstream cannot set. Pre-existing and outside that change's scope.
 
-## 5. The resource path lacks the tool path's guarantees
+## 4. The resource path lacks the tool path's guarantees
 
 Three findings, closed by a ~4-line local `resource(uri, **kw)` factory mirroring `tool`, plus a
 wider walk in `find_marker`.
@@ -167,7 +143,7 @@ value and lists by item only. No client method builds a tuple, a set or a non-st
 reply, so nothing reaches those branches today, and the markers' own serialisation refusal still
 fires there — the outcome degrades to the pre-T1-FIX-2 message rather than leaking.
 
-## 6. echo.py's three enforcement gaps
+## 5. echo.py's three enforcement gaps
 
 **A policy built inline at a call site escapes both guards.** `test_every_policy_has_a_cap_row`
 (`tests/test_echo.py:59`) enumerates `vars(echo)`, so it sees only module-level policies declared in
@@ -196,14 +172,14 @@ and the content is what was asked for — than to a refusal. Closing it means de
 whole record is `PROPERTY_VALUE`-shaped data with a `_provenance` label, or whether a schema
 description deserves its own bound. A behaviour change to a resource's output either way.
 
-## 7. `get_entity_text` derives no caption
+## 6. `get_entity_text` derives no caption
 
 `client.py:1188` reads `entity.get("caption")` straight off the payload, where every slimmed path
 calls `derive_caption`. Live Aleph sends a null caption, so this is the one tool that can return
 `caption: null` for an entity the other tools would have captioned. Found during T1; fixing it
 changes a tool's output and so is a behaviour change, not a refactor.
 
-## 8. Four checks that certify nothing
+## 7. Four checks that certify nothing
 
 One purely-test change closes all four.
 
@@ -214,7 +190,7 @@ One purely-test change closes all four.
   `test_every_entity_returning_method_shapes_its_reply` covers the same path with a discriminating
   model. Delete or strengthen.
 - **The `MAX_SCOPE_COLLECTIONS` boundary is unpinned.** Only `MAX + 1` is tested
-  (`tests/test_scope.py:91`); changing `>` to `>=` at `scope.py:161` — which would refuse a
+  (`tests/test_scope.py:91`); changing `>` to `>=` at `scope.py:210` — which would refuse a
   legitimate ten-collection scope — passes the whole suite. Related and also unpinned: the dedup runs
   *before* the bound, so eleven spellings collapsing to ten are accepted. One row in the existing
   parametrised table.
@@ -226,7 +202,7 @@ One purely-test change closes all four.
   `classify-transport-failures`: a TLS refusal now names that setting to the operator, so the
   message is wrong in a new way if the setting never reaches the client.
 
-## 9. A public repo still points at private siblings
+## 8. A public repo still points at private siblings
 
 The publication this was to be decided before has happened — 0.3.0 shipped from a public repo on
 2026-09-10 — so this is now a live defect rather than a pending decision.
@@ -245,7 +221,7 @@ private; `acordia` is also named across the specs, the archived changes and
 contributor cannot see. The declaration is deliberate and documented, so removing it is a design
 decision, not a cleanup.
 
-## 10. The ontology tools trust `model["schemata"]`'s shape
+## 9. The ontology tools trust `model["schemata"]`'s shape
 
 **A non-dict `schemata` inside a valid `model` reaches the caller as an AttributeError.**
 `client.py`'s `list_schemata` does `model.get("schemata") or {}` and then `.items()` on it, and
@@ -271,7 +247,7 @@ not reach this value. Found while implementing `bound-ontology-echo` on 2026-09-
 pre-existing on `develop`, unrelated to that change's scope, and the fix is a refusal-shape
 decision (reuse `raise_unusable_model`, or degrade) rather than a one-liner.
 
-## 11. An oversized error body is dropped without saying so
+## 10. An oversized error body is dropped without saying so
 
 **`_upstream_detail` discards a JSON error body over 64 KiB and the refusal reads as if none
 arrived.** `errors.py`. For a `400` the quoted `message` is the only actionable content the refusal
@@ -288,16 +264,18 @@ an oversized body and `b""` from an empty one are the same value today) and appe
 the refusal naming the drop. Parsing a truncated prefix is not the fix; the reasoning against that
 is written at `Transport._read_error_body`.
 
-## 12. Four pieces of stale prose (Tier 0)
+## 11. Four pieces of stale prose (Tier 0)
 
 - **`openspec/config.yaml`'s layout paragraph is three modules stale**
   (`openspec/config.yaml:23-26`). It lists `server.py`, `client.py`, `readonly.py`, `config.py` and
   `errors.py` and names none of `echo.py` (T2), `scope.py` (T5) or `transport.py` (T4). No spec
   assertion depends on it.
-- **Comment drift naming the structure T3 deleted.** `scope.py:320`,
-  `tests/test_collection_scope.py:339` and `:454` still say "no tool's `except ValueError`
+- **Comment drift naming the structure T3 deleted.** `scope.py:375`,
+  `tests/test_collection_scope.py:364` and `:486` still say "no tool's `except ValueError`
   translates". The claims stay true of the single seam, but send a reader looking for per-tool arms
-  that no longer exist.
+  that no longer exist. Line references refreshed after `guard-scope-resolver-shapes` moved them;
+  the `scope.py` instance is the same sentence, rewritten in place by that change and still using
+  the plural.
 - **`transport.py:89` names a `_classify` function that does not exist, and counts the wrong
   family.** The comment above `_CONNECT_ERRORS` calls it "one bucket of the classification in
   `_classify`"; the classification is an inline dispatch in `Transport.request` and there is no
