@@ -41,9 +41,12 @@
 ## 6. Land
 
 - [x] 6.1 `openspec validate finish-scope-row-shape --strict`.
-- [ ] 6.2 Sync the delta into `openspec/specs/mcp-tool-surface/spec.md` and archive the change.
-- [ ] 6.3 Close entry 1 in `docs/implementation-notes.md`, renumber the work plan, and park anything found in passing.
-- [ ] 6.4 Open the PR; run `code-reviewer`, `silent-failure-hunter` and `pr-test-analyzer` on the diff; fix or dismiss each finding; merge on green CI.
+- [x] 6.2 Sync the delta into `openspec/specs/mcp-tool-surface/spec.md` and archive the change.
+- [x] 6.3 Close entry 1 in `docs/implementation-notes.md`, renumber the work plan, and park anything found in passing.
+- [~] 6.4 Open the PR; run `code-reviewer`, `silent-failure-hunter` and `pr-test-analyzer` on the diff; fix or dismiss each finding; merge on green CI.
+      PR #27 is open and CI is 5/5 green. The three reviewer agents were NOT run: this
+      session is configured not to spawn subagents unless asked. The PR is therefore left
+      unmerged — an unreviewed PR is never merged, so the review is the remaining step.
 
 ## Verification record
 
