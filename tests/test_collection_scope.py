@@ -397,10 +397,47 @@ async def test_a_non_dict_listing_row_is_a_tool_error_not_an_attribute_error(
     collection exists or the key may read it, and this test asserted that wrong diagnosis
     until `guard-scope-resolver-shapes` separated the two.
     """
+    entities = respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json=raw_search_payload(raw_entity(), total=1))
+    )
     respx_mock.get("/api/2/collections").mock(return_value=httpx.Response(200, json=["x"]))
     with pytest.raises(ValueError, match="upstream malfunction") as excinfo:
         await client.search_entities(collection="my-case", q="acme")
     assert "list_collections" not in str(excinfo.value), str(excinfo.value)
+    assert entities.call_count == 0, "a scope that could not be resolved must not be searched"
+    assert client._scope.cached == {}, "an unreadable listing must cache nothing"
+
+
+@pytest.mark.parametrize(
+    ("label", "body", "clause"),
+    [
+        ("no-results-key", {"status": "error"}, "carried no results at all"),
+        ("non-list-results", "not-a-listing", "carried results as str, not a list"),
+    ],
+    ids=["no-results-key", "non-list-results"],
+)
+async def test_an_unreadable_listing_is_refused_over_the_real_transport(
+    client: AlephClient, respx_mock: respx.MockRouter, label: str, body: object, clause: str
+) -> None:
+    """The other two malfunction branches, over HTTP rather than an in-process callable.
+
+    Worth the duplication because the reachability argument is transport-dependent: the
+    module tests hand-build `{"results": 5}`, and only `Transport.request` decides whether
+    such a body can actually arrive. The `non-list-results` row is a bare JSON string,
+    which is the wrapper's doing — the resolver never sees the body this server was sent.
+    """
+    entities = respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json=raw_search_payload(raw_entity(), total=1))
+    )
+    respx_mock.get("/api/2/collections").mock(return_value=httpx.Response(200, json=body))
+    with pytest.raises(ValueError) as excinfo:
+        await client.search_entities(collection="my-case", q="acme")
+    message = str(excinfo.value)
+    assert clause in message, message
+    assert "upstream malfunction" in message, message
+    assert "list_collections" not in message, message
+    assert entities.call_count == 0, "a scope that could not be resolved must not be searched"
+    assert client._scope.cached == {}, "an unreadable listing must cache nothing"
 
 
 async def test_paging_is_refused_before_a_foreign_id_costs_a_lookup(

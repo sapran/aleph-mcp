@@ -88,6 +88,11 @@ SCOPE_REFUSALS: list[tuple[Any, str]] = [
     ([""], "must not be empty"),
     ([ALL_COLLECTIONS, "874"], "cannot be combined"),
     (["874", ALL_COLLECTIONS], "cannot be combined"),
+    # A repeated literal beside a named collection is still a mixed scope. Without these,
+    # counting the literal instead of testing every element passes -- and then `"*"`
+    # survives into the resolved scope as a foreign_id, costing a lookup before failing.
+    ([ALL_COLLECTIONS, ALL_COLLECTIONS, "874"], "cannot be combined"),
+    (["874", ALL_COLLECTIONS, ALL_COLLECTIONS], "cannot be combined"),
     (list(range(MAX_SCOPE_COLLECTIONS + 1)), f"at most {MAX_SCOPE_COLLECTIONS} collections"),
     ("42\n", "expected a numeric collection id"),
     ("874 874", "expected a numeric collection id"),
@@ -337,15 +342,23 @@ async def test_an_upstream_id_echoed_into_a_refusal_is_bounded_and_escaped() -> 
 # bool rows are reachable two ways: Aleph's own dict carrying that value, and a JSON body
 # that is not an object at all. An HTML interstitial is deliberately not among them — it
 # never reaches this module, because the transport's decode raises on it first.
+# The falsy rows are the ones that matter most and are the easiest to leave out: `{}`,
+# `""`, `0` and `False` are all non-lists that the old `results or []` read as "empty", so
+# a branch order that checks emptiness before type sends every one of them back to the
+# missing-collection diagnosis while every truthy row still passes.
 UNUSABLE_LISTINGS: list[tuple[str, dict[str, Any]]] = [
     ("no-results-key", {"status": "error"}),
     ("null-results", {"results": None}),
     ("mapping-results", {"results": {"a": 1}}),
+    ("empty-mapping-results", {"results": {}}),
     ("number-results", {"results": 5}),
+    ("zero-results", {"results": 0}),
     ("bool-results", {"results": True}),
+    ("false-results", {"results": False}),
     ("string-results", {"results": "not-a-listing"}),
+    ("empty-string-results", {"results": ""}),
     ("null-first-row", {"results": [None]}),
-    ("string-first-row", {"results": ["my-case"]}),
+    ("string-first-row", {"results": ["some-other-value"]}),
 ]
 
 
@@ -379,42 +392,58 @@ async def test_an_unreadable_listing_is_refused_and_not_called_a_missing_collect
         f"an upstream malfunction is not an authorisation problem: {message}"
     )
     assert "my-case" in message, f"the refusal must name what was being resolved: {message}"
+    assert "upstream malfunction" in message, (
+        f"every malfunction branch must carry the same framing: {message}"
+    )
     assert resolve.cached == {}, "a listing that could not be read must resolve nothing"
 
 
-# Both malfunction branches — a non-list `results`, and a first row that is not a record —
-# with a different type on each row, so a refusal that hard-coded one type name rather than
-# reading it fails here instead of passing on the row that happens to agree.
-SHAPE_TYPE_NAMES: list[tuple[dict[str, Any], str]] = [
-    ({"results": {"a": 1}}, "dict"),
-    ({"results": 5}, "int"),
-    ({"results": True}, "bool"),
-    ({"results": "not-a-listing"}, "str"),
-    ({"results": [None]}, "NoneType"),
-    ({"results": [5]}, "int"),
-    ({"results": ["my-case"]}, "str"),
+# All three malfunction branches, each with the whole clause it must produce rather than
+# just the type name inside it. Asserting the bare token is what let a reworded message
+# disarm this test once already: "str" lives inside "upstream" and "int" inside
+# "endpoint", so `"str" in message` passed whatever the branch actually said. A clause is
+# immune to the surrounding prose changing, which is the only way that regression stays
+# closed.
+SHAPE_CLAUSES: list[tuple[str, dict[str, Any], str]] = [
+    ("no-results-key", {"status": "error"}, "carried no results at all"),
+    ("null-results", {"results": None}, "carried no results at all"),
+    ("mapping-results", {"results": {"a": 1}}, "carried results as dict, not a list"),
+    ("empty-mapping-results", {"results": {}}, "carried results as dict, not a list"),
+    ("number-results", {"results": 5}, "carried results as int, not a list"),
+    ("zero-results", {"results": 0}, "carried results as int, not a list"),
+    ("bool-results", {"results": True}, "carried results as bool, not a list"),
+    ("string-results", {"results": "x"}, "carried results as str, not a list"),
+    ("null-first-row", {"results": [None]}, "carried a first row as NoneType, not a record"),
+    ("int-first-row", {"results": [5]}, "carried a first row as int, not a record"),
+    ("string-first-row", {"results": ["x"]}, "carried a first row as str, not a record"),
 ]
 
 
 @pytest.mark.parametrize(
-    ("listing", "type_name"),
-    SHAPE_TYPE_NAMES,
-    ids=[f"{row[1]}-{i}" for i, row in enumerate(SHAPE_TYPE_NAMES)],
+    ("listing", "clause"),
+    [(row[1], row[2]) for row in SHAPE_CLAUSES],
+    ids=[row[0] for row in SHAPE_CLAUSES],
 )
-async def test_an_unreadable_listing_names_the_type_it_received(
-    listing: dict[str, Any], type_name: str
+async def test_an_unreadable_listing_names_the_shape_it_received(
+    listing: dict[str, Any], clause: str
 ) -> None:
-    """The type is what identifies the malfunction, and it is read rather than assumed.
+    """The shape is what identifies the malfunction, and it is read rather than assumed.
 
-    A refusal saying only "unusable" leaves the operator with nothing to grep a proxy log
-    for; `str` says "something answered with a page", `dict` says "an object where a list
-    belongs". Both branches are covered because each formats its own message.
+    A refusal saying only "unusable" tells an operator nothing about which of the three
+    things went wrong; `results as dict` says "an object where a list belongs", `a first
+    row as NoneType` says "the list is there but its first entry is null". All three
+    branches format their own message, so all three are pinned here.
+
+    The whole clause, not the type name inside it. `"str" in message` was satisfied by
+    "up**str**eam" and `"int"` by "end**point**", so those assertions passed whatever the
+    branch actually emitted — and a reworded message is exactly what turned them vacuous
+    the first time.
     """
     upstream = FakeUpstream(answer=listing)
     with pytest.raises(ValueError) as excinfo:
         await resolver(upstream).resolve_one("my-case", context="search_entities")
     message = str(excinfo.value)
-    assert type_name in message, f"the refusal must name the type received ({type_name}): {message}"
+    assert clause in message, f"the refusal must say {clause!r}: {message}"
 
 
 @pytest.mark.parametrize(
@@ -433,12 +462,18 @@ async def test_an_unreadable_listing_never_echoes_the_upstream_body(
     branches: they build their messages separately, so one can grow an echo the other
     does not have.
     """
-    body = "<html>" + "\x1b" + "A" * 5000 + "</html>"
+    # The sentinel sits at offset 0, not after a prefix. With it further in, an echo of
+    # the first few characters cleared every assertion here -- no "AAAA", no control
+    # character, still under the cap -- while leaking the head of the body.
+    body = "SENTINEL" + "\x1b" + "A" * 5000 + "</html>"
     upstream = FakeUpstream(answer=wrap(body))
     with pytest.raises(ValueError) as excinfo:
         await resolver(upstream).resolve_one("my-case", context="search_entities")
     message = str(excinfo.value)
-    assert "str" in message, f"the refusal must name the type received: {message}"
+    assert "not a list" in message or "not a record" in message, (
+        f"the refusal must still name the shape: {message}"
+    )
+    assert "SENTINEL" not in message, f"the head of the upstream body was echoed: {message}"
     assert "AAAA" not in message, f"the upstream body must not be echoed: {message[:200]}"
     assert "\x1b" not in message, "a raw control character reached a model-visible message"
     assert len(message) < 500, f"an upstream-shaped refusal must stay bounded: {len(message)}"

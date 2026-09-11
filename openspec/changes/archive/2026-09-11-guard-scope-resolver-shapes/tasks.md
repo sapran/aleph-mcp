@@ -110,3 +110,32 @@ the shapes this change's spec enumerates, and all four fail closed.
 
 **Re-verified after the fixes.** 541 passed; 16 of 16 mutations caught, including a new one for
 the `match_entity` spelling; `ruff` and `mypy` clean; `openspec validate` clean.
+
+### Second review round: eight surviving mutations
+
+The test analyzer ran its own mutation pass and found **eight mutations the suite did not catch**.
+The sharpest was self-inflicted: the reworded refusal from the first round added the words
+"up**str**eam" and "end**point**", so `assert "str" in message` and `assert "int" in message`
+became true of every message regardless of what the branch emitted. The verification record above
+claimed that mutation was caught, and it had been — the rewording silently disarmed it. This is
+the "assertions that cannot fail" failure mode arriving through prose, not through code.
+
+| survivor | why it survived | closed by |
+|---|---|---|
+| emptiness checked before type | every fixture row was a *truthy* non-list, so `{}`, `""`, `0`, `False` were untested | four falsy rows in `UNUSABLE_LISTINGS` |
+| hard-coded type name, first-row branch | two of its three rows were tautologies after the rewording | assert the whole clause, not the token |
+| hard-coded type name, non-list branch | same | same |
+| absent-`results` shape string emptied | nothing asserted `"carried no results at all"` | `SHAPE_CLAUSES` covers all three branches |
+| absent-`results` reports another branch's text | same | same |
+| absent-`results` branch deleted | same | same |
+| six-character body echo, non-list branch | the sentinel sat at offset 6, behind `"<html>"` | sentinel at offset 0, asserted absent |
+| six-character body echo, first-row branch | same | same |
+| `["*", "*", "874"]` accepted | no fixture repeated the literal beside a name | two rows in `SCOPE_REFUSALS` |
+
+Also added, for coverage the analyzer showed was absent rather than wrong: end-to-end respx tests
+for the absent-`results` and non-list-`results` branches, which had only been exercised through
+the in-process lookup — and the reachability argument for those shapes is transport-dependent.
+The existing bare-array e2e test now also asserts nothing was searched and nothing cached.
+
+**Re-verified again.** 553 passed, 31 skipped, 5 xfailed. **25 of 25 mutations caught**, the
+original 16 plus all nine the analyzer demonstrated surviving. `ruff` and `mypy` clean.
