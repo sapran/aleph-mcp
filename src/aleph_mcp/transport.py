@@ -30,11 +30,14 @@ from fastmcp.exceptions import ResourceError, ToolError
 
 from .config import Settings
 from .errors import (
+    MAX_ERROR_BODY_BYTES,
     raise_for_status,
     raise_read_only,
+    raise_redirect_loop,
     raise_tls_untrusted,
     raise_too_large,
     raise_transport_failed,
+    raise_undecodable_body,
     raise_unreachable,
 )
 from .readonly import ReadOnlyViolation, read_only_hook
@@ -42,9 +45,25 @@ from .readonly import ReadOnlyViolation, read_only_hook
 # A ceiling on the body this server will accept. Enforced while the response is streamed,
 # so it bounds the allocation rather than describing it after the fact — httpx decodes
 # Content-Encoding as it iterates, so a gzip bomb is refused at the same threshold as a
-# plain body. The error path has its own, much smaller bound in errors.py, because there
-# the status is known before the body is.
+# plain body.
+#
+# It governs a *successful* body only, because it is a ceiling on what is decoded into the
+# model's context and a failing body is never decoded into anything. A non-2xx is streamed
+# against `MAX_ERROR_BODY_BYTES` instead — errors.py quotes at most a `message` out of it
+# and drops any body over that bound before parsing, so the smaller bound is the real one
+# and enforcing it here is what makes it bound the allocation too.
 MAX_RESPONSE_BYTES = 25 * 1024 * 1024
+
+# How many redirect hops one call may follow. httpx's own default is 20, which is a
+# reasonable number for a general-purpose client and a poor one for a server that also
+# retries: measured, an instance answering 302 with a Location back to the same path cost
+# 21 upstream requests for a single tool call. The legitimate chains this server has met
+# are one hop — Aleph's canonical-host redirect; the profile 302, which is not followed at
+# all — so five leaves room for a reverse proxy that canonicalises as well.
+#
+# This is a bound on how far a chain is followed, never on what may be followed: every hop
+# is matched against readonly.py's allowlist before it is sent, whatever this number is.
+MAX_REDIRECTS = 5
 
 # The connect phase gets its own, much shorter ceiling than the rest of the request. A
 # handshake that takes a minute will not produce a useful answer, and the retry loop has
@@ -150,6 +169,7 @@ class Transport:
             ),
             verify=settings.verify_tls,
             follow_redirects=True,
+            max_redirects=MAX_REDIRECTS,
             event_hooks={"request": [read_only_hook(settings.host)]},
         )
 
@@ -194,6 +214,18 @@ class Transport:
                         delivered = True
                         if on_redirect is not None and resp.is_redirect:
                             return on_redirect(resp)
+                        # The round trip is spend in the same sense a failed connect is, and
+                        # it is charged in the same place: before the retry decision, so a
+                        # slow answer both shortens its own backoff and can exhaust the
+                        # budget on the spot. Measured with only the backoff charged: a route
+                        # answering 503 after ten seconds cost four attempts and 47 seconds
+                        # against a 25-second budget.
+                        #
+                        # What is charged is the time to the headers. On a retry the body is
+                        # never read -- the stream context exits and discards it -- and on
+                        # the give-up path below the loop breaks immediately after, so there
+                        # is no later charge to miss.
+                        budget -= self._monotonic() - started
                         # A zero delay still retries; only an exhausted budget stops the loop.
                         give_up = (
                             resp.status_code not in _RETRY_STATUS
@@ -202,11 +234,9 @@ class Transport:
                         )
                         delay = 0.0 if give_up else min(_retry_delay(resp, attempt), budget)
                         if give_up:
-                            body = await self._read_bounded(
-                                resp, context=context, resource=resource
-                            )
+                            body = await self._read_body(resp, context=context, resource=resource)
                             break
-                except (httpx.TransportError, ssl.SSLError) as e:
+                except (httpx.RequestError, ssl.SSLError) as e:
                     # `ssl.SSLError` is caught alongside because it is *not* an
                     # `httpx.TransportError`: measured, a `BAD_RECORD_MAC` reached the model
                     # as `Error calling tool 'list_collections': [SSL: BAD_RECORD_MAC] ...`,
@@ -258,6 +288,26 @@ class Transport:
                     # something that is not a trust problem. Only a failure before the headers
                     # arrived can carry a *trust* verdict; after them, a TLS fault is a broken
                     # connection to a response that may already have been served.
+                    # Two certainties first, because the axis below them deals in maybes.
+                    # Both are `httpx.RequestError` siblings of `TransportError` rather than
+                    # members, which is why they escaped the seam entirely until the clause
+                    # above widened: measured, a redirect loop reached the model as
+                    # `Exceeded maximum allowed redirects.` and a body contradicting its own
+                    # Content-Encoding as a raw zlib sentence, neither labelled, neither
+                    # naming the call.
+                    if isinstance(e, httpx.TooManyRedirects):
+                        # Every hop was answered, so this is not the undelivered bucket --
+                        # and not the possibly-delivered one either: nothing was lost, there
+                        # is just no final response. Not retried, because the next attempt
+                        # walks the identical chain.
+                        raise_redirect_loop(
+                            e, context=context, hops=MAX_REDIRECTS, resource=resource
+                        )
+                    if isinstance(e, httpx.DecodingError):
+                        # Raised while the body is iterated, so the response arrived in full.
+                        # Not retried for the same reason: an instance encoding its responses
+                        # wrongly does so on every attempt.
+                        raise_undecodable_body(e, context=context, resource=resource)
                     if isinstance(e, httpx.ProxyError):
                         # Undelivered: every `ProxyError` raise site in httpcore is a failed
                         # HTTP CONNECT or a SOCKS negotiation failure, none of which forwards
@@ -289,6 +339,40 @@ class Transport:
         if not isinstance(data, dict):
             return {"results": data}
         return data
+
+    async def _read_body(self, resp: httpx.Response, *, context: str, resource: bool) -> bytes:
+        """Stream the body against whichever bound its status makes the real one.
+
+        A success is read against the 25 MiB ceiling, which is what this server is willing to
+        decode into the model's context. A failure is never decoded into anything: the most
+        that reaches a caller is a `message` quoted out of it, and errors.py drops any body
+        over `MAX_ERROR_BODY_BYTES` before parsing. Reading a failure against the larger
+        ceiling therefore allocated up to 25 MiB nobody would read, and -- worse -- answered
+        an oversized 502 with the ceiling refusal, hiding the status behind advice to narrow
+        the request. Measured: a 502 with a plain body cost 4 requests and named the status;
+        the same 502 with a 25 MiB body cost 16 through `search_entities`, because the
+        ceiling refusal is the marker its shrink loop re-asks on.
+        """
+        if resp.is_success:
+            return await self._read_bounded(resp, context=context, resource=resource)
+        return await self._read_error_body(resp)
+
+    async def _read_error_body(self, resp: httpx.Response) -> bytes:
+        """The part of a failing body that could be quoted, or nothing.
+
+        Empty bytes rather than a truncated prefix once the bound is crossed: that is
+        already what `_upstream_detail` does with an over-sized body, and a prefix cut mid
+        string is not JSON, so parsing one could only ever reach the same answer by a longer
+        route. Stopping the iteration also means the rest of the body is never received.
+        """
+        total = 0
+        chunks: list[bytes] = []
+        async for chunk in resp.aiter_bytes():
+            total += len(chunk)
+            if total > MAX_ERROR_BODY_BYTES:
+                return b""
+            chunks.append(chunk)
+        return b"".join(chunks)
 
     async def _read_bounded(self, resp: httpx.Response, *, context: str, resource: bool) -> bytes:
         """Accumulate the body, refusing the moment the running total crosses the ceiling.

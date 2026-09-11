@@ -27,9 +27,10 @@ from fastmcp.exceptions import ToolError
 
 from aleph_mcp.client import AlephClient
 from aleph_mcp.config import Settings
-from aleph_mcp.errors import ResponseTooLarge
+from aleph_mcp.errors import MAX_ERROR_BODY_BYTES, ResponseTooLarge
 from aleph_mcp.transport import (
     MAX_CONNECT_SECS,
+    MAX_REDIRECTS,
     MAX_RESPONSE_BYTES,
     MAX_RETRY_SLEEP_SECS,
     Transport,
@@ -193,15 +194,20 @@ async def test_a_transport_error_with_no_message_omits_the_empty_quotes(
     assert "untrusted" not in message, "nothing foreign was embedded, so nothing to label"
 
 
-def _transport_error_subclasses() -> list[type[httpx.TransportError]]:
-    """Every `httpx.TransportError` subclass the installed httpx actually defines.
+def _request_error_subclasses() -> list[type[httpx.RequestError]]:
+    """Every `httpx.RequestError` subclass the installed httpx actually defines.
 
     Walked from the live class rather than listed, so a dependency bump that adds one fails
-    this suite instead of adding a thirteenth way out of the seam. Listing them would be the
+    this suite instead of adding a nineteenth way out of the seam. Listing them would be the
     "declared, never verified" partition this test exists to avoid.
+
+    Walked from `RequestError` rather than `TransportError` since this change: the three
+    members that differ -- `TransportError` itself, `DecodingError` and `TooManyRedirects`
+    -- are exactly the ones the narrower walk certified while two of them still reached the
+    caller as themselves.
     """
-    found: list[type[httpx.TransportError]] = []
-    queue = list(httpx.TransportError.__subclasses__())
+    found: list[type[httpx.RequestError]] = []
+    queue = list(httpx.RequestError.__subclasses__())
     while queue:
         cls = queue.pop()
         if cls not in found:
@@ -210,12 +216,12 @@ def _transport_error_subclasses() -> list[type[httpx.TransportError]]:
     return found
 
 
-@pytest.mark.parametrize("error_cls", _transport_error_subclasses(), ids=lambda c: c.__name__)
-async def test_every_transport_error_is_refused_through_this_servers_error_path(
+@pytest.mark.parametrize("error_cls", _request_error_subclasses(), ids=lambda c: c.__name__)
+async def test_every_request_error_is_refused_through_this_servers_error_path(
     transport: Transport,
     respx_mock: respx.MockRouter,
     no_sleep: None,
-    error_cls: type[httpx.TransportError],
+    error_cls: type[httpx.RequestError],
 ) -> None:
     """The partition, verified. Before this, two of the fifteen were handled and the rest
     left this process as themselves: measured through the shipped MCP path, an
@@ -804,3 +810,221 @@ async def test_a_compressed_body_is_refused_on_its_expanded_size(
     )
     with pytest.raises(ToolError, match=r"over the .* ceiling"):
         await transport.request("GET", PROBE, context="probe")
+
+
+# -- the response half of the loop ---------------------------------------------
+#
+# Everything above the ceiling section is about a request that failed before or while it
+# was written. These are about one that was answered: the time that answer took, the size
+# of a body whose status already says it is not an answer, and the two failures that arrive
+# with a response rather than instead of one.
+
+
+async def test_a_slow_failing_response_is_charged_to_the_retry_budget(
+    settings: Settings, respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slow round trip is spend in the same sense a slow connect is, and only the connect
+    half was charged.
+
+    Measured on `develop @ 37931ea` with this exact fixture -- a route answering 503 ten
+    seconds after the request, against a 25-second timeout: **4 requests and 47 seconds** of
+    wall clock, of which only the 7 seconds of backoff were charged to the budget. The
+    upstream, not this server, was deciding how long a tool call hung.
+
+    The clock is the mock's to advance, as in the slow-connect test above: respx answers
+    instantly, so on a real clock this test passes whether or not the charge exists.
+    """
+    now = 0.0
+    slept: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        nonlocal now
+        slept.append(seconds)
+        now += seconds
+
+    def _slow(request: httpx.Request) -> httpx.Response:
+        nonlocal now
+        now += 10.0
+        return httpx.Response(503)
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+    monkeypatch.setattr(settings, "timeout_secs", 25.0)
+    transport = Transport(settings, monotonic=lambda: now)
+    route = respx_mock.get(PROBE).mock(side_effect=_slow)
+    try:
+        with pytest.raises(ToolError, match="unexpected HTTP 503"):
+            await transport.request("GET", PROBE, context="probe")
+    finally:
+        await transport.aclose()
+    # 10 + 1 + 10 + 2 + 10 = 33 against a budget of 25, so the third response exhausts it
+    # and the fourth attempt max_retries would allow never happens.
+    assert route.call_count == 3, f"a slow response must consume the budget: {slept}"
+    assert now <= settings.timeout_secs + 10.0, (
+        "one call may overrun by at most the response already in flight when the budget ran "
+        f"out, spent {now}s of a {settings.timeout_secs}s budget"
+    )
+
+
+async def test_a_failing_status_over_the_ceiling_is_reported_as_the_status(
+    transport: Transport, respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    """The ceiling answers "narrow your request". For a 502 that is a confident wrong
+    diagnosis: nothing about the request made the instance fail.
+
+    Measured on `develop @ 37931ea`: a 502 with a plain body cost 4 requests and said
+    "unexpected HTTP 502"; the same 502 with a 25 MiB body cost 4 at this seam and 16
+    through `search_entities`, and told the model to narrow its query instead.
+
+    `ResponseTooLarge` is asserted absent by type rather than by message, because the type
+    is what `search_entities` keys on to re-ask -- the message is only what the model reads.
+    """
+    oversized = b"x" * (MAX_RESPONSE_BYTES + 1024)
+    route = respx_mock.get(PROBE).mock(return_value=httpx.Response(502, content=oversized))
+    with pytest.raises(ToolError) as excinfo:
+        await transport.request("GET", PROBE, context="probe")
+    assert "unexpected HTTP 502" in str(excinfo.value)
+    assert not isinstance(excinfo.value, ResponseTooLarge), (
+        "a failing status must not be raised as the marker the shrink loop re-asks on"
+    )
+    assert route.call_count == 4, "one transport retry budget, not one per shrink"
+
+
+class _CountingStream(httpx.AsyncByteStream):
+    """A body delivered in small chunks, counting how many were actually consumed."""
+
+    CHUNK = b"q" * 16384
+
+    def __init__(self, total: int) -> None:
+        self.chunks = total
+        self.consumed = 0
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for _ in range(self.chunks):
+            self.consumed += 1
+            yield self.CHUNK
+
+
+async def test_a_failing_body_is_read_only_as_far_as_it_could_be_quoted(
+    transport: Transport, respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    """The bound has to stop the read, not merely discard it afterwards.
+
+    Asserted on bytes consumed off the wire rather than on the refusal text, because the
+    text cannot tell the two apart: `_upstream_detail` drops any body over the same bound
+    before parsing, so a transport that read a 2 MiB error body in full and handed the whole
+    of it over produces the identical message. Written the first way, this test passed with
+    the bound deleted -- one of the "checks that certify nothing" the work plan lists.
+
+    The 2 MiB body sits deliberately between the two bounds: under the 25 MiB ceiling, so a
+    transport reading a failure against the wrong one reads all of it and is caught here
+    rather than by a ceiling refusal that would look like a pass.
+    """
+    stream = _CountingStream(128)
+    respx_mock.get(PROBE).mock(
+        return_value=httpx.Response(
+            400, stream=stream, headers={"content-type": "application/json"}
+        )
+    )
+    with pytest.raises(ToolError, match="bad request"):
+        await transport.request("GET", PROBE, context="probe")
+    ceiling = MAX_ERROR_BODY_BYTES // len(_CountingStream.CHUNK) + 1
+    assert stream.consumed <= ceiling, (
+        f"a failing body is read only as far as the {MAX_ERROR_BODY_BYTES}-byte quoting "
+        f"bound: consumed {stream.consumed * len(_CountingStream.CHUNK)} bytes"
+    )
+
+    respx_mock.get(PROBE).mock(return_value=httpx.Response(400, json={"message": "bad facet"}))
+    with pytest.raises(ToolError, match="bad facet"):
+        await transport.request("GET", PROBE, context="probe")
+
+
+async def test_a_body_that_contradicts_its_content_encoding_is_refused_with_context(
+    transport: Transport, respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    """`httpx.DecodingError` is a sibling of `TransportError`, not a member, so it escaped
+    the seam the previous change hardened.
+
+    Measured on `develop @ 37931ea` through the shipped MCP path: a 200 declaring
+    `Content-Encoding: gzip` over a body that is not gzip reached the model as
+    `Error calling tool 'list_collections': Error -3 while decompressing data: incorrect
+    header check` -- no call context, no label. The text is zlib's own fixed C string table
+    rather than anything an attacker authors, but it is still foreign text quoted to a
+    model, and the label is what every other quoted upstream string carries.
+
+    The response must be built with a raw stream: `httpx.Response(content=...)` decodes at
+    construction, so a `content=` fixture raises inside the test rather than inside the
+    transport.
+    """
+
+    class _Raw(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b"not gzip at all"
+
+    route = respx_mock.get(PROBE).mock(
+        return_value=httpx.Response(200, headers={"content-encoding": "gzip"}, stream=_Raw())
+    )
+    with pytest.raises(ToolError) as excinfo:
+        await transport.request("GET", PROBE, context="probe")
+    message = str(excinfo.value)
+    assert message.startswith("probe:"), f"the refusal must name the call site: {message}"
+    assert "untrusted transport text" in message, "foreign text must be labelled"
+    assert "could not be decoded" in message
+    assert not isinstance(excinfo.value, httpx.DecodingError)
+    assert route.call_count == 1, "a body the instance encodes wrongly is not retried"
+
+
+def _loops_to(path: str) -> httpx.Response:
+    return httpx.Response(302, headers={"Location": f"https://aleph.test{path}"})
+
+
+async def test_a_redirect_loop_is_bounded_by_this_server_and_refused(
+    transport: Transport, respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    """`httpx.TooManyRedirects` is the other sibling outside the hardened seam, and the hop
+    count that produces it was httpx's default rather than a budget this server chose.
+
+    Measured on `develop @ 37931ea` through the shipped MCP path: an instance answering 302
+    with a Location back to the same allowlisted path cost **21 upstream requests for one
+    tool call** and answered `Error calling tool 'list_collections': Exceeded maximum
+    allowed redirects.` -- no context, no label, nothing charged to the budget.
+    """
+    route = respx_mock.get(PROBE).mock(return_value=_loops_to(PROBE))
+    with pytest.raises(ToolError) as excinfo:
+        await transport.request("GET", PROBE, context="probe")
+    message = str(excinfo.value)
+    assert message.startswith("probe:"), f"the refusal must name the call site: {message}"
+    assert "did not end" in message
+    assert "will not help" in message, "a loop is served the same way on every attempt"
+    assert not isinstance(excinfo.value, httpx.TooManyRedirects)
+    assert route.call_count == MAX_REDIRECTS + 1, (
+        f"the hop ceiling is this server's: {route.call_count} requests for one call"
+    )
+
+
+async def test_a_redirect_chain_within_the_bound_is_still_followed(
+    transport: Transport, respx_mock: respx.MockRouter
+) -> None:
+    """Bounding the chain must not stop following one. Aleph's own canonical-host redirect
+    is a single hop, and a reverse proxy in front of it may add another, so a bound that
+    refused a short chain would break a working deployment rather than a broken one."""
+    respx_mock.get(PROBE).mock(return_value=_loops_to("/api/2/collections/42"))
+    respx_mock.get("/api/2/collections/42").mock(
+        return_value=httpx.Response(200, json={"followed": True})
+    )
+    assert await transport.request("GET", PROBE, context="probe") == {"followed": True}
+
+
+async def test_every_redirect_hop_is_still_matched_against_the_allowlist(
+    transport: Transport, respx_mock: respx.MockRouter
+) -> None:
+    """The bound decides when to stop following, never what may be followed. Asserted here
+    as well as in `test_readonly.py` because this change is the one that touches the
+    redirect configuration, and a `max_redirects` set by rebuilding the client differently
+    is exactly how the request event hook would get dropped."""
+    respx_mock.get(PROBE).mock(return_value=_loops_to("/api/2/collections/42/reingest"))
+    refused = respx_mock.get("/api/2/collections/42/reingest").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    with pytest.raises(ToolError, match="read-only allowlist"):
+        await transport.request("GET", PROBE, context="probe")
+    assert refused.call_count == 0, "the write route must never be reached"

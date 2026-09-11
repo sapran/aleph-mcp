@@ -10,65 +10,27 @@ priority order, not an id. Item 1 of that plan — the metadata path — was clo
 `harden-metadata-path` on 2026-09-10, and item 1 of the renumbered plan — transport failure
 classification — by `classify-transport-failures` the same day. Item 1 again — the ontology echo
 — was closed by `bound-ontology-echo` on 2026-09-11, which parked two new claims in passing: one
-under echo.py's enforcement gaps, and one as its own entry. The plan and the sections below are
-renumbered after each, so twenty-nine claims across twelve entries remain.
+under echo.py's enforcement gaps, and one as its own entry. Item 1 once more — the response path —
+was closed by `charge-and-account-response-path` on 2026-09-11, parking one new claim under the
+stale-prose entry. The plan and the sections below are renumbered after each, so twenty-six claims
+across eleven entries remain.
 
 ## Work plan
 
-1. Charge and account the response path — a 502 costs 16 requests and names the wrong cause.
-2. Guard the scope resolver's upstream shapes — untranslated errors, confident wrong diagnosis.
-3. Give refusals a type — a dead upstream is reported as a bad argument.
-4. Make the licence gate able to fail — it passes with the project's own LICENSE deleted.
-5. Answer the entity-shaped spec question — four copy-through slots, one decision, five xfails.
-6. Extend the tool path's guarantees to resources — a `resource()` factory and a wider walk.
-7. Close echo.py's enforcement gaps — an inline policy escapes both guards.
-8. Give `get_entity_text` a derived caption.
-9. Close the tests that cannot fail — four checks that certify nothing.
-10. Decide the private-sibling references — the publication deadline has already passed.
-11. Guard `model["schemata"]`'s shape — a non-dict raises AttributeError at the caller.
-12. Correct three pieces of stale prose (Tier 0).
+1. Guard the scope resolver's upstream shapes — untranslated errors, confident wrong diagnosis.
+2. Give refusals a type — a dead upstream is reported as a bad argument.
+3. Make the licence gate able to fail — it passes with the project's own LICENSE deleted.
+4. Answer the entity-shaped spec question — four copy-through slots, one decision, five xfails.
+5. Extend the tool path's guarantees to resources — a `resource()` factory and a wider walk.
+6. Close echo.py's enforcement gaps — an inline policy escapes both guards.
+7. Give `get_entity_text` a derived caption.
+8. Close the tests that cannot fail — four checks that certify nothing.
+9. Decide the private-sibling references — the publication deadline has already passed.
+10. Guard `model["schemata"]`'s shape — a non-dict raises AttributeError at the caller.
+11. Correct four pieces of stale prose (Tier 0).
 ---
 
-## 1. The response path is neither charged nor accounted
-
-**Only the connect path charges its elapsed time to the retry budget.** `transport.py:169` charges
-the connect elapsed; the response path charges only `delay` (`transport.py:174`), so a slow 429/5xx
-round trip is uncharged and `max_retries` slow responses can exceed `timeout_secs` in total. The
-connect path had to be charged because a connect can burn the whole connect phase without ever
-sleeping; the same one-line charge was never extended.
-
-**A non-2xx whose body is over the ceiling is reported as a ceiling refusal, never as the status.**
-`_read_bounded` (`transport.py:160`) runs before `raise_for_status` (`transport.py:179`) and does
-not look at `resp.status_code`, so a 502 with a >25 MiB body raises `TooLargeToolError` and the 502
-is discarded. Measured identical on `develop` and the T4 branch: a 502 with a plain body costs 4
-requests and says "unexpected HTTP 502"; a 502 with an oversized body costs **16** requests — the
-shrink loop re-asks four times, each paying four transport retries because 502 is in
-`_RETRY_STATUS` — and tells the model to narrow its query, never that the instance is failing. Only
-`search_entities`' deadline bounds it. Related inaccuracy: the comment at `transport.py:41` claims
-the error path "has its own, much smaller bound"; the 64 KiB `_MAX_ERROR_BODY_BYTES` in
-`_upstream_detail` bounds only what is *quoted*, and above the ceiling the error path is never
-reached at all. Fixing it changes a refusal message, so it is a behaviour change.
-
-**A redirect loop costs 21 upstream requests and reports the raw httpx message.** Found by
-security review of `classify-transport-failures`; outside it because `httpx.TooManyRedirects` is a
-sibling of `TransportError` under `HTTPError`, so the seam that change hardened does not reach it.
-Executed through the shipped MCP path: an instance answering `302` with a `Location` back to the
-same allowlisted path produced **21** upstream requests for one tool call and told the model
-`Error calling tool 'list_collections': Exceeded maximum allowed redirects.` -- no call context, no
-label, and nothing charged to the retry budget. The redirect count is httpx's own `max_redirects`
-(20), not a budget this server chose, and the same class also escapes classification entirely.
-Belongs with the charging work above: one seam, two symptoms.
-
-**A malformed compressed body reaches the model as a raw zlib message.** Same review, same reason:
-`httpx.DecodingError` is an `HTTPError`, not a `TransportError`. A `200` carrying
-`Content-Encoding: gzip` and a body that is not gzip produced
-`Error calling tool 'list_collections': Error -3 while decompressing data: incorrect header check`
--- unlabelled, no call context. Not an injection surface, and that was checked rather than assumed:
-six hostile bodies produced three distinct messages, all drawn from zlib's fixed C string table,
-with no input bytes echoed. So the cost is a confusing refusal rather than a model-visible attacker
-string, which is why it is recorded rather than fixed under a security-hardening change.
-
-## 2. The scope resolver mishandles three upstream shapes
+## 1. The scope resolver mishandles three upstream shapes
 
 All three in `scope.py`, adjacent lines, one change.
 
@@ -92,7 +54,7 @@ message — "cannot be combined with named collections" — for a list that name
 The scalar `"*"` is accepted at `scope.py:141`. Unchanged from `develop`, untested anywhere.
 Correcting it changes a refusal message.
 
-## 3. Bare `ValueError` is the wrong refusal channel, in both directions
+## 2. Bare `ValueError` is the wrong refusal channel, in both directions
 
 Both halves close with one type: a dedicated `Refusal(ValueError)` raised at the client's own
 refusal sites and caught in place of bare `ValueError` — the pattern `errors.py` already sets for
@@ -111,7 +73,7 @@ replaced wrapped only the `await client.X(...)` call. Equivalent today — every
 forwarding call — but a future in-body `int()`, `datetime.fromisoformat()` or nested `json.loads`
 would be relabelled as a client refusal with nothing to catch it.
 
-## 4. The licence gate cannot fail
+## 3. The licence gate cannot fail
 
 Both in `.github/workflows/ci.yml`, the `build` job's licence step; one change. (The SIGPIPE race
 in the same step is fixed — see Retired.)
@@ -137,7 +99,7 @@ which is the first thing anyone debugging a packaging regression wants. Also, tw
 `unzip -p`) — unreachable in CI, where the checkout is fresh and `uv build` is the only writer, but
 it bites anyone running the step locally against a dirty `dist/`.
 
-## 5. Four aggregation slots are copied rather than rebuilt — one spec question
+## 4. Four aggregation slots are copied rather than rebuilt — one spec question
 
 `get_profile.entities`, `_slim_entityset.entities`, a tag row's `value`, and
 `_slim_collection(full=True).statistics` are one decision about what counts as entity-shaped, not
@@ -180,7 +142,7 @@ fixing any of them forces this note to be closed.
   above: upstream text would then land in `_reply`'s existing-note composition. Fix is to key the
   short-circuit on something upstream cannot set. Pre-existing and outside that change's scope.
 
-## 6. The resource path lacks the tool path's guarantees
+## 5. The resource path lacks the tool path's guarantees
 
 Three findings, closed by a ~4-line local `resource(uri, **kw)` factory mirroring `tool`, plus a
 wider walk in `find_marker`.
@@ -203,7 +165,7 @@ value and lists by item only. No client method builds a tuple, a set or a non-st
 reply, so nothing reaches those branches today, and the markers' own serialisation refusal still
 fires there — the outcome degrades to the pre-T1-FIX-2 message rather than leaking.
 
-## 7. echo.py's three enforcement gaps
+## 6. echo.py's three enforcement gaps
 
 **A policy built inline at a call site escapes both guards.** `test_every_policy_has_a_cap_row`
 (`tests/test_echo.py:59`) enumerates `vars(echo)`, so it sees only module-level policies declared in
@@ -232,14 +194,14 @@ and the content is what was asked for — than to a refusal. Closing it means de
 whole record is `PROPERTY_VALUE`-shaped data with a `_provenance` label, or whether a schema
 description deserves its own bound. A behaviour change to a resource's output either way.
 
-## 8. `get_entity_text` derives no caption
+## 7. `get_entity_text` derives no caption
 
 `client.py:1188` reads `entity.get("caption")` straight off the payload, where every slimmed path
 calls `derive_caption`. Live Aleph sends a null caption, so this is the one tool that can return
 `caption: null` for an entity the other tools would have captioned. Found during T1; fixing it
 changes a tool's output and so is a behaviour change, not a refactor.
 
-## 9. Four checks that certify nothing
+## 8. Four checks that certify nothing
 
 One purely-test change closes all four.
 
@@ -262,7 +224,7 @@ One purely-test change closes all four.
   `classify-transport-failures`: a TLS refusal now names that setting to the operator, so the
   message is wrong in a new way if the setting never reaches the client.
 
-## 10. A public repo still points at private siblings
+## 9. A public repo still points at private siblings
 
 The publication this was to be decided before has happened — 0.3.0 shipped from a public repo on
 2026-09-10 — so this is now a live defect rather than a pending decision.
@@ -281,7 +243,7 @@ private; `acordia` is also named across the specs, the archived changes and
 contributor cannot see. The declaration is deliberate and documented, so removing it is a design
 decision, not a cleanup.
 
-## 11. The ontology tools trust `model["schemata"]`'s shape
+## 10. The ontology tools trust `model["schemata"]`'s shape
 
 **A non-dict `schemata` inside a valid `model` reaches the caller as an AttributeError.**
 `client.py`'s `list_schemata` does `model.get("schemata") or {}` and then `.items()` on it, and
@@ -307,7 +269,7 @@ not reach this value. Found while implementing `bound-ontology-echo` on 2026-09-
 pre-existing on `develop`, unrelated to that change's scope, and the fix is a refusal-shape
 decision (reuse `raise_unusable_model`, or degrade) rather than a one-liner.
 
-## 12. Three pieces of stale prose (Tier 0)
+## 11. Four pieces of stale prose (Tier 0)
 
 - **`openspec/config.yaml`'s layout paragraph is three modules stale**
   (`openspec/config.yaml:23-26`). It lists `server.py`, `client.py`, `readonly.py`, `config.py` and
@@ -317,6 +279,12 @@ decision (reuse `raise_unusable_model`, or degrade) rather than a one-liner.
   `tests/test_collection_scope.py:339` and `:454` still say "no tool's `except ValueError`
   translates". The claims stay true of the single seam, but send a reader looking for per-tool arms
   that no longer exist.
+- **`transport.py:89` names a `_classify` function that does not exist.** The comment above
+  `_CONNECT_ERRORS` calls it "one bucket of the classification in `_classify`"; the classification
+  is an inline dispatch in `Transport.request` and there is no such function, so a reader greps for
+  it and finds nothing. Found while widening that dispatch to `httpx.RequestError`, and left alone
+  because the seam's own comments were in scope and this one is not about the seam.
+
 - **`pyproject.toml` sets `line-length = 100` while `[tool.ruff.lint]` ignores `E501`**
   (`pyproject.toml:64`, `:69`), so line length is enforced only by `ruff format`, never by
   `ruff check`. Harmless; noted because the contributor-facing constraint reads as if `ruff check`
@@ -325,6 +293,15 @@ decision (reuse `raise_unusable_model`, or degrade) rather than a one-liner.
 ---
 
 ## Retired
+
+- The response path being neither charged nor accounted — all four claims (a slow round trip
+  uncharged to the retry budget, an oversized non-2xx reported as a ceiling refusal, a redirect
+  loop costing 21 requests, and a malformed compressed body reaching the model as a raw zlib
+  sentence). **Fixed** by `charge-and-account-response-path`, which is now four requirements in
+  `openspec/specs/mcp-tool-surface`. Re-measured through the same harness: 4 requests / 47s of a
+  25s budget became 3 / 33s; the oversized 502 became `unexpected HTTP 502` and cost 4 requests
+  through `search_entities` rather than 16; the loop became 6 requests and a labelled refusal; the
+  zlib sentence became a labelled refusal naming the call.
 
 - Transport failures being classified by the wrong axis — both claims (attacker-authored
   `ProxyError` text reaching the model unsanitised, and a TLS verification failure retried four

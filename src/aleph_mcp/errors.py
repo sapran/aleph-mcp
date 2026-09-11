@@ -131,6 +131,56 @@ def raise_tls_untrusted(exc: Exception, *, context: str, resource: bool = False)
     ) from exc
 
 
+def raise_redirect_loop(
+    exc: Exception, *, context: str, hops: int, resource: bool = False
+) -> NoReturn:
+    """Refuse a redirect chain that did not reach a final response inside this server's bound.
+
+    Every hop was answered, so this must not claim the request was undelivered -- but unlike
+    `raise_transport_failed` it is not a maybe in either direction: nothing was lost, there
+    simply is no final response to return.
+
+    Not retried, for the reason a TLS trust failure is not: the chain is what this host
+    serves for this path, so the next attempt walks the identical hops. The bound is named
+    because it is this server's rather than httpx's default of 20, and an operator reading
+    the refusal has no other way to know which number was hit.
+    """
+    err_cls = ResourceError if resource else ToolError
+    raise err_cls(
+        f"{context}: the redirect chain from this host did not end within {hops} hops "
+        f"({_reported(exc)}). Every hop answered, so nothing was lost -- there is simply no "
+        "final response to return. This is deterministic: the same chain is served on every "
+        "attempt, so it was not retried and retrying will not help. A loop here is an "
+        "instance or proxy misconfiguration, typically an SSO interstitial or a "
+        "canonical-host redirect that points back at itself. Every hop was still matched "
+        "against this server's read-only allowlist before it was sent."
+    ) from exc
+
+
+def raise_undecodable_body(exc: Exception, *, context: str, resource: bool = False) -> NoReturn:
+    """Refuse a response whose body does not honour the `Content-Encoding` it declares.
+
+    The response arrived in full -- status and headers both -- so this says so rather than
+    hedging the way `raise_transport_failed` must. What failed is the body, which makes it an
+    upstream fault a caller cannot fix by changing arguments.
+
+    The decoder text is quoted through the same sanitising helper as every other foreign
+    string. zlib's messages come from a fixed C string table and echo no input bytes -- six
+    hostile bodies were measured to produce three distinct messages, none carrying any of
+    them -- so this is the label being applied by convention rather than against a known
+    injection surface, which is the cheaper of the two mistakes.
+    """
+    err_cls = ResourceError if resource else ToolError
+    raise err_cls(
+        f"{context}: the response arrived but its body could not be decoded "
+        f"({_reported(exc)}). This host declared a Content-Encoding the body does not "
+        "honour, so the fault is in the response rather than in the request or the network "
+        "path. Nothing upstream can have changed -- this server issues only read requests -- "
+        "and retrying will not help while the instance, or a proxy in front of it, encodes "
+        "its responses this way."
+    ) from exc
+
+
 def raise_transport_failed(exc: Exception, *, context: str, resource: bool = False) -> NoReturn:
     """Refuse a transport failure that may have happened after the request was delivered.
 
@@ -230,7 +280,7 @@ def raise_unusable_model(model: object, *, context: str, resource: bool = False)
 # An error body worth quoting is never large. Parsing before checking would let the error
 # path allocate without bound, which is the one path the transport ceiling cannot cover:
 # the status is known before the body is.
-_MAX_ERROR_BODY_BYTES = 64 * 1024
+MAX_ERROR_BODY_BYTES = 64 * 1024
 
 
 def _upstream_detail(resp: httpx.Response, body: bytes | None) -> str:
@@ -244,7 +294,7 @@ def _upstream_detail(resp: httpx.Response, body: bytes | None) -> str:
     if "json" not in resp.headers.get("content-type", "").lower():
         return ""
     raw = resp.content if body is None else body
-    if len(raw) > _MAX_ERROR_BODY_BYTES:
+    if len(raw) > MAX_ERROR_BODY_BYTES:
         return ""
     try:
         payload = json.loads(raw)
