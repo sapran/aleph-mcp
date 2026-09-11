@@ -280,18 +280,10 @@ class Transport:
                     # is `raise_transport_failed`, so a subclass nobody has classified gets the
                     # conservative answer instead of the wire.
                     #
-                    # Delivery is settled *before* the TLS question, and the order is
-                    # load-bearing. A TLS failure mid-body arrives as `ReadError` with an
-                    # `ssl.SSLEOFError` in its chain, and testing the cause first reported it
-                    # as a handshake trust failure that claimed no response was received --
-                    # false for a read-side failure, and it named `ALEPH_MCP_VERIFY_TLS` for
-                    # something that is not a trust problem. Only a failure before the headers
-                    # arrived can carry a *trust* verdict; after them, a TLS fault is a broken
-                    # connection to a response that may already have been served.
-                    # Two certainties first, because the axis below them deals in maybes.
-                    # Both are `httpx.RequestError` siblings of `TransportError` rather than
-                    # members, which is why they escaped the seam entirely until the clause
-                    # above widened: measured, a redirect loop reached the model as
+                    # The two certainties come first, because everything below them deals in
+                    # maybes. Both are `httpx.RequestError` siblings of `TransportError`
+                    # rather than members, which is why they escaped this seam entirely until
+                    # the clause above widened: measured, a redirect loop reached the model as
                     # `Exceeded maximum allowed redirects.` and a body contradicting its own
                     # Content-Encoding as a raw zlib sentence, neither labelled, neither
                     # naming the call.
@@ -308,6 +300,14 @@ class Transport:
                         # Not retried for the same reason: an instance encoding its responses
                         # wrongly does so on every attempt.
                         raise_undecodable_body(e, context=context, resource=resource)
+                    # Delivery is settled *before* the TLS question, and the order is
+                    # load-bearing. A TLS failure mid-body arrives as `ReadError` with an
+                    # `ssl.SSLEOFError` in its chain, and testing the cause first reported it
+                    # as a handshake trust failure that claimed no response was received --
+                    # false for a read-side failure, and it named `ALEPH_MCP_VERIFY_TLS` for
+                    # something that is not a trust problem. Only a failure before the headers
+                    # arrived can carry a *trust* verdict; after them, a TLS fault is a broken
+                    # connection to a response that may already have been served.
                     if isinstance(e, httpx.ProxyError):
                         # Undelivered: every `ProxyError` raise site in httpcore is a failed
                         # HTTP CONNECT or a SOCKS negotiation failure, none of which forwards
