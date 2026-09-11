@@ -68,16 +68,38 @@ MAX_SCOPE_COLLECTIONS = 10
 _SEARCH_FILTER: Final = "filter:collection_id"
 _MATCH_FILTER: Final = "collection_ids"
 
+# What tells a listing from a bare array of records. Aleph's `QueryResult` serialiser emits
+# all five of these beside its rows; `transport.py`'s wrapper for a non-object body emits
+# `results` and nothing else. Any one of them is accepted, because the question is whether
+# the rows arrived inside an envelope at all, not whether this server recognises the
+# version that built it. Membership is tested by key presence, never by value: `offset` is
+# `0` on the first page of every listing Aleph serves.
+_ENVELOPE_KEYS: Final = frozenset({"status", "total", "page", "limit", "offset"})
+
+
+def _reads_as_collection_id(value: object) -> bool:
+    """Whether a value is a numeric collection id, wherever it came from.
+
+    Shared by the caller-facing validator below and the row guard in `resolve_one`, so the
+    two cannot drift into disagreeing about what a collection id is — the same reason
+    `_COLLECTION_ID` is written to agree with readonly.py by construction. They differ
+    only in the refusal they raise, which is the whole point: one is a statement about an
+    argument, the other about an upstream row.
+    """
+    return _COLLECTION_ID.fullmatch(str(value)) is not None
+
 
 def check_collection_id(value: object) -> str:
     text = str(value)
-    if not _COLLECTION_ID.fullmatch(text):
+    if not _reads_as_collection_id(text):
         raise Refusal(
-            # `value` is caller input on every path but one: the id read out of a
-            # foreign_id lookup is upstream text, so it is bounded under the shared rule
-            # in echo.py — an unbounded echo is a write primitive into the model's
-            # context. `!r` additionally escapes control characters, which is why
-            # COLLECTION_ECHO does not strip them itself.
+            # `value` is caller input on every path. It was upstream text on exactly one —
+            # the id read out of a foreign_id lookup — until `resolve_one` took that case
+            # over, because this message is written for a caller and was false about that
+            # call. The bound stays: caller text is model-authored, a model can be induced
+            # by document content to pass an attacker-chosen string, and an unbounded echo
+            # is a write primitive into the model's context. `!r` additionally escapes
+            # control characters, which is why COLLECTION_ECHO does not strip them itself.
             f"invalid collection: expected a numeric collection id "
             f"(got {render(text, COLLECTION_ECHO)!r}). "
             "A foreign_id is accepted directly and resolved for you; this error means the "
@@ -125,6 +147,14 @@ def _unusable_listing(text: str, shape: str) -> Refusal:
     the caller's own foreign_id and is echoed the same way every other refusal here echoes
     it.
 
+    One branch is exempt, and only because a type name is not the diagnosis there: an
+    `id` of `"abc"` and an `id` of `"874"` are both `str`, so the value *is* the finding.
+    That caller passes the value through `render(..., COLLECTION_ECHO)!r`, which is the
+    same bound and the same escaping this module already applies to a collection id on
+    its way to a model — so the rule the paragraph above states is kept by the value being
+    bounded before it arrives, not by being left out. No other branch may take that
+    exemption: for all of them the type is the whole statement.
+
     The next step it names is for whoever runs the instance, not for the caller: nothing
     about the call can change what the upstream returned. That is the opposite of the
     failure it replaces, which offered the caller an actionable step that led nowhere.
@@ -137,7 +167,8 @@ def _unusable_listing(text: str, shape: str) -> Refusal:
         f"collection listing {shape}. This is an upstream malfunction rather than a "
         "problem with the arguments: nothing about this call can change it and retrying "
         "will not help. Whoever runs this Aleph instance needs to know that its "
-        "collections endpoint answered with JSON that is not a listing."
+        "collections endpoint answered with JSON this server cannot read as a listing of "
+        "collections."
     )
 
 
@@ -406,14 +437,43 @@ class CollectionResolver:
             raise _unusable_listing(
                 text, f"carried a first row as {type(hit).__name__}, not a record"
             )
+        # Checked after the row-shape branch above, so a body that is wrong in both ways —
+        # a bare `["x"]` — keeps the more specific diagnosis. Skipped for an empty
+        # `results`, which is the one shape that means "no such collection" whoever
+        # serialised it; requiring an envelope there would quietly reverse that reading
+        # while claiming to be about rows. There are no rows to trust, so there is nothing
+        # to require an envelope for.
+        if not _ENVELOPE_KEYS & listing.keys():
+            raise _unusable_listing(text, "carried rows with no listing envelope around them")
         # Tie the answer back to the question. Without this the resolver trusts that the
         # upstream applied the filter it was given, and any leniency — a dropped filter, a
         # loose match, a redirect answered by a different listing — resolves to a
         # plausible id for a collection nobody named, then caches it for the process
         # lifetime.
+        #
+        # Key presence, not value, separates the two diagnoses below. A row that states a
+        # `foreign_id` — including the null a collection created without one truthfully
+        # reports — has named a collection, and naming a different one is the miss the
+        # refusal below is written for. A row with no such field has named nothing, so
+        # reading it as a miss asserts something about the caller's permissions that the
+        # body never said.
+        if "foreign_id" not in hit:
+            raise _unusable_listing(text, "carried a first row with no foreign_id field")
         if hit.get("foreign_id") != text:
             raise _no_such_collection(text)
-        resolved = check_collection_id(hit.get("id"))
+        # The row's own `id`, checked here rather than by `check_collection_id`, whose
+        # message is written for caller input: it offers the caller the foreign_id
+        # alternative and says their value is "neither", both false of a call whose
+        # foreign_id the upstream confirmed one line above. Same predicate, different
+        # refusal — see `_reads_as_collection_id`.
+        raw_id = hit.get("id")
+        if not _reads_as_collection_id(raw_id):
+            raise _unusable_listing(
+                text,
+                f"carried a first row whose id is {render(str(raw_id), COLLECTION_ECHO)!r}, "
+                "not a numeric collection id",
+            )
+        resolved = str(raw_id)
         # A collection's numeric id never changes, so this needs no invalidation. Cached for
         # the process lifetime beside the instance model: a session works one or two
         # collections and would otherwise pay a lookup on every scoped call. Only a verified
