@@ -123,6 +123,31 @@ async def test_the_all_collections_literal_drops_the_filter_and_annotates_the_re
     assert "EVERY COLLECTION:" in note, f"an unscoped search must say so in `_note`: {note!r}"
 
 
+async def test_the_all_collections_literal_reads_the_same_as_a_single_element_list(
+    client: AlephClient, respx_mock: respx.MockRouter
+) -> None:
+    """`["*"]` is the same scope as `"*"`, end to end.
+
+    The module-level test pins that `parse_scope` returns the all-collections scope for
+    it; this pins what the caller actually sees — no filter on the wire, no foreign_id
+    lookup spent on the literal, and `"*"` reported back rather than a single-element
+    list. Before this it was refused with "cannot be combined with named collections",
+    naming a mistake the caller did not make.
+    """
+    route = respx_mock.get("/api/2/entities").mock(
+        return_value=httpx.Response(200, json=raw_search_payload(raw_entity(), total=1))
+    )
+    lookup = respx_mock.get("/api/2/collections").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    out = await client.search_entities(collection=[ALL_COLLECTIONS], q="acme")
+    assert _scopes(route.calls.last.request) == [], "'*' must not be sent as a filter value"
+    assert out["searched"]["collection"] == ALL_COLLECTIONS
+    assert lookup.call_count == 0, "the literal must never be looked up as a foreign_id"
+    note = out.get("_note") or ""
+    assert "EVERY COLLECTION:" in note, f"an unscoped search must say so in `_note`: {note!r}"
+
+
 async def test_the_every_collection_note_composes_with_the_unenumerated_note(
     client: AlephClient, respx_mock: respx.MockRouter
 ) -> None:
@@ -337,10 +362,17 @@ async def test_a_non_dict_listing_row_is_a_tool_error_not_an_attribute_error(
     """`Transport.request` wraps a non-dict JSON body as `{"results": <body>}`, so a bare array
     upstream makes `results[0]` a string. `.get` on it would raise AttributeError, which
     no tool's `except ValueError` translates — the caller would see an unhandled exception
-    instead of a legible refusal."""
+    instead of a legible refusal.
+
+    The refusal it gets is the upstream-malfunction one, not "no collection with that
+    foreign_id": a bare array where a listing belongs says nothing about whether the
+    collection exists or the key may read it, and this test asserted that wrong diagnosis
+    until `guard-scope-resolver-shapes` separated the two.
+    """
     respx_mock.get("/api/2/collections").mock(return_value=httpx.Response(200, json=["x"]))
-    with pytest.raises(ValueError, match="list_collections"):
+    with pytest.raises(ValueError, match="upstream malfunction") as excinfo:
         await client.search_entities(collection="my-case", q="acme")
+    assert "list_collections" not in str(excinfo.value), str(excinfo.value)
 
 
 async def test_paging_is_refused_before_a_foreign_id_costs_a_lookup(

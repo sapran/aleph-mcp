@@ -97,6 +97,43 @@ def _is_numeric_form(text: str) -> bool:
     return not text.strip("0123456789 \t\r\n")
 
 
+def _no_such_collection(text: str) -> ValueError:
+    """The one diagnosis that is about the caller: the listing was read and held no match.
+
+    Reached from exactly two places — an empty `results` list, and a row naming a
+    different collection than the one asked for. Both are the upstream working correctly
+    and saying no.
+    """
+    return ValueError(
+        f"no collection with foreign_id {text!r} is readable with this API key; "
+        "call list_collections to see what is available"
+    )
+
+
+def _unusable_listing(text: str, shape: str) -> ValueError:
+    """The upstream answered, but not with something this server can read as a listing.
+
+    `shape` names a type, never a value: the body is upstream text of unknown length and
+    provenance, and interpolating it would put an unbounded, attacker-influenceable string
+    into the model's context — the defect `bound-ontology-echo` closed on the neighbouring
+    path. A type name is a closed vocabulary, so it needs no bound of its own. `text` is
+    the caller's own foreign_id and is echoed the same way every other refusal here echoes
+    it.
+
+    Deliberately less actionable than `_no_such_collection`: it names no next step for the
+    caller because there is none. Nothing about the call can change what the upstream
+    returned, and the failure this replaces was the opposite one — an actionable next step
+    that led nowhere.
+    """
+    return ValueError(
+        f"resolving the collection foreign_id {text!r} could not be completed: the "
+        f"collection listing {shape}. This is an upstream malfunction rather than a "
+        "problem with the arguments, so retrying with a different collection will not "
+        "help; check that the Aleph instance and any proxy in front of it are answering "
+        "the API rather than an error or a login page."
+    )
+
+
 def parse_collection(collection: str | int) -> str:
     """Return the spelling a single-collection argument names, or refuse it.
 
@@ -131,6 +168,10 @@ def parse_scope(collection: str | int | list[str | int]) -> tuple[str, ...] | No
     caller that omits the argument never reaches here — the tool signature refuses first,
     which is the point: see the required-scope requirement in the spec.
 
+    The literal is accepted in either spelling, bare or as the sole content of a list, and
+    means the same scope in both. Only a list pairing it with a named collection is
+    ambiguous about what the caller wants, and only that list is refused.
+
     Each element is parsed later, by `parse_collection` as it is resolved, so a blank
     element is refused at the position the caller wrote it rather than ahead of the
     element before it.
@@ -147,6 +188,14 @@ def parse_scope(collection: str | int | list[str | int]) -> tuple[str, ...] | No
             "collection must name at least one collection, or the literal '*' to search "
             "every readable collection"
         )
+    # The literal means the same scope in either spelling. A list whose every element is
+    # `"*"` names no other collection, so refusing it with the mixed-scope message below
+    # described a mistake the caller did not make — and a caller building this argument
+    # programmatically produces the list, not the scalar. Asking whether every element is
+    # the literal rather than whether the list has one element also reads `["*", "*"]` as
+    # what it says, the same way the dedup below reads a repeated named collection.
+    if all(c == ALL_COLLECTIONS for c in collection):
+        return None
     if ALL_COLLECTIONS in collection:
         raise ValueError(
             "collection='*' searches every readable collection and cannot be combined "
@@ -309,20 +358,39 @@ class CollectionResolver:
             return ResolvedCollection(cached)
 
         listing = await self._lookup(text, context)
-        results = listing.get("results") or []
-        hit = results[0] if results and isinstance(results[0], dict) else None
+        # The listing's shape is checked before it is indexed, in branches rather than as
+        # one predicate. One predicate can only produce one message, which is how a single
+        # `isinstance` guard here ended up reporting every upstream malfunction as a
+        # missing collection. Exactly one shape means "no such collection" — a `results`
+        # list that is present, is a list, and is empty, which is what Aleph answers for a
+        # foreign_id nobody owns. Every other unusable shape is a statement about the
+        # responder, not about the collection, and saying otherwise asserts something
+        # about the caller's permissions that the body never said.
+        results = listing.get("results")
+        if results is None:
+            raise _unusable_listing(text, "carried no results at all")
+        if not isinstance(results, list):
+            # The transport wraps a non-dict JSON body as `{"results": <body>}`, so a
+            # maintenance page or a proxy interstitial arrives here as a str. Indexing it
+            # used to raise KeyError or TypeError, which no tool's `except ValueError`
+            # translates, so it left this server as a server fault rather than a refusal.
+            raise _unusable_listing(
+                text, f"carried results as {type(results).__name__}, not a list"
+            )
+        if not results:
+            raise _no_such_collection(text)
+        hit = results[0]
+        if not isinstance(hit, dict):
+            raise _unusable_listing(
+                text, f"carried a first row as {type(hit).__name__}, not a record"
+            )
         # Tie the answer back to the question. Without this the resolver trusts that the
         # upstream applied the filter it was given, and any leniency — a dropped filter, a
         # loose match, a redirect answered by a different listing — resolves to a
         # plausible id for a collection nobody named, then caches it for the process
-        # lifetime. A non-dict row is checked in the same breath because the lookup wraps
-        # a non-dict JSON body as `{"results": <body>}`, and `.get` on a str would raise
-        # AttributeError, which no tool's `except ValueError` translates.
-        if hit is None or hit.get("foreign_id") != text:
-            raise ValueError(
-                f"no collection with foreign_id {text!r} is readable with this API key; "
-                "call list_collections to see what is available"
-            )
+        # lifetime.
+        if hit.get("foreign_id") != text:
+            raise _no_such_collection(text)
         resolved = check_collection_id(hit.get("id"))
         # A collection's numeric id never changes, so this needs no invalidation. Cached for
         # the process lifetime beside the instance model: a session works one or two

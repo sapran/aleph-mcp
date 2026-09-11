@@ -328,3 +328,176 @@ async def test_an_upstream_id_echoed_into_a_refusal_is_bounded_and_escaped() -> 
     message = str(excinfo.value)
     assert "\x1b" not in message, "a raw control character reached a model-visible message"
     assert "'" + "a" * 60 + "\\x1b" + '"' + "b" * 58 + "… [+2 chars]'" in message
+
+
+# -- the listing's shape is checked before it is indexed -----------------------
+
+# Every shape the resolver can be handed that is not a readable list of records. The
+# transport wraps a non-dict JSON body as `{"results": <body>}`, so the string and number
+# rows are real bodies an interstitial or a misrouted proxy produces, not invented ones.
+UNUSABLE_LISTINGS: list[tuple[str, dict[str, Any]]] = [
+    ("no-results-key", {"status": "error"}),
+    ("null-results", {"results": None}),
+    ("mapping-results", {"results": {"a": 1}}),
+    ("number-results", {"results": 5}),
+    ("bool-results", {"results": True}),
+    ("string-results", {"results": "<html>maintenance</html>"}),
+    ("null-first-row", {"results": [None]}),
+    ("string-first-row", {"results": ["my-case"]}),
+]
+
+
+@pytest.mark.parametrize(
+    "listing",
+    [row[1] for row in UNUSABLE_LISTINGS],
+    ids=[row[0] for row in UNUSABLE_LISTINGS],
+)
+async def test_an_unreadable_listing_is_refused_and_not_called_a_missing_collection(
+    listing: dict[str, Any],
+) -> None:
+    """The shapes this covers used to fail three different wrong ways.
+
+    A truthy non-list `results` reached `results[0]` and raised `KeyError: 0` or
+    `TypeError: not subscriptable`, which `server.py` does not translate — so it left this
+    server as a FastMCP fault rather than as a refusal. Everything else was reported as
+    "no collection with foreign_id X is readable with this API key; call list_collections",
+    which is an assertion about the caller's permissions derived from a body that said
+    nothing about them. A proxy, an SSO interstitial or an unfamiliar Aleph version
+    therefore produced a confident wrong diagnosis and a dead-end next step.
+    """
+    upstream = FakeUpstream(answer=listing)
+    resolve = resolver(upstream)
+    with pytest.raises(ValueError) as excinfo:
+        await resolve.resolve_one("my-case", context="search_entities")
+    message = str(excinfo.value)
+    assert "list_collections" not in message, (
+        f"an upstream malfunction must not send the caller to list_collections: {message}"
+    )
+    assert "API key" not in message, (
+        f"an upstream malfunction is not an authorisation problem: {message}"
+    )
+    assert "my-case" in message, f"the refusal must name what was being resolved: {message}"
+    assert resolve.cached == {}, "a listing that could not be read must resolve nothing"
+
+
+# Both malfunction branches — a non-list `results`, and a first row that is not a record —
+# with a different type on each row, so a refusal that hard-coded one type name rather than
+# reading it fails here instead of passing on the row that happens to agree.
+SHAPE_TYPE_NAMES: list[tuple[dict[str, Any], str]] = [
+    ({"results": {"a": 1}}, "dict"),
+    ({"results": 5}, "int"),
+    ({"results": True}, "bool"),
+    ({"results": "<html>"}, "str"),
+    ({"results": [None]}, "NoneType"),
+    ({"results": [5]}, "int"),
+    ({"results": ["my-case"]}, "str"),
+]
+
+
+@pytest.mark.parametrize(
+    ("listing", "type_name"),
+    SHAPE_TYPE_NAMES,
+    ids=[f"{row[1]}-{i}" for i, row in enumerate(SHAPE_TYPE_NAMES)],
+)
+async def test_an_unreadable_listing_names_the_type_it_received(
+    listing: dict[str, Any], type_name: str
+) -> None:
+    """The type is what identifies the malfunction, and it is read rather than assumed.
+
+    A refusal saying only "unusable" leaves the operator with nothing to grep a proxy log
+    for; `str` says "something answered with a page", `dict` says "an object where a list
+    belongs". Both branches are covered because each formats its own message.
+    """
+    upstream = FakeUpstream(answer=listing)
+    with pytest.raises(ValueError) as excinfo:
+        await resolver(upstream).resolve_one("my-case", context="search_entities")
+    message = str(excinfo.value)
+    assert type_name in message, f"the refusal must name the type received ({type_name}): {message}"
+
+
+@pytest.mark.parametrize(
+    "wrap",
+    [lambda body: {"results": body}, lambda body: {"results": [body]}],
+    ids=["non-list-results", "non-record-row"],
+)
+async def test_an_unreadable_listing_never_echoes_the_upstream_body(
+    wrap: Any,
+) -> None:
+    """The type identifies the malfunction; the value is unbounded upstream text.
+
+    Interpolating the body would put an attacker-influenceable string of unknown length
+    into the model's context — the defect `bound-ontology-echo` closed on the neighbouring
+    path. A type name is a closed vocabulary, so it needs no bound. Asserted on both
+    branches: they build their messages separately, so one can grow an echo the other
+    does not have.
+    """
+    body = "<html>" + "\x1b" + "A" * 5000 + "</html>"
+    upstream = FakeUpstream(answer=wrap(body))
+    with pytest.raises(ValueError) as excinfo:
+        await resolver(upstream).resolve_one("my-case", context="search_entities")
+    message = str(excinfo.value)
+    assert "str" in message, f"the refusal must name the type received: {message}"
+    assert "AAAA" not in message, f"the upstream body must not be echoed: {message[:200]}"
+    assert "\x1b" not in message, "a raw control character reached a model-visible message"
+    assert len(message) < 500, f"an upstream-shaped refusal must stay bounded: {len(message)}"
+
+
+async def test_the_empty_listing_is_the_one_shape_that_means_no_such_collection() -> None:
+    """Aleph answers a foreign_id nobody owns with a present, empty `results` list.
+
+    That is the only shape this server may read as an authorisation-or-existence problem.
+    The companion of the test above: together they pin that the two diagnoses are told
+    apart rather than one standing in for both.
+    """
+    upstream = FakeUpstream(answer={"total": 0, "results": []})
+    resolve = resolver(upstream)
+    with pytest.raises(ValueError) as excinfo:
+        await resolve.resolve_one("no-such-case", context="get_collection")
+    message = str(excinfo.value)
+    assert "list_collections" in message, f"a genuine miss keeps its next step: {message}"
+    assert "no collection with foreign_id" in message, message
+    assert resolve.cached == {}
+
+
+async def test_a_refused_listing_does_not_poison_a_later_good_one() -> None:
+    """Fail closed, not fail permanently. Nothing is cached on any refusal path, so the
+    same foreign_id resolves normally once the upstream recovers."""
+    answers: list[dict[str, Any]] = [
+        {"results": 5},
+        {"total": 1, "results": [{"id": "874", "foreign_id": "my-case"}]},
+    ]
+
+    async def flaky(foreign_id: str, context: str) -> dict[str, Any]:
+        return answers.pop(0)
+
+    resolve = resolver(flaky)
+    with pytest.raises(ValueError):
+        await resolve.resolve_one("my-case", context="search_entities")
+    assert resolve.cached == {}
+    assert await resolve.resolve_one("my-case", context="search_entities") == ResolvedCollection(
+        "874"
+    )
+
+
+# -- the all-collections literal means the same in either spelling -------------
+
+
+@pytest.mark.parametrize(
+    "collection",
+    [[ALL_COLLECTIONS], [ALL_COLLECTIONS, ALL_COLLECTIONS]],
+    ids=["single-element", "repeated"],
+)
+async def test_a_list_naming_only_the_literal_is_the_all_collections_scope(
+    collection: list[str | int],
+) -> None:
+    """`["*"]` names no other collection, so the mixed-scope refusal described a mistake
+    the caller did not make. The scalar `"*"` was always accepted; a caller building the
+    argument programmatically produces the list, and paid a turn for the difference.
+
+    The repeated case falls out of asking whether every element is the literal rather than
+    whether the list has one element — the same reading as the dedup one branch below.
+    """
+    assert parse_scope(collection) is None
+    scope = await resolver().resolve_scope(collection, context="search_entities")
+    assert scope.reported() == ALL_COLLECTIONS
+    assert scope.search_filters() == []
