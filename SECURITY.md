@@ -45,7 +45,8 @@ full in that release's notes:
   also documented a raw-`curl` fallback that stepped around the read-only guard.
 
 If you pinned a SHA at or before any of those points, move to the latest release. For the
-pre-0.1.5 case also re-store your Keychain entry under the host-scoped name.
+pre-0.1.5 case, overwrite the formerly legacy `aleph-mcp` Keychain service with the
+intended host, then store the API key under its host-scoped name.
 
 ## What this project treats as a security boundary
 
@@ -75,8 +76,8 @@ per-response nonce fence and labelled as data rather than instruction.
   otherwise reaching the model in a form that presents as server-authored instruction
   rather than as quoted data.
 - A response able to exhaust memory despite the streamed size ceiling.
-- The plugin credential lookup in `plugins/aleph/.mcp.json` yielding a key for a host it
-  was not minted for, or falling back to an ambient `ALEPHCLIENT_API_KEY`.
+- A Keychain-sourced API key being looked up under a service other than the resolved
+  host-scoped `aleph-mcp:<host>` name.
 
 ## Out of scope
 
@@ -91,3 +92,7 @@ per-response nonce fence and labelled as data rather than instruction.
 - The server trusting the operator's own environment. `ALEPHCLIENT_HOST` and
   `ALEPHCLIENT_API_KEY` are configuration; anyone who can set them can already run
   arbitrary code as you.
+- The launcher falling back to an `ALEPHCLIENT_*` value deliberately supplied by its
+  parent process when the corresponding Keychain lookup fails or is blank. The parent
+  environment is an explicit operator-controlled credential source, and the launcher
+  never prints the API key while selecting it.
