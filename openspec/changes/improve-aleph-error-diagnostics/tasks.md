@@ -40,7 +40,7 @@
 
 ## 3. Tests
 
-- [ ] 3.1 Mutation-prove each new assertion: reintroduce the old message, confirm the test
+- [x] 3.1 Mutation-prove each new assertion: reintroduce the old message, confirm the test
   fails with the reported symptom, restore. Record which mutation produced which failure.
 - [x] 3.2 Re-read every existing test asserting on these two messages. Error wording is the
   published contract here, so update each to the new contract and add exact assertions for
