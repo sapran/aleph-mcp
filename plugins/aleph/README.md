@@ -62,17 +62,18 @@ Optional: `ALEPH_MCP_TIMEOUT_SECS` (default `60`), `ALEPH_MCP_MAX_RETRIES` (defa
 `ALEPH_MCP_VERIFY_TLS` (default `true`; set `false` for a self-signed instance).
 
 **Never put the key itself in `plugins/aleph/.mcp.json`.** That committed file carries
-no credentials and does not override the process environment. At server start, the
-runtime chooses one complete host-and-key pair in this order:
+no credentials and does not override the process environment. At startup, the runtime
+selects the first **complete** host-and-key pair in this order:
 
-1. `ALEPHCLIENT_HOST` and `ALEPHCLIENT_API_KEY` already defined in the inherited process
-   environment.
-2. Those same two variables from `.env` in the current project directory.
+1. The inherited process environment — `ALEPHCLIENT_HOST` plus
+   `ALEPHCLIENT_API_KEY` (the `ALEPH_HOST` / `ALEPH_API_KEY` and `ALEPH_MCP_HOST` /
+   `ALEPH_MCP_API_KEY` aliases also work).
+2. The same pair in `<current project>/.env`.
 3. The macOS login Keychain entries described below.
 
-An incomplete higher-priority source is ignored rather than combined with a lower source.
-That prevents a host from an untrusted project file being paired with a Keychain API key.
-The `.env` file is parsed as configuration data; it is never shell-sourced.
+An incomplete source is ignored rather than combined with a lower-priority source. A
+host from a project `.env` therefore cannot be paired with a Keychain API key. The
+runtime parses `.env` as configuration data; it never shell-sources it.
 
 
 - **Per-instance override without touching the plugin** — also the answer to "I have two
@@ -96,7 +97,8 @@ The `.env` file is parsed as configuration data; it is never shell-sourced.
   }
   ```
 
-  A config `env` block is an overlay on the inherited environment, not a replacement.
+  An explicit server `env` block becomes part of the inherited process environment, so
+  it is tier 1; it is an overlay, not a replacement.
 
 ### Storing the host and key
 
@@ -144,9 +146,9 @@ aleph-mcp: set ALEPHCLIENT_HOST and ALEPHCLIENT_API_KEY (use a READ-only Aleph r
 ```
 
 That is the intended failure when none of the three sources provides a complete
-credential pair. The runtime checks the inherited environment first, then `<cwd>/.env`,
-then the two Keychain services. It still rejects the legacy refusal marker emitted by an
-older installed plugin manifest.
+credential pair. The runtime checks the inherited environment first, then
+`<current project>/.env`, then the two Keychain services. It still rejects the legacy
+refusal marker emitted by an older installed plugin manifest.
 
 ## Pinning and updates
 
