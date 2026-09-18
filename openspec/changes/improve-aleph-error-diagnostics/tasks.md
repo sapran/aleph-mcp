@@ -54,20 +54,20 @@
 
 ## 4. Land the spec
 
-- [ ] 4.1 Apply the `mcp-tool-surface` delta: one added requirement, one modified. Verify
+- [x] 4.1 Apply the `mcp-tool-surface` delta: one added requirement, one modified. Verify
   `openspec validate --strict` passes and that the modified requirement's untouched
   paragraphs are byte-identical to the published ones.
-- [ ] 4.2 Verify every scenario in the delta against the delivered behaviour one by one,
+- [x] 4.2 Verify every scenario in the delta against the delivered behaviour one by one,
   recording for each the assertion or output that satisfies it, so an unmet scenario is
   visible rather than assumed.
 
 ## 5. Verify
 
-- [ ] 5.1 Run the mocked suite and the linters: `uv run pytest tests/`,
+- [x] 5.1 Run the mocked suite and the linters: `uv run pytest tests/`,
   `uv run ruff check`, `uv run ruff format --check`, `uv run mypy src`. The live suite in
   `tests/live/` needs credentials and is not run here.
-- [ ] 5.2 Exercise the two messages through the tool seam rather than by calling the
+- [x] 5.2 Exercise the two messages through the tool seam rather than by calling the
   validator directly, so the text a caller actually receives is what was checked.
-- [ ] 5.3 Confirm the diff touches only `src/aleph_mcp/errors.py`,
+- [x] 5.3 Confirm the diff touches only `src/aleph_mcp/errors.py`,
   `src/aleph_mcp/transport.py`, `src/aleph_mcp/client.py`, `tests/`, and
   `openspec/`: `git diff --stat`.
