@@ -1379,3 +1379,55 @@ async def test_a_parsed_body_that_is_not_an_object_is_still_wrapped_not_refused(
     too would change what `scope.py` sees without saying so."""
     respx_mock.get(PROBE).mock(return_value=httpx.Response(200, json=[{"id": "874"}]))
     assert await transport.request("GET", PROBE, context="probe") == {"results": [{"id": "874"}]}
+
+
+async def test_a_503_refusal_carries_the_terminal_responses_advertised_wait(
+    transport: Transport, respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    """The wiring, not just the message: `_retry_delay` is skipped on the give-up path, so
+    the terminal response's header is read only because this path reads it explicitly."""
+    respx_mock.get(PROBE).mock(return_value=httpx.Response(503, headers={"Retry-After": "7"}))
+    with pytest.raises(ToolError) as exc:
+        await transport.request("GET", PROBE, context="probe")
+    message = str(exc.value)
+    assert "one this server retries" in message, message
+    assert "advertised a 7s wait" in message, message
+
+
+async def test_a_503_refusal_reports_silence_when_the_terminal_response_has_no_header(
+    transport: Transport, respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    respx_mock.get(PROBE).mock(return_value=httpx.Response(503))
+    with pytest.raises(ToolError) as exc:
+        await transport.request("GET", PROBE, context="probe")
+    assert "final response advertised no next wait" in str(exc.value)
+
+
+async def test_an_earlier_advertised_wait_does_not_become_the_refusals_claim(
+    transport: Transport, respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    """The claim is scoped to the final response. An earlier attempt advertising a wait
+    that was honoured must not make the refusal say a wait was advertised."""
+    responses = [
+        httpx.Response(503, headers={"Retry-After": "3"}),
+        httpx.Response(503, headers={"Retry-After": "3"}),
+        httpx.Response(503, headers={"Retry-After": "3"}),
+        httpx.Response(503),
+    ]
+    respx_mock.get(PROBE).mock(side_effect=responses)
+    with pytest.raises(ToolError) as exc:
+        await transport.request("GET", PROBE, context="probe")
+    message = str(exc.value)
+    assert "final response advertised no next wait" in message, message
+    assert "3s wait" not in message, message
+
+
+async def test_a_non_retryable_status_reached_through_the_transport_reports_no_retry_facts(
+    transport: Transport, respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    respx_mock.get(PROBE).mock(return_value=httpx.Response(418, headers={"Retry-After": "9"}))
+    with pytest.raises(ToolError) as exc:
+        await transport.request("GET", PROBE, context="probe")
+    message = str(exc.value)
+    assert "this server retries" not in message, message
+    assert "9s wait" not in message, message

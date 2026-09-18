@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import NoReturn
+from typing import NoReturn, Protocol
 
 import httpx
 from fastmcp.exceptions import ResourceError, ToolError
@@ -73,6 +73,55 @@ def _budget_clause(attempts: int) -> str:
     )
 
 
+class AdvertisedWaitLike(Protocol):
+    """The shape of a parsed `Retry-After`, structurally rather than by import.
+
+    `transport` imports this module, so this module cannot import `transport.AdvertisedWait`
+    back without a cycle. A protocol keeps the single parser in `transport` — the one place
+    the header is read — while letting the message composed here read its result.
+    """
+
+    @property
+    def state(self) -> str: ...
+
+    @property
+    def seconds(self) -> float | None: ...
+
+
+def _retry_clause(attempts: int, wait: AdvertisedWaitLike) -> str:
+    """What this server can say about a retryable status without inventing anything.
+
+    Three facts and no judgement: that the status is one this server retries, how many
+    attempts it spent, and what the *final* response advertised as a next wait. The
+    condition itself is deliberately not classified — the observed `503` bodies carry
+    Elasticsearch's `state not recovered / initialized`, which is not a contract and can
+    change without notice, so a caller's retry decision must not be derived from it.
+
+    The wait is reported as the advertised value normalised, never as the wait this call
+    would have taken: `Transport._request` clamps again by the call's remaining budget, so
+    a response advertising 30 s with 0.5 s left would have produced a 0.5 s sleep. Calling
+    the reported number an honoured wait would be false in exactly that case, and it is
+    the common one on this path, where the budget is frequently what ended the loop.
+    """
+    if wait.state == "seconds" and wait.seconds is not None:
+        advertised = (
+            f" Its final response advertised a {wait.seconds:g}s wait, normalised to this "
+            "server's retry ceiling; that is what the response asked for, not necessarily "
+            "what this call would have waited."
+        )
+    elif wait.state == "invalid":
+        advertised = (
+            " Its final response advertised a wait this server could not read, so no wait "
+            "value is reported."
+        )
+    else:
+        advertised = " Its final response advertised no next wait."
+    return (
+        f" This status is one this server retries; {attempts} attempt"
+        f"{'' if attempts == 1 else 's'} were made.{advertised}"
+    )
+
+
 def raise_for_status(
     resp: httpx.Response,
     *,
@@ -81,6 +130,8 @@ def raise_for_status(
     body: bytes | None = None,
     attempts: int = 0,
     budget_spent: bool = False,
+    retryable: bool = False,
+    advertised_wait: AdvertisedWaitLike | None = None,
 ) -> None:
     """Convert non-2xx HTTP responses to MCP errors. No-op for 2xx.
 
@@ -91,6 +142,11 @@ def raise_for_status(
     `budget_spent` says the caller stopped retrying a retryable status because the
     wall-clock budget ran out with attempts still allowed. Only the two branches a
     retryable status can reach report it; the rest cannot be told this and do not ask.
+
+    `retryable` and `advertised_wait` carry the retry facts for a status this server
+    retries: both default to the non-retryable case, so a caller that does not know them
+    produces exactly the message it produced before. `advertised_wait` is the parse of the
+    *final* response's `Retry-After`, from the one parser in `transport`.
     """
     if resp.is_success:
         return
@@ -98,6 +154,7 @@ def raise_for_status(
     err_cls = ResourceError if resource else ToolError
     detail = _upstream_detail(resp, body)
     budget = _budget_clause(attempts) if budget_spent else ""
+    retry = _retry_clause(attempts, advertised_wait) if retryable and advertised_wait else ""
 
     if resp.status_code == 401:
         raise err_cls(
@@ -124,11 +181,11 @@ def raise_for_status(
         # cause was a slow instance spending a wall-clock budget.
         exhausted = "" if budget_spent else " and retries are exhausted"
         raise err_cls(
-            f"{context}: rate limited (429){exhausted}.{budget} "
+            f"{context}: rate limited (429){exhausted}.{retry}{budget} "
             "Aleph limits anonymous callers to ~30 requests/minute; slow down or widen "
             "each query instead of issuing many narrow ones."
         )
-    raise err_cls(f"{context}: unexpected HTTP {resp.status_code}.{detail}{budget}")
+    raise err_cls(f"{context}: unexpected HTTP {resp.status_code}.{detail}{retry}{budget}")
 
 
 def raise_read_only(exc: ReadOnlyViolation, *, context: str, resource: bool = False) -> NoReturn:

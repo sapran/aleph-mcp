@@ -102,9 +102,29 @@ def _fence(text: str) -> str:
 _ENTITY_ID = re.compile(r"[A-Za-z0-9._:-]+")
 
 
+# Where a real identifier is read from, per field. A constant of the field and not an
+# inference from the rejected value: a "looks like a rendered label" test would be a second
+# classifier that misses every label shape it was not written for, while changing nothing
+# about what is accepted. Measured over a week of one consumer's traffic, nine calls passed
+# a rendered property label here, and the message named only the charset.
+_ID_SOURCE = {
+    "entity_id": "an entity id is the `id` field of a `search_entities` or `expand_entity` result row",
+    "profile_id": "a profile id is the `profile_id` field of an entity reply, present only where the instance has curated one",
+    "entityset_id": "an entityset id is the `id` field of a `list_entitysets` row",
+}
+
+
 def _check_entity_id(value: str, *, field: str = "entity_id") -> str:
     if not isinstance(value, str) or not _ENTITY_ID.fullmatch(value):
-        raise Refusal(f"invalid {field}: must match [A-Za-z0-9._:-]+ (got {value!r})")
+        # `.get`, not `[...]`: a field added later without an entry must lose the hint, not
+        # turn a refusal into a `KeyError` that the seam would refuse to dress as one.
+        source = _ID_SOURCE.get(field)
+        hint = (
+            f" Read it from a result rather than from a rendered display string: {source}."
+            if source
+            else ""
+        )
+        raise Refusal(f"invalid {field}: must match [A-Za-z0-9._:-]+ (got {value!r}).{hint}")
     # The charset permits `.`, so an id of only dot segments passes the pattern and is then
     # normalised away at URL construction — `/api/2/entitysets/../entities` becomes
     # `/api/2/entities`, answering a different question than the caller asked. Refuse on

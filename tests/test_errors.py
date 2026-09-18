@@ -13,6 +13,7 @@ from aleph_mcp.errors import (
     raise_unparsable_body,
     raise_unreachable,
 )
+from aleph_mcp.transport import parse_retry_after
 
 
 def _resp(status: int, text: str = "") -> httpx.Response:
@@ -329,3 +330,150 @@ def test_the_unparsable_body_refusal_is_not_itself_a_refusal() -> None:
     with pytest.raises(ToolError) as exc:
         raise_unparsable_body(ValueError("x"), context="ctx", status=200, size=64)
     assert not isinstance(exc.value, ValueError)
+
+
+def test_a_retryable_refusal_reports_retryability_and_attempt_count() -> None:
+    """The gap this closes: a 503 that spent its retries looked identical to one that
+    never retried, so a caller could not tell an incomplete sweep from a single miss."""
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(
+            _resp(503),
+            context="get_entity",
+            attempts=4,
+            retryable=True,
+            advertised_wait=parse_retry_after(_resp(503)),
+        )
+    message = str(exc.value)
+    assert "one this server retries" in message, message
+    assert "4 attempts were made" in message, message
+
+
+def test_an_absent_retry_after_is_reported_as_the_final_responses_silence() -> None:
+    """Scoped to the final response: an earlier attempt may have advertised a wait that
+    was honoured, so an unqualified "no wait was advertised" would be false."""
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(
+            _resp(503),
+            context="get_entity",
+            attempts=2,
+            retryable=True,
+            advertised_wait=parse_retry_after(_resp(503)),
+        )
+    message = str(exc.value)
+    assert "final response advertised no next wait" in message, message
+    assert "s wait" not in message, message
+
+
+def test_a_parsed_retry_after_is_reported_normalised_and_not_as_an_honoured_wait() -> None:
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(
+            _resp(503),
+            context="get_entity",
+            attempts=1,
+            retryable=True,
+            advertised_wait=parse_retry_after(
+                httpx.Response(
+                    503,
+                    headers={"Retry-After": "5"},
+                    request=httpx.Request("GET", "https://aleph.test/x"),
+                )
+            ),
+        )
+    message = str(exc.value)
+    assert "advertised a 5s wait" in message, message
+    assert "not necessarily what this call would have waited" in message, message
+
+
+def test_an_over_ceiling_retry_after_reports_the_ceiling_not_the_header() -> None:
+    """The header is untrusted upstream input: the reported number is this server's
+    bounded normalisation of it, never the raw value."""
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(
+            _resp(503),
+            context="get_entity",
+            attempts=1,
+            retryable=True,
+            advertised_wait=parse_retry_after(
+                httpx.Response(
+                    503,
+                    headers={"Retry-After": "900"},
+                    request=httpx.Request("GET", "https://aleph.test/x"),
+                )
+            ),
+        )
+    message = str(exc.value)
+    assert "advertised a 30s wait" in message, message
+    assert "900" not in message, message
+
+
+def test_an_unparseable_retry_after_is_distinguished_from_an_absent_one() -> None:
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(
+            _resp(503),
+            context="get_entity",
+            attempts=3,
+            retryable=True,
+            advertised_wait=parse_retry_after(
+                httpx.Response(
+                    503,
+                    headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"},
+                    request=httpx.Request("GET", "https://aleph.test/x"),
+                )
+            ),
+        )
+    message = str(exc.value)
+    assert "could not read" in message, message
+    assert "advertised no next wait" not in message, message
+
+
+def test_a_non_retryable_status_reports_no_retry_facts() -> None:
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(_resp(404), context="get_entity", attempts=1)
+    message = str(exc.value)
+    assert "this server retries" not in message, message
+    assert "attempts were made" not in message, message
+
+
+def test_the_upstream_body_does_not_decide_the_retryability_claim() -> None:
+    """The observed 503 bodies carry Elasticsearch's own words. They are echoed as
+    untrusted text and must not be restated as this server's classification."""
+    upstream = "blocked by: [SERVICE_UNAVAILABLE/1/state not recovered / initialized];"
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(
+            _json_resp(503, {"status": "error", "message": upstream}),
+            context="get_entity",
+            attempts=4,
+            retryable=True,
+            advertised_wait=parse_retry_after(_resp(503)),
+        )
+    message = str(exc.value)
+    assert "one this server retries" in message, message
+    assert "untrusted upstream text" in message, message
+    assert "not recovered" not in message.split("untrusted upstream text")[0], message
+
+
+def test_a_supplied_wait_is_ignored_when_the_status_is_not_retryable() -> None:
+    """`retryable` gates the clause, not the presence of a parsed wait: a caller that
+    supplies one for a status this server never retries must not be told it retried.
+
+    `418` rather than `404` deliberately: the `404` branch raises its own message and never
+    interpolates the retry clause, so it cannot observe the gate at all. Only a status
+    reaching the generic branch can.
+    """
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(
+            _resp(418),
+            context="get_entity",
+            attempts=3,
+            retryable=False,
+            advertised_wait=parse_retry_after(
+                httpx.Response(
+                    418,
+                    headers={"Retry-After": "9"},
+                    request=httpx.Request("GET", "https://aleph.test/x"),
+                )
+            ),
+        )
+    message = str(exc.value)
+    assert "this server retries" not in message, message
+    assert "9s wait" not in message, message
