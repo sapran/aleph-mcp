@@ -83,8 +83,8 @@ async def test_tool_names_carry_no_namespace_prefix(server: FastMCP) -> None:
 
 async def test_instructions_state_the_limits(server: FastMCP) -> None:
     async with MCPClient(server) as mcp:
-        # fastmcp 4 leaves `initialize_result` unpopulated on the in-memory transport and
-        # exposes the handshake's instructions on the client itself.
+        # fastmcp 4 negotiates with `server/discover`, so `initialize_result` is None on
+        # any modern connection; `Client.instructions` holds the handshake's instructions.
         text = mcp.instructions or ""
     assert "9999" in text
     assert "200" in text

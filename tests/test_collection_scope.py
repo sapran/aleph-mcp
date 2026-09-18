@@ -327,7 +327,7 @@ async def test_no_tool_advertises_a_second_spelling_of_the_scope(server: FastMCP
     `collection_id` to the caller."""
     async with MCPClient(server) as mcp:
         tools = await mcp.list_tools()
-    advertised = {t.name: set((t.inputSchema or {}).get("properties") or {}) for t in tools}
+    advertised = {t.name: set((t.input_schema or {}).get("properties") or {}) for t in tools}
     offenders = {
         name: sorted(props & FORBIDDEN_SCOPE_ARGS)
         for name, props in advertised.items()
@@ -630,7 +630,7 @@ async def test_a_numeric_json_collection_is_accepted(server: FastMCP) -> None:
     async with MCPClient(server) as mcp:
         for tool in await mcp.list_tools():
             if tool.name == "search_entities":
-                props = tool.inputSchema["properties"]["collection"]
+                props = tool.input_schema["properties"]["collection"]
     assert props is not None
     rendered = str(props)
     assert "integer" in rendered, f"a numeric id must be an accepted form: {rendered}"
