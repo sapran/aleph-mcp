@@ -32,8 +32,8 @@ def _payload(result: list) -> dict:
 
 async def test_resource_surface_is_exactly_the_read_set(server: FastMCP) -> None:
     async with MCPClient(server) as mcp:
-        static = {str(r.uri): r.mimeType for r in await mcp.list_resources()}
-        templates = {t.uriTemplate: t.mimeType for t in await mcp.list_resource_templates()}
+        static = {str(r.uri): r.mime_type for r in await mcp.list_resources()}
+        templates = {t.uri_template: t.mime_type for t in await mcp.list_resource_templates()}
     assert set(static) == {"aleph://collections", "aleph://schemata"}
     assert set(templates) == {"aleph://schema/{name}"}
     assert set(static.values()) | set(templates.values()) == {"application/json"}
@@ -240,7 +240,7 @@ async def test_every_registered_resource_is_read_here(server: FastMCP) -> None:
     whose only proof is that it appears in list_resource_templates fails this."""
     async with MCPClient(server) as mcp:
         static = {str(r.uri) for r in await mcp.list_resources()}
-        templates = [t.uriTemplate for t in await mcp.list_resource_templates()]
+        templates = [t.uri_template for t in await mcp.list_resource_templates()]
 
     assert not static - URIS_READ_HERE, "registered but never read"
     for template in templates:

@@ -129,11 +129,11 @@ async def main() -> None:
             templates = await mcp.list_resource_templates()
             out = {
                 "tools": {
-                    t.name: {"description": t.description, "input_schema": t.inputSchema}
+                    t.name: {"description": t.description, "input_schema": t.input_schema}
                     for t in sorted(tools, key=lambda t: t.name)
                 },
-                "resources": {str(r.uri): r.mimeType for r in resources},
-                "resource_templates": {t.uriTemplate: t.mimeType for t in templates},
+                "resources": {str(r.uri): r.mime_type for r in resources},
+                "resource_templates": {t.uri_template: t.mime_type for t in templates},
             }
     finally:
         await client.aclose()
