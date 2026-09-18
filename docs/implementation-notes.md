@@ -406,3 +406,19 @@ running the same loop for the match path or stating in the spec that the ceiling
   *because the ontology could not be read* now says so, composing with the endpoint's own note. The
   three requirements are in `openspec/specs/mcp-tool-surface`. `_schemata`'s comment naming this as
   its own live counterexample is corrected in the same change.
+## `Settings` silently drops a mistyped keyword argument
+
+`config.py` sets `extra="ignore"`, which is what lets an unrelated `ALEPH_MCP_*` variable or a
+shared `.env` entry pass without breaking startup. The cost is that a *keyword* argument is
+dropped just as quietly: `Settings(aleph_mcp_max_retries=2)` — the env-variable spelling rather
+than the field name `max_retries` — constructs successfully and leaves the default of 4 in place.
+Measured while probing the retry-facts change on 2026-09-19: a verification script appeared to
+prove a two-attempt refusal while actually exercising four, and nothing anywhere reported the
+mistake.
+
+Parked rather than fixed because the tolerance is deliberate for environment input and the fix is
+not obviously free — `extra="forbid"` would reject the env and `.env` cases this is there to
+absorb, so the real options are a validator that distinguishes init kwargs from environment
+sources, or leaving init-time typos to the type checker. Neither is in scope for an error-message
+change. Anything constructing `Settings` directly in a test or probe should use the field names
+and read the value back before trusting it.
