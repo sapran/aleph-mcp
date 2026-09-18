@@ -7,11 +7,7 @@
         "--from",
         "git+https://github.com/sapran/aleph-mcp.git@3952fb7a5c926b1372bec436ec90287aeeb5756b",
         "aleph-mcp"
-      ],
-      "env": {
-        "ALEPHCLIENT_HOST": "!if h=$(security find-generic-password -s \"aleph-mcp\" -a \"$USER\" -w 2>/dev/null); then :; else h=; fi; printf %s \"${h:-$ALEPHCLIENT_HOST}\"",
-        "ALEPHCLIENT_API_KEY": "!if h=$(security find-generic-password -s \"aleph-mcp\" -a \"$USER\" -w 2>/dev/null); then :; else h=; fi; h=${h:-$ALEPHCLIENT_HOST}; if k=$(security find-generic-password -s \"aleph-mcp:$h\" -a \"$USER\" -w 2>/dev/null); then :; else k=; fi; printf %s \"${k:-$ALEPHCLIENT_API_KEY}\""
-      }
+      ]
     }
   }
 }

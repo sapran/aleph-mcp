@@ -61,26 +61,19 @@ Two variables, both required:
 Optional: `ALEPH_MCP_TIMEOUT_SECS` (default `60`), `ALEPH_MCP_MAX_RETRIES` (default `4`),
 `ALEPH_MCP_VERIFY_TLS` (default `true`; set `false` for a self-signed instance).
 
-**Never put the key itself in `plugins/aleph/.mcp.json`.** That file is committed and
-shared. Its `env` block contains no secret: it reads the preferred host and its matching
-API key from the macOS login Keychain, then uses the corresponding inherited environment
-value only when that Keychain lookup is unavailable or blank.
+**Never put the key itself in `plugins/aleph/.mcp.json`.** That committed file carries
+no credentials and does not override the process environment. At server start, the
+runtime chooses one complete host-and-key pair in this order:
 
-- **The plugin (macOS) — Keychain first, environment fallback.** Store the host in the
-  `aleph-mcp` Keychain service and the API key under `aleph-mcp:<host>`, in that order as
-  shown below. A non-empty Keychain host wins over an inherited `ALEPHCLIENT_HOST`. The
-  API-key resolver independently selects that same raw host, then a non-empty host-scoped
-  Keychain key wins over an inherited `ALEPHCLIENT_API_KEY`.
+1. `ALEPHCLIENT_HOST` and `ALEPHCLIENT_API_KEY` already defined in the inherited process
+   environment.
+2. Those same two variables from `.env` in the current project directory.
+3. The macOS login Keychain entries described below.
 
-  When either lookup misses, its own inherited value is used verbatim. Therefore, a
-  Keychain host with no matching key combines with the inherited API key; when both
-  lookups miss, the inherited host and API key are used together. This also lets the
-  plugin run on a platform where the macOS `security` command is unavailable, provided
-  the parent process deliberately supplies both variables.
+An incomplete higher-priority source is ignored rather than combined with a lower source.
+That prevents a host from an untrusted project file being paired with a Keychain API key.
+The `.env` file is parsed as configuration data; it is never shell-sourced.
 
-  omp's `.env` precedence, highest first, is: inherited process environment →
-  `<cwd>/.env` → `~/.omp/agent/.env` → `~/.omp/.env` → `~/.env`. A variable already
-  present in the process environment is never overwritten by any `.env` file.
 
 - **Per-instance override without touching the plugin** — also the answer to "I have two
   Aleph instances". Declare a same-purpose server in `~/.omp/agent/mcp.json` with an
@@ -107,33 +100,19 @@ value only when that Keychain lookup is unavailable or blank.
 
 ### Storing the host and key
 
-Store the preferred host first:
+Only when neither the inherited environment nor the current project's `.env` provides
+both values, store the host and API key in distinct Keychain services:
 
 ```bash
-security add-generic-password -s "aleph-mcp" \
+security add-generic-password -s "aleph-mcp-host" \
   -a "$USER" -w "https://aleph.example.org" -U
-```
-
-Then store its API key under that exact raw host:
-
-```bash
-security add-generic-password -s "aleph-mcp:https://aleph.example.org" \
+security add-generic-password -s "aleph-mcp-api-key" \
   -a "$USER" -w '<api-key>' -U
 ```
 
-The host item uses the service name `aleph-mcp`. The API-key service name is
-`aleph-mcp:` followed by the selected host **exactly as stored** — same scheme and raw
-suffix. The launcher derives that host itself for both resolver commands, so it does not
-depend on an `env` evaluation order.
-
-**Why the API-key entry is host-scoped.** A Keychain-sourced API key is looked up only
-under the service for the resolved raw host. The launcher never prints a key or Keychain
-lookup diagnostics. If a relevant Keychain record is missing, the parent environment is
-the operator-controlled fallback for that field.
-
-Upgrading from 0.1.4 or earlier: the formerly legacy `aleph-mcp` service is now the host
-record. Overwrite it with the intended host using the first command before relying on the
-new plugin, then store the API key under the matching host-scoped name using the second.
+The distinct host service deliberately avoids the old `aleph-mcp` service, which prior
+releases used for an API key. A stale legacy key therefore cannot become the configured
+host. The launcher never prints a Keychain value or lookup diagnostic.
 
 ## Verify
 
@@ -164,14 +143,10 @@ aleph-mcp: configuration error: …
 aleph-mcp: set ALEPHCLIENT_HOST and ALEPHCLIENT_API_KEY (use a READ-only Aleph role).
 ```
 
-That is the intended failure when neither source supplies both required values. At every
-server start, the `env` block resolves the host from the `aleph-mcp` Keychain record then
-the inherited environment, and independently resolves the API key from the matching
-host-scoped Keychain record then the inherited environment. The runtime still rejects an
-empty key and the legacy refusal marker emitted by an older installed plugin manifest.
-
-If a host is not the one you expected, check the `aleph-mcp` Keychain record and the
-inherited `ALEPHCLIENT_HOST` value. The host record wins whenever it is non-empty.
+That is the intended failure when none of the three sources provides a complete
+credential pair. The runtime checks the inherited environment first, then `<cwd>/.env`,
+then the two Keychain services. It still rejects the legacy refusal marker emitted by an
+older installed plugin manifest.
 
 ## Pinning and updates
 

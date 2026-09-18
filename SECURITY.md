@@ -44,9 +44,9 @@ full in that release's notes:
   the limit was consulted, and the error path was not bounded at all. The bundled skill
   also documented a raw-`curl` fallback that stepped around the read-only guard.
 
-If you pinned a SHA at or before any of those points, move to the latest release. For the
-pre-0.1.5 case, overwrite the formerly legacy `aleph-mcp` Keychain service with the
-intended host, then store the API key under its host-scoped name.
+If you pinned a SHA at or before any of those points, move to the latest release. Current
+releases use separate `aleph-mcp-host` and `aleph-mcp-api-key` Keychain services, so the
+old `aleph-mcp` API-key entry is not read as configuration.
 
 ## What this project treats as a security boundary
 
@@ -76,8 +76,8 @@ per-response nonce fence and labelled as data rather than instruction.
   otherwise reaching the model in a form that presents as server-authored instruction
   rather than as quoted data.
 - A response able to exhaust memory despite the streamed size ceiling.
-- A Keychain-sourced API key being looked up under a service other than the resolved
-  host-scoped `aleph-mcp:<host>` name.
+- Credentials from different precedence sources being combined, allowing a host from a
+  project `.env` to be paired with a Keychain API key.
 
 ## Out of scope
 
@@ -89,10 +89,6 @@ per-response nonce fence and labelled as data rather than instruction.
 - Vulnerabilities in Aleph itself — report those to
   [alephdata/aleph](https://github.com/alephdata/aleph). Findings in how *this* server
   calls Aleph are in scope.
-- The server trusting the operator's own environment. `ALEPHCLIENT_HOST` and
-  `ALEPHCLIENT_API_KEY` are configuration; anyone who can set them can already run
-  arbitrary code as you.
-- The launcher falling back to an `ALEPHCLIENT_*` value deliberately supplied by its
-  parent process when the corresponding Keychain lookup fails or is blank. The parent
-  environment is an explicit operator-controlled credential source, and the launcher
-  never prints the API key while selecting it.
+- The server trusting a complete credential pair deliberately supplied by its parent
+  process. `ALEPHCLIENT_HOST` and `ALEPHCLIENT_API_KEY` are configuration; anyone who
+  can set both can already run arbitrary code as you.
