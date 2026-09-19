@@ -355,10 +355,10 @@ running the same loop for the match path or stating in the spec that the ceiling
   `openspec/specs/mcp-tool-surface`, and the partition is verified by a test that walks
   `httpx.TransportError`'s subclasses from the live module rather than listing them.
 
-- The version being written in three places with nothing checking they agree — which shipped
+- The version being written in several places with nothing checking they agree, which shipped
   0.1.4 to every marketplace user as 0.1.2, because the *catalog* version is what drives
-  change detection in `omp plugin upgrade`. **Fixed** by `tests/test_packaging.py`, which
-  asserts the three declared versions equal `aleph_mcp.__version__`.
+  marketplace change detection. **Fixed** by `tests/test_packaging.py`, which asserts the
+  Python package, marketplace catalog, Claude plugin, and native omp package versions agree.
 - The `$` anchor letting `entity_id="e1\n"` through, and `entityset_id=".."` normalising away to
   a different endpoint. **Fixed** by `fix-id-validation-anchors`; the validators now use
   `re.fullmatch`, as the allowlist always has.
@@ -425,11 +425,11 @@ and read the value back before trusting it.
 
 ## Nothing guards the release SHAs hardcoded in `README.md`
 
-`tests/test_packaging.py` pins the three version literals to each other because a 0.1.4 release
-once shipped as 0.1.2. The same defect class now lives one file over, unguarded: the README
-hardcodes the current release's full commit SHA in three places (the "latest release" line, the
-Path B `mcp.json` snippet, the opencode snippet), and nothing checks them against the newest tag
-or against the SHA pinned in `plugins/aleph/.mcp.json`. Found during the 0.5.1 cut on 2026-09-19,
+`tests/test_packaging.py` pins the four version literals to each other because a 0.1.4 release once
+shipped as 0.1.2. The same defect class now lives one file over, unguarded: the README hardcodes the
+current release's full commit SHA in three places (the "latest release" line, the Path C `mcp.json`
+snippet, and the opencode snippet), and nothing checks them against the newest tag or against the
+SHA pinned in both plugin MCP manifests. Found during the 0.5.1 cut on 2026-09-19,
 when the README being rewritten still advertised `v0.1.6` — four releases stale — as the commit to
 pin.
 

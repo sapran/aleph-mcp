@@ -33,35 +33,42 @@ Pin a commit on every path. An unpinned `git+` spec builds and runs whatever the
 head happens to be, in a process you have just handed your Aleph key. Latest release:
 **v0.5.1** = `327aa2965a9e31d3cd2b313c2c86f0b98c8dcdb4`.
 
-### Path A — omp or Claude Code, as a plugin (recommended)
+### Path A: omp native plugin (recommended for omp)
 
-This repository is itself a plugin marketplace, so one install delivers the server and the
-`aleph-mcp-entity-graph` method skill together, already pinned.
+Install the native omp package. It delivers the server and the
+`aleph-mcp-entity-graph` method skill without enabling Claude Code plugin discovery.
+
+omp's native package manager currently requires `bun` on `PATH`; the MCP server itself
+still runs through `uvx`.
 
 ```bash
-omp plugin marketplace add sapran/aleph-mcp
-omp plugin install aleph@aleph-mcp
+omp plugin install @sapran/aleph-mcp-plugin@0.5.1
 ```
 
-Claude Code: `/plugin marketplace add sapran/aleph-mcp`, then `/plugin install aleph@aleph-mcp`.
+Set the two credentials (see [Configure](#configure)), then restart omp. The package
+ships **no `env` block**, so it inherits the environment omp runs in. If that
+environment lacks the key, Aleph answers anonymously: HTTP 200, zero collections, no
+error anywhere.
 
-Then, in both cases:
+Verify with `/mcp list`: the server must appear as `aleph:mcp`, with tools named
+`mcp__aleph_mcp_<tool>`. Then make one real `list_collections` call. A non-zero `total`
+is the proof; a schema listing is not. Package details:
+[`plugins/aleph-omp/README.md`](plugins/aleph-omp/README.md).
 
-1. Set the two credentials — see [Configure](#configure). The plugin ships **no `env`
-   block**, so it inherits the environment its client runs in. If that environment lacks
-   the key, Aleph answers anonymously: HTTP 200, zero collections, no error anywhere.
-2. **Restart the session**, or run `/reload-plugins` — this plugin ships a skill as well
-   as a server, and `/mcp reload` refreshes only the MCP side, so it would load half the
-   install with no sign the other half is missing.
-3. Verify with `/mcp list` (the server appears as `aleph:mcp`) and one real call —
-   `list_collections`. A non-zero `total` is the proof; a schema listing is not.
+### Path B: Claude Code marketplace plugin
 
-The plugin namespaces its server as `aleph:mcp`, so tools reach the model as
-`mcp__aleph_mcp_<tool>` — e.g. `mcp__aleph_mcp_search_entities`. Credentials, several
-Aleph instances and running from a checkout:
+This repository is also a Claude Code plugin marketplace:
+
+```text
+/plugin marketplace add sapran/aleph-mcp
+/plugin install aleph@aleph-mcp
+```
+
+Restart Claude Code after installation, configure the same two credentials, and verify
+the MCP server plus the `aleph-mcp-entity-graph` skill. Marketplace details:
 [`plugins/aleph/README.md`](plugins/aleph/README.md).
 
-### Path B — any stdio MCP client, by hand
+### Path C: any stdio MCP client, by hand
 
 Project scope in omp is `.omp/mcp.json`; user scope is `~/.omp/agent/mcp.json`. Other
 clients use their own file.
@@ -220,9 +227,25 @@ honoured — it is wrong, expired, or the client never received it. Do not read 
 
 ## Update
 
+If omp previously installed `aleph@aleph-mcp` from this repository's marketplace,
+remove that old entry before installing the native package. Do this in every profile and
+scope where `omp plugin list` shows it, or both discovery paths can load Aleph:
+
 ```bash
-# Plugin (omp) — the action is `upgrade`, not `update`
-omp plugin upgrade aleph@aleph-mcp
+omp --profile <name> plugin uninstall aleph@aleph-mcp --scope user
+omp --profile <name> plugin marketplace remove aleph-mcp
+```
+
+Use `--scope project` instead when the old install was project-scoped. Omit
+`--profile <name>` only for the default profile.
+
+```bash
+# Native omp package: install the new version explicitly
+omp plugin install @sapran/aleph-mcp-plugin@<version>
+
+# Claude Code marketplace plugin
+/plugin marketplace update aleph-mcp
+/plugin update aleph@aleph-mcp
 
 # Standalone tool install
 uv tool upgrade aleph-mcp                # only follows the spec it was installed with
@@ -236,28 +259,32 @@ A hand-written `mcp.json` pins a SHA, so it never updates by itself: edit the SH
 caches the built environment per spec, so a changed SHA is a new environment and an
 unchanged one is never rebuilt.
 
-Restart the session afterwards — a running server keeps the old code. On the plugin path
-use `/reload-plugins`; `/mcp reload` is the right verb only for a hand-written `mcp.json`,
-because it refreshes MCP alone and cannot load this plugin's skill.
-There is no `--version` flag: the server ignores unknown arguments and starts anyway, so
-confirm the upgrade with `omp plugin list` (plugin path) or by re-reading the SHA in your
-`mcp.json` (hand-written path), then make one real call.
+Restart the client afterwards. A running server keeps the old code. There is no
+`--version` flag: the server ignores unknown arguments and starts anyway, so confirm the
+upgrade with the plugin manager or by re-reading the SHA in a hand-written `mcp.json`,
+then make one real call.
 
-Under omp, a plugin is installed **per profile**: `omp --profile <name> plugin upgrade …`
-updates only that profile, and other profiles keep their own version.
+Under omp, the native package is installed **per profile**:
+`omp --profile <name> plugin install @sapran/aleph-mcp-plugin@<version>` updates only that
+profile, and other profiles keep their own version.
 
 ## Remove
 
 ```bash
-# Plugin (omp)
-omp plugin uninstall aleph@aleph-mcp
-# Add `--scope user` or `--scope project` if you installed it in both; the bare form
-# refuses rather than guessing.
+# Native package in the default profile
+omp plugin uninstall @sapran/aleph-mcp-plugin
 
-# The marketplace entry survives an uninstall; list and drop it separately. The argument
-# is the marketplace name `aleph-mcp`, not the `aleph@aleph-mcp` plugin spelling above.
-omp plugin marketplace list
-omp plugin marketplace remove aleph-mcp
+# Native package in a named profile
+omp --profile <name> plugin uninstall @sapran/aleph-mcp-plugin
+
+# Remove old omp marketplace residue if this installation was migrated
+omp --profile <name> plugin uninstall aleph@aleph-mcp --scope user
+omp --profile <name> plugin uninstall aleph@aleph-mcp --scope project
+omp --profile <name> plugin marketplace remove aleph-mcp
+
+# Claude Code marketplace plugin
+/plugin uninstall aleph@aleph-mcp
+/plugin marketplace remove aleph-mcp
 
 # Standalone tool install
 uv tool uninstall aleph-mcp
@@ -265,6 +292,9 @@ uv tool uninstall aleph-mcp
 # uvx cache (built environments are not removed by the above)
 uv cache clean aleph-mcp
 ```
+
+For legacy residue, run only the scope command that matches the old install. Omit
+`--profile <name>` for the default profile.
 
 Then, in order:
 
