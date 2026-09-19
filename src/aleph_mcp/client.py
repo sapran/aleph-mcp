@@ -45,6 +45,14 @@ MAX_EXPAND = 200
 # cap again what is copied back, because the two are set by different parties.
 MAX_FACET_SIZE = 200
 
+# How many values are kept per property. `render(v, PROPERTY_VALUE)` bounds how long ONE
+# value may be; nothing bounded how MANY there were, which is the axis Aleph's NER fills:
+# an email from a long thread carries `namesMentioned`, `emailMentioned` and
+# `phoneMentioned` lists running to hundreds of entries. Same shape as MAX_FACET_SIZE, and
+# the overflow is reported in `_omitted_property_values` rather than dropped silently, so a
+# caller can see the list was cut.
+MAX_PROPERTY_VALUES = 25
+
 # How many times search_entities may re-ask with a smaller page after crossing the ceiling.
 # Each hop is a whole extra request against Aleph and buffers up to the ceiling again, so
 # this is deliberately small: the goal is a usable partial page, not a binary search for the
@@ -293,6 +301,47 @@ def derive_caption(entity: dict[str, Any], schemata: dict[str, Any] | None = Non
     return None
 
 
+def _stub_entity(value: dict[str, Any], schemata: dict[str, Any] | None) -> dict[str, Any]:
+    """Reduce a nested entity to the identity a caller can act on.
+
+    Aleph serialises an entity-valued property as a WHOLE entity — its own properties, both
+    timestamps, the mutable/writeable/score housekeeping and a links block of four absolute
+    URLs — so one `parent` Folder costs ~800 characters to say a file sits in a folder. The
+    `id` is the only part a caller can follow, and `get_entity` fetches the rest
+    deliberately: the same bargain `_TEXT_BLOB_PROPS` already strikes.
+
+    `_reduced` is what keeps the reduction honest. Every other lossy path here announces
+    itself — blobs in `_omitted_properties`, long strings via their own `… [+N chars]` tail,
+    long lists in `_omitted_property_values` — and without a marker a model cannot tell a
+    reduced entity from one that genuinely carries nothing but an id, so it cannot tell
+    whether following the id would buy it anything.
+    """
+    caption = derive_caption(value, schemata)
+    return {
+        "id": value["id"],
+        "schema": value.get("schema"),
+        "caption": render(caption, PROPERTY_VALUE) if caption else caption,
+        "_reduced": "identity only; call get_entity with this id for the full entity",
+    }
+
+
+def _slim_value(value: Any, schemata: dict[str, Any] | None) -> Any:
+    """Bound one property value: strings by length, nested entities to an identity stub.
+
+    The entity test requires a string `id` rather than merely a dict, because the stub's
+    whole promise is that the id remains followable. A dict without one is not an entity we
+    can reduce — flattening it would throw every byte away and leave nothing to refetch
+    with — so it is passed through as it came. Anything else, a number or a bool or None,
+    is already small and is passed through too, which is what the scalar-passthrough
+    contract in the tests depends on.
+    """
+    if isinstance(value, str):
+        return render(value, PROPERTY_VALUE)
+    if isinstance(value, dict) and isinstance(value.get("id"), str):
+        return _stub_entity(value, schemata)
+    return value
+
+
 def _collection_id(entity: dict[str, Any]) -> str | None:
     """Aleph nests the collection object in search hits and omits `collection_id`."""
     direct = entity.get("collection_id")
@@ -313,12 +362,15 @@ def slim_entity(entity: dict[str, Any], schemata: dict[str, Any] | None = None) 
     """
     props: dict[str, Any] = {}
     dropped: list[str] = []
+    omitted_values: dict[str, int] = {}
     for name, values in (entity.get("properties") or {}).items():
         if name in _TEXT_BLOB_PROPS:
             dropped.append(name)
             continue
         if isinstance(values, list):
-            props[name] = [render(v, PROPERTY_VALUE) if isinstance(v, str) else v for v in values]
+            if len(values) > MAX_PROPERTY_VALUES:
+                omitted_values[name] = len(values) - MAX_PROPERTY_VALUES
+            props[name] = [_slim_value(v, schemata) for v in values[:MAX_PROPERTY_VALUES]]
         else:
             props[name] = values
 
@@ -334,6 +386,11 @@ def slim_entity(entity: dict[str, Any], schemata: dict[str, Any] | None = None) 
             slim[optional] = entity[optional]
     if dropped:
         slim["_omitted_properties"] = sorted(dropped)
+    if omitted_values:
+        # Not `_omitted_values`: `_slim_facets` and `_slim_tags` already use that name for an
+        # int total, and one search reply carries both. A key whose type depends on where it
+        # is found is a reliable source of misreading for the model this is written for.
+        slim["_omitted_property_values"] = omitted_values
     return slim
 
 

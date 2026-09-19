@@ -21,6 +21,7 @@ from aleph_mcp.client import (
     MAX_EXPAND,
     MAX_FACET_SIZE,
     MAX_PAGE,
+    MAX_PROPERTY_VALUES,
     MAX_SEARCH_SHRINKS,
     MAX_SUGGESTION_CHARS,
     MAX_SUGGESTIONS,
@@ -94,6 +95,57 @@ def test_slim_entity_keeps_a_scalar_property_value() -> None:
     """Truncation applies per list item; a scalar value is passed through as it came."""
     out = slim_entity(raw_entity(properties={"summary": "z" * 2000}))
     assert out["properties"]["summary"] == "z" * 2000
+
+
+def test_slim_entity_reduces_a_nested_entity_to_a_followable_stub() -> None:
+    """Aleph nests a whole entity to say a file sits in a folder; keep only what is actionable."""
+    out = slim_entity(
+        raw_entity(
+            properties={
+                "parent": [
+                    {
+                        "id": "14384680.08014cd",
+                        "schema": "Folder",
+                        "properties": {"fileName": ["files"], "bodyText": ["B" * 9000]},
+                        "links": {"self": "https://aleph.example.org/api/2/entities/1"},
+                        "writeable": True,
+                    }
+                ],
+                "name": ["Jane"],
+            }
+        )
+    )
+    stub = out["properties"]["parent"][0]
+    assert stub == {
+        "id": "14384680.08014cd",
+        "schema": "Folder",
+        "caption": "files",
+        "_reduced": "identity only; call get_entity with this id for the full entity",
+    }
+    # A non-dict value must not be caught by the entity branch.
+    assert out["properties"]["name"] == ["Jane"]
+
+
+def test_slim_entity_passes_through_a_dict_that_is_not_an_entity() -> None:
+    """Without a followable id there is nothing to refetch, so reducing it would lose it all."""
+    payload = {"amount": 1000, "currency": "USD", "note": "wire transfer"}
+    out = slim_entity(raw_entity(properties={"weird": [payload]}))
+    assert out["properties"]["weird"] == [payload]
+
+
+def test_slim_entity_bounds_a_long_property_value_list() -> None:
+    """Aleph's NER fills these lists to hundreds; the overflow must be reported, not dropped."""
+    out = slim_entity(raw_entity(properties={"namesMentioned": [f"n{i}" for i in range(500)]}))
+    assert len(out["properties"]["namesMentioned"]) == MAX_PROPERTY_VALUES
+    assert out["_omitted_property_values"] == {"namesMentioned": 500 - MAX_PROPERTY_VALUES}
+
+
+def test_slim_entity_keeps_every_value_at_the_bound_and_says_nothing_was_cut() -> None:
+    """At exactly the bound nothing is omitted, so the marker must not claim otherwise."""
+    at_bound = [f"n{i}" for i in range(MAX_PROPERTY_VALUES)]
+    out = slim_entity(raw_entity(properties={"namesMentioned": at_bound}))
+    assert out["properties"]["namesMentioned"] == at_bound
+    assert "_omitted_property_values" not in out
 
 
 # -- collections ---------------------------------------------------------------
