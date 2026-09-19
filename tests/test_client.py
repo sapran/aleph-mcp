@@ -1,17 +1,21 @@
+import inspect
 import re
 from collections.abc import Callable, Iterator
 from itertools import pairwise
+from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 import pytest
 import respx
+from fastmcp import Client as MCPClient
 from fastmcp.exceptions import ResourceError, ToolError
 from pydantic import TypeAdapter
 
 from aleph_mcp.client import (
     _FALLBACK_CAPTION_NOTE,
+    _ID_SOURCE,
     _MODEL_FAILURE_TTL,
     _SHAPED_ENDPOINTS,
     MAX_EXPAND,
@@ -22,6 +26,7 @@ from aleph_mcp.client import (
     MAX_SUGGESTIONS,
     AlephClient,
     _AsIs,
+    _check_entity_id,
     _Ent,
     _MarkerEscaped,
     _shape,
@@ -30,8 +35,10 @@ from aleph_mcp.client import (
     derive_caption,
     slim_entity,
 )
+from aleph_mcp.config import Settings
 from aleph_mcp.echo import SCHEMA_NAME
 from aleph_mcp.errors import Refusal, ResponseTooLarge
+from aleph_mcp.server import build_server
 from aleph_mcp.transport import MAX_RESPONSE_BYTES, Transport
 from tests.conftest import assert_model_not_fetched
 from tests.shapes import (
@@ -2583,3 +2590,87 @@ async def test_an_unknown_schema_name_is_refused_by_type(
     )
     with pytest.raises(Refusal):
         await client.get_schema(name="Persson")
+
+
+@pytest.mark.parametrize(
+    ("field", "needle"),
+    [
+        ("entity_id", "`id` field of a `search_entities` or `expand_entity` result row"),
+        ("profile_id", "`profile_id` field of an entity reply"),
+        ("entityset_id", "`id` field of a `list_entitysets` row"),
+    ],
+)
+def test_each_validated_identifier_field_names_its_own_source(field: str, needle: str) -> None:
+    """Measured: nine calls passed a rendered property label where an id belongs, against
+    a message that named only the accepted charset."""
+    with pytest.raises(Refusal) as exc:
+        _check_entity_id("Email 1.2", field=field)
+    message = str(exc.value)
+    assert needle in message, message
+    others = {
+        "`search_entities`": "entity_id",
+        "an entity reply": "profile_id",
+        "`list_entitysets`": "entityset_id",
+    }
+    for fragment, owner in others.items():
+        if owner != field:
+            assert fragment not in message, message
+
+
+def test_the_source_clause_does_not_depend_on_the_rejected_value() -> None:
+    """A constant of the field, not a "looks like a label" classifier: a second classifier
+    would miss every label shape it was not written for."""
+    with pytest.raises(Refusal) as label_exc:
+        _check_entity_id("Email 1.2")
+    with pytest.raises(Refusal) as arbitrary_exc:
+        _check_entity_id("abc!")
+    label = str(label_exc.value)
+    arbitrary = str(arbitrary_exc.value)
+    clause = "Read it from a result rather than from a rendered display string:"
+    assert clause in label, label
+    assert clause in arbitrary, arbitrary
+    assert label.split(clause)[1] == arbitrary.split(clause)[1]
+
+
+def test_the_charset_and_the_echo_of_the_rejected_value_are_unchanged() -> None:
+    with pytest.raises(Refusal) as exc:
+        _check_entity_id("Pages 1.1")
+    message = str(exc.value)
+    assert "must match [A-Za-z0-9._:-]+ (got 'Pages 1.1')" in message, message
+
+
+def test_an_unmapped_field_loses_the_hint_rather_than_raising() -> None:
+    """A field added later without an entry must still produce a refusal: a `KeyError`
+    here is an exception nobody composed, which the seam must not dress as one."""
+    with pytest.raises(Refusal) as exc:
+        _check_entity_id("x y", field="some_future_id")
+    message = str(exc.value)
+    assert "invalid some_future_id" in message, message
+    assert "Read it from a result" not in message, message
+
+
+def test_every_validated_field_has_a_source_entry() -> None:
+    """The published requirement is unconditional: a refused identifier names its source.
+    `.get` fails open, so a fourth field added with no `_ID_SOURCE` entry would violate
+    that with a green suite. This ties the entries to the call sites."""
+    source = Path(inspect.getsourcefile(_check_entity_id) or "").read_text()
+    used = set(re.findall(r'_check_entity_id\([^)]*field="([a-z_]+)"', source))
+    used.add("entity_id")  # the default, passed at the bare call sites
+    missing = used - set(_ID_SOURCE)
+    assert not missing, f"fields validated with no source clause: {sorted(missing)}"
+
+
+async def test_the_identifier_hint_reaches_a_caller_through_the_tool_seam() -> None:
+    """Asserted through the server, not the private validator: the seam translates
+    `Refusal` with `str(e)`, and a change there would drop the clause silently."""
+    settings = Settings(alephclient_host="https://aleph.test", alephclient_api_key="k")
+    server, aleph = build_server(settings)
+    try:
+        async with MCPClient(server) as mcp:
+            result = await mcp.call_tool_mcp("get_entity", {"entity_id": "Email 1.2"})
+    finally:
+        await aleph.aclose()
+    assert result.is_error
+    text = result.content[0].text
+    assert "must match [A-Za-z0-9._:-]+ (got 'Email 1.2')" in text, text
+    assert "`id` field of a `search_entities` or `expand_entity` result row" in text, text

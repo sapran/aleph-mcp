@@ -34,7 +34,9 @@ from aleph_mcp.transport import (
     MAX_RESPONSE_BYTES,
     MAX_RETRY_SLEEP_SECS,
     Transport,
+    _backoff_delay,
     _has_tls_cause,
+    _retry_delay,
 )
 from tests.conftest import assert_model_not_fetched
 
@@ -1379,3 +1381,124 @@ async def test_a_parsed_body_that_is_not_an_object_is_still_wrapped_not_refused(
     too would change what `scope.py` sees without saying so."""
     respx_mock.get(PROBE).mock(return_value=httpx.Response(200, json=[{"id": "874"}]))
     assert await transport.request("GET", PROBE, context="probe") == {"results": [{"id": "874"}]}
+
+
+async def test_a_503_refusal_carries_the_terminal_responses_advertised_wait(
+    transport: Transport, respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    """The wiring, not just the message: `_retry_delay` is skipped on the give-up path, so
+    the terminal response's header is read only because this path reads it explicitly."""
+    respx_mock.get(PROBE).mock(return_value=httpx.Response(503, headers={"Retry-After": "7"}))
+    with pytest.raises(ToolError) as exc:
+        await transport.request("GET", PROBE, context="probe")
+    message = str(exc.value)
+    assert "one this server retries" in message, message
+    assert "advertised a 7s wait" in message, message
+
+
+async def test_a_503_refusal_reports_silence_when_the_terminal_response_has_no_header(
+    transport: Transport, respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    respx_mock.get(PROBE).mock(return_value=httpx.Response(503))
+    with pytest.raises(ToolError) as exc:
+        await transport.request("GET", PROBE, context="probe")
+    assert "final response advertised no next wait" in str(exc.value)
+
+
+async def test_an_earlier_advertised_wait_does_not_become_the_refusals_claim(
+    transport: Transport, respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    """The claim is scoped to the final response. An earlier attempt advertising a wait
+    that was honoured must not make the refusal say a wait was advertised."""
+    responses = [
+        httpx.Response(503, headers={"Retry-After": "3"}),
+        httpx.Response(503, headers={"Retry-After": "3"}),
+        httpx.Response(503, headers={"Retry-After": "3"}),
+        httpx.Response(503),
+    ]
+    respx_mock.get(PROBE).mock(side_effect=responses)
+    with pytest.raises(ToolError) as exc:
+        await transport.request("GET", PROBE, context="probe")
+    message = str(exc.value)
+    assert "final response advertised no next wait" in message, message
+    assert "3s wait" not in message, message
+
+
+async def test_a_non_retryable_status_reached_through_the_transport_reports_no_retry_facts(
+    transport: Transport, respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    respx_mock.get(PROBE).mock(return_value=httpx.Response(418, headers={"Retry-After": "9"}))
+    with pytest.raises(ToolError) as exc:
+        await transport.request("GET", PROBE, context="probe")
+    message = str(exc.value)
+    assert "this server retries" not in message, message
+    assert "9s wait" not in message, message
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        (None, None),  # absent -> exponential backoff
+        ("0", 0.0),  # an immediate retry, not a backoff
+        ("5", 5.0),
+        ("900", MAX_RETRY_SLEEP_SECS),  # clamped to the ceiling
+        ("-3", None),  # not delay-seconds -> backoff, never a negative sleep
+        ("5.5", None),
+        ("inf", None),
+        ("nan", None),
+        ("Wed, 21 Oct 2026 07:28:00 GMT", None),
+    ],
+)
+def test_the_sleep_path_reads_retry_after_exactly_as_before(
+    header: str | None, expected: float | None
+) -> None:
+    """The refactor moved the header read into `parse_retry_after`; this pins what the
+    retry loop actually sleeps, which the message tests cannot see. `None` means the
+    header is unusable and exponential backoff decides instead."""
+    resp = httpx.Response(
+        503,
+        headers={} if header is None else {"Retry-After": header},
+        request=httpx.Request("GET", "https://aleph.test/x"),
+    )
+    attempt = 3
+    delay = _retry_delay(resp, attempt)
+    assert delay == (_backoff_delay(attempt) if expected is None else expected)
+
+
+async def test_a_429_refusal_carries_the_retry_facts(
+    transport: Transport, respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    """429 is in the retried set, so the requirement covers it -- and it is the one branch
+    where the new clause sits beside the pre-existing "retries are exhausted" phrase."""
+    respx_mock.get(PROBE).mock(return_value=httpx.Response(429, headers={"Retry-After": "12"}))
+    with pytest.raises(ToolError) as exc:
+        await transport.request("GET", PROBE, context="probe")
+    message = str(exc.value)
+    assert "rate limited (429)" in message, message
+    assert "one this server retries" in message, message
+    assert "advertised a 12s wait" in message, message
+
+
+async def test_a_narrow_budget_does_not_change_the_reported_wait(
+    respx_mock: respx.MockRouter, no_sleep: None
+) -> None:
+    """The reported value is the advertised wait normalised by the ceiling alone. The
+    transport also clamps by the remaining budget, so this is the case where calling the
+    number an honoured wait would be false."""
+    clock = iter([0.0, 0.0, 100.0, 100.0, 200.0, 200.0, 300.0, 300.0])
+    settings = Settings(
+        alephclient_host="https://aleph.test",
+        alephclient_api_key="k",
+        timeout_secs=25.0,
+    )
+    transport = Transport(settings, monotonic=lambda: next(clock))
+    respx_mock.get(PROBE).mock(return_value=httpx.Response(503, headers={"Retry-After": "5"}))
+    try:
+        with pytest.raises(ToolError) as exc:
+            await transport.request("GET", PROBE, context="probe")
+    finally:
+        await transport.aclose()
+    message = str(exc.value)
+    assert "advertised a 5s wait" in message, message
+    assert "not necessarily what this call would have waited" in message, message
+    assert "wall-clock budget" in message, message

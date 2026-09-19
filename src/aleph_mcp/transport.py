@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import asyncio
 import json as jsonlib
+import re
 import ssl
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, Literal
 
 import httpx
@@ -134,13 +136,64 @@ def _backoff_delay(attempt: int) -> float:
     return min(MAX_RETRY_SLEEP_SECS, float(2 ** (attempt - 1)))
 
 
-def _retry_delay(resp: httpx.Response, attempt: int) -> float:
+@dataclass(frozen=True, slots=True)
+class AdvertisedWait:
+    """What one response's `Retry-After` header advertised, as this server reads it.
+
+    Three states, because the refusal must tell them apart and a bare `float | None`
+    cannot: a header this server parsed (`seconds`), a header present in a form it does
+    not parse (`invalid`), and no header at all (`absent`). Folding the middle case into
+    either of the others is what would let a refusal say the response advertised nothing
+    when it did.
+
+    `seconds` is already bounded by `MAX_RETRY_SLEEP_SECS`. It is the *advertised* wait
+    normalised, NOT the wait a call would have taken: the retry loop clamps again by the
+    call's remaining wall-clock budget, so the two diverge whenever the budget is the
+    binding constraint.
+    """
+
+    state: Literal["absent", "invalid", "seconds"]
+    seconds: float | None = None
+
+
+ABSENT_WAIT = AdvertisedWait("absent")
+_INVALID_WAIT = AdvertisedWait("invalid")
+
+
+# RFC 9110's `delay-seconds` is `1*DIGIT` and nothing else. `float()` accepts far more --
+# `nan`, `inf`, `1e400`, `-3`, `5.5` -- and the clamp then turns each into a plausible
+# number the refusal would report as what the response asked for. Measured before this was
+# tightened: `nan` produced "advertised a 0s wait" and `inf` "advertised a 30s wait", both
+# false and both indistinguishable from an honest `0` or `30`. The `nan` bound was not even
+# designed: it held only because `max(0.0, nan)` is `0.0`, `nan > 0.0` being False.
+_DELAY_SECONDS = re.compile(r"[0-9]+")
+
+
+def parse_retry_after(resp: httpx.Response) -> AdvertisedWait:
+    """Read `Retry-After` off one response, bounded and classified.
+
+    The single reader of this header. The retry loop uses it to decide how long to sleep
+    and the refusal path uses it to say what the final response asked for; two readers
+    would be how the number slept and the number reported drift apart.
+
+    Anything that is not `delay-seconds` is `invalid`, not a number: the HTTP-date form
+    RFC 9110 also allows, and every shape `float()` would have accepted. `invalid` says
+    this server saw a header and could not use it, which is the only honest report.
+    """
     retry_after = resp.headers.get("Retry-After")
-    if retry_after:
-        try:
-            return min(MAX_RETRY_SLEEP_SECS, max(0.0, float(retry_after)))
-        except ValueError:
-            pass
+    if not retry_after:
+        return ABSENT_WAIT
+    if not _DELAY_SECONDS.fullmatch(retry_after.strip()):
+        return _INVALID_WAIT
+    # Bounded after parsing, never before: the ceiling is what this server is willing to
+    # sleep, and it is also what keeps an upstream-chosen number out of the message.
+    return AdvertisedWait("seconds", min(MAX_RETRY_SLEEP_SECS, float(retry_after.strip())))
+
+
+def _retry_delay(resp: httpx.Response, attempt: int) -> float:
+    wait = parse_retry_after(resp)
+    if wait.state == "seconds" and wait.seconds is not None:
+        return wait.seconds
     return _backoff_delay(attempt)
 
 
@@ -202,6 +255,8 @@ class Transport:
         body = b""
         spent = 0
         by_budget = False
+        was_retryable = False
+        final_wait: AdvertisedWait | None = None
         follow = self._http.follow_redirects if follow_redirects is None else follow_redirects
         # One tool call, one budget. Each hop's backoff is clamped, but an upstream that
         # answers every attempt with a Retry-After — or a host that swallows every connect
@@ -259,6 +314,12 @@ class Transport:
                                 and attempt < attempts
                                 and budget <= 0
                             )
+                            # The terminal response's own advertisement. `_retry_delay` is
+                            # skipped on this path -- `delay` above is 0.0 when giving up --
+                            # so without reading it here the refusal could say nothing about
+                            # what the response that actually failed asked for.
+                            was_retryable = resp.status_code in _RETRY_STATUS
+                            final_wait = parse_retry_after(resp) if was_retryable else None
                             body = await self._read_body(resp, context=context, resource=resource)
                             break
                 except (httpx.RequestError, ssl.SSLError) as e:
@@ -378,6 +439,8 @@ class Transport:
             body=body,
             attempts=spent,
             budget_spent=by_budget,
+            retryable=was_retryable,
+            advertised_wait=final_wait,
         )
         # Guarded, because the two `ValueError` shapes this fails with are what the tool seam
         # used to translate as a family -- not because they are every way it can fail, which
