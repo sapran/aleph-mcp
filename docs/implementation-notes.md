@@ -422,3 +422,19 @@ absorb, so the real options are a validator that distinguishes init kwargs from 
 sources, or leaving init-time typos to the type checker. Neither is in scope for an error-message
 change. Anything constructing `Settings` directly in a test or probe should use the field names
 and read the value back before trusting it.
+
+## Nothing guards the release SHAs hardcoded in `README.md`
+
+`tests/test_packaging.py` pins the three version literals to each other because a 0.1.4 release
+once shipped as 0.1.2. The same defect class now lives one file over, unguarded: the README
+hardcodes the current release's full commit SHA in three places (the "latest release" line, the
+Path B `mcp.json` snippet, the opencode snippet), and nothing checks them against the newest tag
+or against the SHA pinned in `plugins/aleph/.mcp.json`. Found during the 0.5.1 cut on 2026-09-19,
+when the README being rewritten still advertised `v0.1.6` — four releases stale — as the commit to
+pin.
+
+Parked rather than fixed because a check has to decide what "current" means at a point where the
+tag deliberately lags the pin commit by one commit, so it cannot simply compare against
+`git describe`. The honest shape is probably a test asserting the README's SHAs equal the SHA in
+`plugins/aleph/.mcp.json`, leaving only that one file to be right — but that is a release-process
+change, not part of a docs hotfix.

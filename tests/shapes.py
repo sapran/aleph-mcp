@@ -55,6 +55,7 @@ SLIM_OPTIONAL = frozenset(
         "first_seen",
         "last_seen",
         "_omitted_properties",
+        "_omitted_property_values",
     }
 )
 

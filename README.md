@@ -26,16 +26,141 @@ human — deliberately not this server.
 
 ## Install
 
-Requires Python ≥ 3.12 and [`uv`](https://github.com/astral-sh/uv).
+Requires Python ≥ 3.12 and [`uv`](https://github.com/astral-sh/uv). `aleph-mcp` is not on
+PyPI, so every path below uses a `git+` spec — a bare `uvx aleph-mcp` resolves nothing.
+
+Pin a commit on every path. An unpinned `git+` spec builds and runs whatever the branch
+head happens to be, in a process you have just handed your Aleph key. Latest release:
+**v0.5.0** = `e0853e15b22b9b30468f3aa07df349fa3d011500`.
+
+### Path A — omp or Claude Code, as a plugin (recommended)
+
+This repository is itself a plugin marketplace, so one install delivers the server and the
+`aleph-mcp-entity-graph` method skill together, already pinned.
 
 ```bash
-# Pin a release commit: this server is handed your Aleph key, and an unpinned git+ spec
-# builds and runs whatever the branch head happens to be. Latest tag: v0.1.6.
-uv tool install git+https://github.com/sapran/aleph-mcp.git@<commit-sha>
+omp plugin marketplace add sapran/aleph-mcp
+omp plugin install aleph@aleph-mcp
+```
 
-# Or, from a checkout:
+Claude Code: `/plugin marketplace add sapran/aleph-mcp`, then `/plugin install aleph@aleph-mcp`.
+
+Then, in both cases:
+
+1. Set the two credentials — see [Configure](#configure). The plugin ships **no `env`
+   block**, so it inherits the environment its client runs in. If that environment lacks
+   the key, Aleph answers anonymously: HTTP 200, zero collections, no error anywhere.
+2. **Restart the session**, or run `/reload-plugins` — this plugin ships a skill as well
+   as a server, and `/mcp reload` refreshes only the MCP side, so it would load half the
+   install with no sign the other half is missing.
+3. Verify with `/mcp list` (the server appears as `aleph:mcp`) and one real call —
+   `list_collections`. A non-zero `total` is the proof; a schema listing is not.
+
+The plugin namespaces its server as `aleph:mcp`, so tools reach the model as
+`mcp__aleph_mcp_<tool>` — e.g. `mcp__aleph_mcp_search_entities`. Credentials, several
+Aleph instances and running from a checkout:
+[`plugins/aleph/README.md`](plugins/aleph/README.md).
+
+### Path B — any stdio MCP client, by hand
+
+Project scope in omp is `.omp/mcp.json`; user scope is `~/.omp/agent/mcp.json`. Other
+clients use their own file.
+
+```json
+{
+  "mcpServers": {
+    "aleph": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/sapran/aleph-mcp.git@e0853e15b22b9b30468f3aa07df349fa3d011500", "aleph-mcp"]
+    }
+  }
+}
+```
+
+No `env` block — credentials come from the environment the client itself runs in. Under
+omp this form is not plugin-namespaced, so its tools are `mcp__aleph_<tool>`.
+
+**Prefer no `env` block at all.** The server reads the credential pair itself — the
+environment, then `.env`, then the Keychain — so there is nothing for the client to pass.
+
+If you do add one under omp, know the fallback rule: omp substitutes the value of an
+environment variable when you name the variable as its own value, **but if that variable
+is unset it passes the name through as a literal string**
+([`mcp-config.md`](https://github.com/can1357/oh-my-pi), "Pre-connect env/header
+resolution"). So this —
+
+```json
+"env": { "ALEPHCLIENT_API_KEY": "ALEPHCLIENT_API_KEY" }
+```
+
+— sends the 19-character text `ALEPHCLIENT_API_KEY` as your key whenever the variable is
+not exported, and Aleph answers `200` with zero collections. Worse, it counts as a
+complete environment pair, so it *shadows* a key you correctly stored in the Keychain: the
+server never reaches that tier. If you want the Keychain, pass nothing and let the server
+read it.
+
+To read a secret explicitly, use omp's command form instead — a value starting with `!` is
+run as a shell command, and the entry is **omitted** if it fails, rather than degrading to
+a literal:
+
+```json
+"env": { "ALEPHCLIENT_API_KEY": "!security find-generic-password -s aleph-mcp-api-key -a \"$USER\" -w" }
+```
+
+Both forms are omp-specific. Other clients want a literal value, or have their own syntax
+— and a literal here means the key itself sits in that config file.
+
+### Path C — from a checkout (developing this server)
+
+Runs your working tree, so local edits take effect on the next server start:
+
+```bash
+git clone https://github.com/sapran/aleph-mcp.git
+cd aleph-mcp
 uv sync --all-extras
 ```
+
+```json
+{
+  "mcpServers": {
+    "aleph": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--directory", "/absolute/path/to/aleph-mcp", "aleph-mcp"]
+    }
+  }
+}
+```
+
+Use an absolute `--directory` path: the client's working directory is not yours.
+`--directory` rather than `--project`, because it also makes the checkout the server's
+working directory, which is where it looks for `.env`.
+
+### opencode
+
+`~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "aleph": {
+      "type": "local",
+      "command": ["uvx", "--from", "git+https://github.com/sapran/aleph-mcp.git@e0853e15b22b9b30468f3aa07df349fa3d011500", "aleph-mcp"],
+      "enabled": true,
+      "environment": {
+        "ALEPHCLIENT_HOST": "https://aleph.example.org",
+        "ALEPHCLIENT_API_KEY": "{env:ALEPHCLIENT_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+`{env:…}` is opencode's own substitution syntax, not omp's. Tools then appear to the model
+as `aleph_search_entities`, `aleph_expand_entity`, and so on
+(`sanitize(server) + "_" + sanitize(tool)`).
 
 ## Configure
 
@@ -67,73 +192,95 @@ Both variables must reach the server's process environment; the server reads not
   — needs them exported from your shell rc (`~/.zshrc`), or set in an `env` block on that
   client's own MCP entry, accepting that the literal value then lives in that config file.
 
+The host and the key are taken as a **pair, from one source**: environment first, then
+`.env`, then the Keychain entries `aleph-mcp-host` + `aleph-mcp-api-key` (macOS, both
+required). The two are never mixed across sources, so a stale key cannot be paired with a
+fresh host.
+
 Never commit the key: `.gitignore` already lists `.env`.
 
-## Wire it up
+### Check it actually works
 
-### omp and Claude Code (plugin)
-
-This repository is itself a plugin marketplace, so one install delivers the server and the
-`aleph-mcp-entity-graph` method skill together:
+A server that starts, lists 17 tools and answers without error still proves nothing: Aleph
+accepts an invalid key and replies `200` with an empty result set. Discriminate:
 
 ```bash
-omp plugin marketplace add sapran/aleph-mcp
-omp plugin install aleph@aleph-mcp
+# Use the SITE ROOT here. ALEPHCLIENT_HOST may carry an /api/2 suffix — the server
+# strips it, curl does not, and the doubled path 404s with a null total.
+ALEPH_ROOT="${ALEPHCLIENT_HOST%/api/2}"; ALEPH_ROOT="${ALEPH_ROOT%/api}"
+
+curl -s -o /dev/null -w '%{http_code}\n' "$ALEPH_ROOT/api/2/collections?limit=1"
+curl -s -H "Authorization: ApiKey $ALEPHCLIENT_API_KEY" \
+  "$ALEPH_ROOT/api/2/collections?limit=1" | jq .total
 ```
 
-Claude Code: `/plugin marketplace add sapran/aleph-mcp`, then
-`/plugin install aleph@aleph-mcp`.
+If the authenticated `total` is `0` and you expect collections, the key is not being
+honoured — it is wrong, expired, or the client never received it. Do not read an empty
+`list_collections` as "this instance is empty".
 
-The plugin namespaces its server as `aleph:mcp`, so tools reach the model as
-`mcp__aleph_mcp_<tool>` — e.g. `mcp__aleph_mcp_search_entities`. Credentials, pinning,
-several Aleph instances and running from a checkout:
-[`plugins/aleph/README.md`](plugins/aleph/README.md).
+## Update
 
-### Any stdio MCP client (`mcp.json`)
+```bash
+# Plugin (omp) — the action is `upgrade`, not `update`
+omp plugin upgrade aleph@aleph-mcp
 
-```json
-{
-  "mcpServers": {
-    "aleph": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": ["--from", "git+https://github.com/sapran/aleph-mcp.git@<commit-sha>", "aleph-mcp"]
-    }
-  }
-}
+# Standalone tool install
+uv tool upgrade aleph-mcp                # only follows the spec it was installed with
+uv tool install --force git+https://github.com/sapran/aleph-mcp.git@<new-commit-sha>
+
+# Checkout
+git pull && uv sync --all-extras
 ```
 
-No `env` block — credentials come from the environment the client itself runs in. Under omp
-this form is not plugin-namespaced, so its tools are `mcp__aleph_<tool>`. Pin `@<commit-sha>`
-to a full commit: an unpinned `git+` spec builds and runs whatever the branch head is at
-launch, in a process you have just handed your Aleph key.
+A hand-written `mcp.json` pins a SHA, so it never updates by itself: edit the SHA. `uvx`
+caches the built environment per spec, so a changed SHA is a new environment and an
+unchanged one is never rebuilt.
 
-### opencode
+Restart the session afterwards — a running server keeps the old code. On the plugin path
+use `/reload-plugins`; `/mcp reload` is the right verb only for a hand-written `mcp.json`,
+because it refreshes MCP alone and cannot load this plugin's skill.
+There is no `--version` flag: the server ignores unknown arguments and starts anyway, so
+confirm the upgrade with `omp plugin list` (plugin path) or by re-reading the SHA in your
+`mcp.json` (hand-written path), then make one real call.
 
-`~/.config/opencode/opencode.json`:
+Under omp, a plugin is installed **per profile**: `omp --profile <name> plugin upgrade …`
+updates only that profile, and other profiles keep their own version.
 
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "mcp": {
-    "aleph": {
-      "type": "local",
-      "command": ["uvx", "--from", "git+https://github.com/sapran/aleph-mcp.git@<commit-sha>", "aleph-mcp"],
-      "enabled": true,
-      "environment": {
-        "ALEPHCLIENT_HOST": "https://aleph.example.org",
-        "ALEPHCLIENT_API_KEY": "{env:ALEPHCLIENT_API_KEY}"
-      }
-    }
-  }
-}
+## Remove
+
+```bash
+# Plugin (omp)
+omp plugin uninstall aleph@aleph-mcp
+# Add `--scope user` or `--scope project` if you installed it in both; the bare form
+# refuses rather than guessing.
+
+# The marketplace entry survives an uninstall; list and drop it separately. The argument
+# is the marketplace name `aleph-mcp`, not the `aleph@aleph-mcp` plugin spelling above.
+omp plugin marketplace list
+omp plugin marketplace remove aleph-mcp
+
+# Standalone tool install
+uv tool uninstall aleph-mcp
+
+# uvx cache (built environments are not removed by the above)
+uv cache clean aleph-mcp
 ```
 
-Tools then appear to the model as `aleph_search_entities`, `aleph_expand_entity`, and so on
-(`sanitize(server) + "_" + sanitize(tool)`).
+Then, in order:
 
-The `--from git+…` spec is required on every path above: `aleph-mcp` is not published to
-PyPI, so a bare `uvx aleph-mcp` resolves nothing.
+1. Delete the server entry from any hand-written config — `.omp/mcp.json`,
+   `~/.omp/agent/mcp.json`, `~/.config/opencode/opencode.json`, or the client's own file.
+   An uninstalled plugin does not remove a config entry you wrote yourself, and a leftover
+   entry fails loudly at launch once the command is gone.
+2. Remove the credentials you no longer need: the two lines from `.env` or `~/.zshrc`, and
+   on macOS `security delete-generic-password -s aleph-mcp-host -a "$USER"` and the same
+   for `aleph-mcp-api-key`. Releases before this one stored a key under the plain
+   `aleph-mcp` service, and a failed-Keychain error once suggested `aleph-mcp:<host>`;
+   neither is read any more, so search rather than trust the two names —
+   `security dump-keychain | grep -i aleph-mcp` — or a live key stays behind.
+3. **Revoke the API key in Aleph itself.** Deleting a local copy does not invalidate it.
+4. Restart the session, and confirm with `/mcp list` that the server is gone.
+
 
 ## Surface
 
