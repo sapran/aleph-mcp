@@ -42,7 +42,7 @@ omp's native package manager currently requires `bun` on `PATH`; the MCP server 
 still runs through `uvx`.
 
 ```bash
-omp plugin install @sapran/aleph-mcp-plugin@0.5.1
+omp plugin install @sapran/aleph-mcp-plugin@0.5.2
 ```
 
 Set the two credentials (see [Configure](#configure)), then restart omp. The package
