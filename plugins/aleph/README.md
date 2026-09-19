@@ -1,12 +1,11 @@
-# `aleph` plugin for Claude Code
+# `aleph` plugin for Claude Code and omp
 
 Installs the [`aleph-mcp`](https://github.com/sapran/aleph-mcp) read-only MCP server and
 the method skill that tells an agent how to work an Aleph instance as an entity graph
 rather than a document pile.
 
-omp users should install the dedicated native package instead; see
-[`plugins/aleph-omp/README.md`](../aleph-omp/README.md). This marketplace bundle remains
-independent so installing it in Claude Code does not alter omp's provider configuration.
+This is a Claude marketplace plugin. Claude Code loads it directly; omp loads it through
+the `claude-plugins` discovery provider.
 
 ## What it installs
 
@@ -25,12 +24,29 @@ independent so installing it in Claude Code does not alter omp's provider config
 
 ## Install
 
+### omp
+
+Confirm that `omp config get disabledProviders` does not contain `claude-plugins`. If it
+does, remove only that entry from the file printed by `omp config path`, preserving every
+other disabled provider. Be aware that enabling this provider loads all installed Claude
+marketplace plugins, not only Aleph.
+
+```bash
+omp plugin marketplace add sapran/aleph-mcp
+omp plugin install aleph@aleph-mcp --scope user
+```
+
+Use `--scope project` for one project. Prefix both commands with
+`omp --profile <name>` for a named profile.
+
+### Claude Code
+
 ```text
 /plugin marketplace add sapran/aleph-mcp
 /plugin install aleph@aleph-mcp
 ```
 
-Restart Claude Code after installation so both the skill and MCP server are loaded. The
+Restart the client after installation so both the skill and MCP server are loaded. The
 catalog is `.claude-plugin/marketplace.json`.
 
 ## Where the Aleph URL and key go
@@ -79,9 +95,10 @@ host. The launcher never prints a Keychain value or lookup diagnostic.
 
 ## Verify
 
-Open Claude Code's MCP status and confirm the `aleph` plugin server is connected. Confirm
-that `aleph-mcp-entity-graph` is available, then call `list_collections`. A non-zero
-collection total is the credential proof; a connected process or a listed schema is not.
+In omp, run `/mcp list`; in Claude Code, open MCP status. Confirm the plugin server is
+connected and `aleph-mcp-entity-graph` is available, then call `list_collections`. A
+non-zero collection total is the credential proof; a connected process or listed schema
+is not.
 
 If the credentials are missing, the server exits `2` and these lines appear in the MCP
 logs:
@@ -98,13 +115,22 @@ refusal marker emitted by an older installed plugin manifest.
 
 ## Pinning and updates
 
+For omp:
+
+```bash
+omp plugin marketplace update aleph-mcp
+omp plugin upgrade aleph@aleph-mcp --scope user
+```
+
+For Claude Code:
+
 ```text
 /plugin marketplace update aleph-mcp
 /plugin update aleph@aleph-mcp
 ```
 
-That refreshes the plugin files. The **server build** is resolved and cached separately by
-`uvx`; run `uv cache clean aleph-mcp` if the updated commit does not resolve.
+These commands refresh the plugin files. The **server build** is resolved and cached
+separately by `uvx`; run `uv cache clean aleph-mcp` if the updated commit does not resolve.
 
 The shipped `--from` spec is pinned to a full commit SHA. That is deliberate: this server
 is handed your Aleph API key, and an unpinned `git+` spec would run whatever the default

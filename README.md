@@ -33,31 +33,35 @@ Pin a commit on every path. An unpinned `git+` spec builds and runs whatever the
 head happens to be, in a process you have just handed your Aleph key. Latest release:
 **v0.5.2** = `e45e84dad9505e0c53278fa7a99785a2a43cf291`.
 
-### Path A: omp native plugin (recommended for omp)
+### Path A: omp marketplace plugin
 
-Install the native omp package. It delivers the server and the
-`aleph-mcp-entity-graph` method skill without enabling Claude Code plugin discovery.
+The plugin installs both the MCP server and the `aleph-mcp-entity-graph` method skill.
+It is served through omp's `claude-plugins` discovery provider.
 
-omp's native package manager currently requires `bun` on `PATH`; the MCP server itself
-still runs through `uvx`.
+First check the effective provider list:
 
 ```bash
-omp plugin install @sapran/aleph-mcp-plugin@0.5.2
+omp config get disabledProviders
 ```
 
-Set the two credentials (see [Configure](#configure)), then restart omp. The package
-ships **no `env` block**, so it inherits the environment omp runs in. If that
-environment lacks the key, Aleph answers anonymously: HTTP 200, zero collections, no
-error anywhere.
+If it contains `claude-plugins`, remove only that entry from the file printed by
+`omp config path`, preserving every other disabled provider. This provider loads all
+installed Claude marketplace plugins, not only Aleph.
 
-Verify with `/mcp list`: the server must appear as `aleph:mcp`, with tools named
-`mcp__aleph_mcp_<tool>`. Then make one real `list_collections` call. A non-zero `total`
-is the proof; a schema listing is not. Package details:
-[`plugins/aleph-omp/README.md`](plugins/aleph-omp/README.md).
+Then install Aleph:
+
+```bash
+omp plugin marketplace add sapran/aleph-mcp
+omp plugin install aleph@aleph-mcp --scope user
+```
+
+Set the two credentials described under [Configure](#configure), then restart omp.
+Run `/mcp list`: the server must appear as `aleph:mcp`, with tools named
+`mcp__aleph_mcp_<tool>`. Resolve `skill://aleph-mcp-entity-graph`, then make one real
+`list_collections` call. A non-zero `total` is the credential proof; a connected process
+or schema listing is not.
 
 ### Path B: Claude Code marketplace plugin
-
-This repository is also a Claude Code plugin marketplace:
 
 ```text
 /plugin marketplace add sapran/aleph-mcp
@@ -65,7 +69,7 @@ This repository is also a Claude Code plugin marketplace:
 ```
 
 Restart Claude Code after installation, configure the same two credentials, and verify
-the MCP server plus the `aleph-mcp-entity-graph` skill. Marketplace details:
+the MCP server plus the `aleph-mcp-entity-graph` skill. Complete plugin details:
 [`plugins/aleph/README.md`](plugins/aleph/README.md).
 
 ### Path C: any stdio MCP client, by hand
@@ -118,7 +122,7 @@ a literal:
 Both forms are omp-specific. Other clients want a literal value, or have their own syntax
 — and a literal here means the key itself sits in that config file.
 
-### Path C — from a checkout (developing this server)
+### Path D: from a checkout (developing this server)
 
 Runs your working tree, so local edits take effect on the next server start:
 
@@ -227,23 +231,12 @@ honoured — it is wrong, expired, or the client never received it. Do not read 
 
 ## Update
 
-If omp previously installed `aleph@aleph-mcp` from this repository's marketplace,
-remove that old entry before installing the native package. Do this in every profile and
-scope where `omp plugin list` shows it, or both discovery paths can load Aleph:
-
 ```bash
-omp --profile <name> plugin uninstall aleph@aleph-mcp --scope user
-omp --profile <name> plugin marketplace remove aleph-mcp
-```
+# omp
+omp plugin marketplace update aleph-mcp
+omp plugin upgrade aleph@aleph-mcp --scope user
 
-Use `--scope project` instead when the old install was project-scoped. Omit
-`--profile <name>` only for the default profile.
-
-```bash
-# Native omp package: install the new version explicitly
-omp plugin install @sapran/aleph-mcp-plugin@<version>
-
-# Claude Code marketplace plugin
+# Claude Code
 /plugin marketplace update aleph-mcp
 /plugin update aleph@aleph-mcp
 
@@ -255,6 +248,9 @@ uv tool install --force git+https://github.com/sapran/aleph-mcp.git@<new-commit-
 git pull && uv sync --all-extras
 ```
 
+Use `--scope project` instead when the omp plugin was installed for one project. For a
+named omp profile, prefix both omp commands with `omp --profile <name>`.
+
 A hand-written `mcp.json` pins a SHA, so it never updates by itself: edit the SHA. `uvx`
 caches the built environment per spec, so a changed SHA is a new environment and an
 unchanged one is never rebuilt.
@@ -264,25 +260,14 @@ Restart the client afterwards. A running server keeps the old code. There is no
 upgrade with the plugin manager or by re-reading the SHA in a hand-written `mcp.json`,
 then make one real call.
 
-Under omp, the native package is installed **per profile**:
-`omp --profile <name> plugin install @sapran/aleph-mcp-plugin@<version>` updates only that
-profile, and other profiles keep their own version.
-
 ## Remove
 
 ```bash
-# Native package in the default profile
-omp plugin uninstall @sapran/aleph-mcp-plugin
+# omp
+omp plugin uninstall aleph@aleph-mcp --scope user
+omp plugin marketplace remove aleph-mcp
 
-# Native package in a named profile
-omp --profile <name> plugin uninstall @sapran/aleph-mcp-plugin
-
-# Remove old omp marketplace residue if this installation was migrated
-omp --profile <name> plugin uninstall aleph@aleph-mcp --scope user
-omp --profile <name> plugin uninstall aleph@aleph-mcp --scope project
-omp --profile <name> plugin marketplace remove aleph-mcp
-
-# Claude Code marketplace plugin
+# Claude Code
 /plugin uninstall aleph@aleph-mcp
 /plugin marketplace remove aleph-mcp
 
@@ -293,8 +278,8 @@ uv tool uninstall aleph-mcp
 uv cache clean aleph-mcp
 ```
 
-For legacy residue, run only the scope command that matches the old install. Omit
-`--profile <name>` for the default profile.
+Use `--scope project` instead when the omp plugin was installed for one project. For a
+named omp profile, prefix the omp commands with `omp --profile <name>`.
 
 Then, in order:
 

@@ -358,7 +358,7 @@ running the same loop for the match path or stating in the spec that the ceiling
 - The version being written in several places with nothing checking they agree, which shipped
   0.1.4 to every marketplace user as 0.1.2, because the *catalog* version is what drives
   marketplace change detection. **Fixed** by `tests/test_packaging.py`, which asserts the
-  Python package, marketplace catalog, Claude plugin, and native omp package versions agree.
+  Python package, marketplace catalog, and Claude plugin versions agree.
 - The `$` anchor letting `entity_id="e1\n"` through, and `entityset_id=".."` normalising away to
   a different endpoint. **Fixed** by `fix-id-validation-anchors`; the validators now use
   `re.fullmatch`, as the allowlist always has.
@@ -438,3 +438,10 @@ tag deliberately lags the pin commit by one commit, so it cannot simply compare 
 `git describe`. The honest shape is probably a test asserting the README's SHAs equal the SHA in
 `plugins/aleph/.mcp.json`, leaving only that one file to be right — but that is a release-process
 change, not part of a docs hotfix.
+
+## Aleph host was unreachable during the plugin rollback probe
+
+On 2026-09-19, a clean omp profile installed `aleph@aleph-mcp`, discovered `aleph:mcp`,
+and resolved `skill://aleph-mcp-entity-graph`, but `list_collections` failed after four
+connection attempts. Parked because target-host network reachability is separate from the
+plugin installation rollback.
