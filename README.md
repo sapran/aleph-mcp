@@ -31,7 +31,7 @@ PyPI, so every path below uses a `git+` spec — a bare `uvx aleph-mcp` resolves
 
 Pin a commit on every path. An unpinned `git+` spec builds and runs whatever the branch
 head happens to be, in a process you have just handed your Aleph key. Latest release:
-**v0.5.0** = `e0853e15b22b9b30468f3aa07df349fa3d011500`.
+**v0.5.1** = `327aa2965a9e31d3cd2b313c2c86f0b98c8dcdb4`.
 
 ### Path A — omp or Claude Code, as a plugin (recommended)
 
@@ -72,7 +72,7 @@ clients use their own file.
     "aleph": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/sapran/aleph-mcp.git@e0853e15b22b9b30468f3aa07df349fa3d011500", "aleph-mcp"]
+      "args": ["--from", "git+https://github.com/sapran/aleph-mcp.git@327aa2965a9e31d3cd2b313c2c86f0b98c8dcdb4", "aleph-mcp"]
     }
   }
 }
@@ -147,7 +147,7 @@ working directory, which is where it looks for `.env`.
   "mcp": {
     "aleph": {
       "type": "local",
-      "command": ["uvx", "--from", "git+https://github.com/sapran/aleph-mcp.git@e0853e15b22b9b30468f3aa07df349fa3d011500", "aleph-mcp"],
+      "command": ["uvx", "--from", "git+https://github.com/sapran/aleph-mcp.git@327aa2965a9e31d3cd2b313c2c86f0b98c8dcdb4", "aleph-mcp"],
       "enabled": true,
       "environment": {
         "ALEPHCLIENT_HOST": "https://aleph.example.org",
