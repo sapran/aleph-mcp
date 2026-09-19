@@ -44,9 +44,12 @@ First check the effective provider list:
 omp config get disabledProviders
 ```
 
-If it contains `claude-plugins`, remove only that entry from the file printed by
-`omp config path`, preserving every other disabled provider. This provider loads all
-installed Claude marketplace plugins, not only Aleph.
+If it contains `claude-plugins`, remove only that entry from the list that supplied it.
+Check the current project's `.omp/config.yml` first, then `config.yml` inside the
+directory printed by `omp config path`. For a named profile, run both commands with
+`omp --profile <name>`. Preserve every other entry, and remember which file you changed
+so uninstall can restore it. This provider loads all installed Claude marketplace
+plugins, not only Aleph.
 
 Then install Aleph:
 
@@ -55,7 +58,7 @@ omp plugin marketplace add sapran/aleph-mcp
 omp plugin install aleph@aleph-mcp --scope user
 ```
 
-Set the two credentials described under [Configure](#configure), then restart omp.
+Configure the credentials as described under [Configure](#configure), then restart omp.
 Run `/mcp list`: the server must appear as `aleph:mcp`, with tools named
 `mcp__aleph_mcp_<tool>`. Resolve `skill://aleph-mcp-entity-graph`, then make one real
 `list_collections` call. A non-zero `total` is the credential proof; a connected process
@@ -192,23 +195,24 @@ client's logs.
 
 ### Where to put them
 
-Both variables must reach the server's process environment; the server reads nothing else.
+The server selects the first complete host-and-key pair from the inherited environment,
+the current project's `.env`, or its two macOS Keychain services. It never combines
+values from different sources.
 
-- **omp** autoloads `.env` into its own environment at startup, and an stdio MCP child
-  inherits it. Precedence, highest first: inherited process environment → `<cwd>/.env` →
-  `~/.omp/agent/.env` → `~/.omp/.env` → `~/.env`; a variable already set is never
-  overwritten by a later file. Put the two lines in `~/.omp/.env` for every project, or
-  `<project>/.env` for one, then `chmod 600` the file.
-- **Every other harness** — Claude Code, opencode, anything spawning the server over stdio
-  — needs them exported from your shell rc (`~/.zshrc`), or set in an `env` block on that
-  client's own MCP entry, accepting that the literal value then lives in that config file.
+- **omp plugin on macOS:** prefer the server-specific Keychain entries shown in
+  [`plugins/aleph/README.md`](plugins/aleph/README.md#storing-the-host-and-key). Only
+  Aleph reads those entries. Do not put the key in omp's ambient `.env`: every stdio MCP
+  child inherits that environment, including unrelated marketplace plugins.
+- **omp plugin without Keychain:** a project `.env` containing both variables works, but
+  every stdio MCP child in that session inherits them. Use a profile containing only
+  plugins you trust with the Aleph key, and run `chmod 600 <project>/.env`.
+- **Other harnesses:** Claude Code, opencode, and any other stdio client need the pair
+  exported from the shell that launches them or set through that client's secret-aware
+  MCP configuration. A literal `env` block stores the key in the config file.
 
-The host and the key are taken as a **pair, from one source**: environment first, then
-`.env`, then the Keychain entries `aleph-mcp-host` + `aleph-mcp-api-key` (macOS, both
-required). The two are never mixed across sources, so a stale key cannot be paired with a
-fresh host.
+The two Keychain services are `aleph-mcp-host` and `aleph-mcp-api-key`. Both must exist.
+An incomplete source is ignored. Never commit the key: `.gitignore` already lists `.env`.
 
-Never commit the key: `.gitignore` already lists `.env`.
 
 ### Check it actually works
 
@@ -232,9 +236,9 @@ honoured — it is wrong, expired, or the client never received it. Do not read 
 ## Update
 
 ```bash
-# omp
+# omp: upgrades every installed scope in the selected profile
 omp plugin marketplace update aleph-mcp
-omp plugin upgrade aleph@aleph-mcp --scope user
+omp plugin upgrade aleph@aleph-mcp
 
 # Claude Code
 /plugin marketplace update aleph-mcp
@@ -248,23 +252,30 @@ uv tool install --force git+https://github.com/sapran/aleph-mcp.git@<new-commit-
 git pull && uv sync --all-extras
 ```
 
-Use `--scope project` instead when the omp plugin was installed for one project. For a
-named omp profile, prefix both omp commands with `omp --profile <name>`.
+For a named omp profile, prefix both omp commands with `omp --profile <name>`.
 
 A hand-written `mcp.json` pins a SHA, so it never updates by itself: edit the SHA. `uvx`
 caches the built environment per spec, so a changed SHA is a new environment and an
 unchanged one is never rebuilt.
 
-Restart the client afterwards. A running server keeps the old code. There is no
-`--version` flag: the server ignores unknown arguments and starts anyway, so confirm the
-upgrade with the plugin manager or by re-reading the SHA in a hand-written `mcp.json`,
-then make one real call.
+Restart the client afterwards. A running server keeps the old code. For user scope, read
+`plugins/installed_plugins.json` beside the `agent` directory printed by `omp config
+path`; for project scope, read `<project>/.omp/plugins/installed_plugins.json`. Follow
+that scope's `installPath`, then compare its `.mcp.json` SHA with the target release's
+`plugins/aleph/.mcp.json`. The refreshed catalog and `omp plugin list` are not payload
+proof. Finally check `/mcp list` and make one real Aleph call.
 
 ## Remove
 
 ```bash
-# omp
+# omp: inspect the installed scopes first
+omp plugin list
+
+# Run each uninstall whose scope is listed
 omp plugin uninstall aleph@aleph-mcp --scope user
+omp plugin uninstall aleph@aleph-mcp --scope project
+
+# Remove the marketplace only after every installed scope is gone
 omp plugin marketplace remove aleph-mcp
 
 # Claude Code
@@ -278,8 +289,9 @@ uv tool uninstall aleph-mcp
 uv cache clean aleph-mcp
 ```
 
-Use `--scope project` instead when the omp plugin was installed for one project. For a
-named omp profile, prefix the omp commands with `omp --profile <name>`.
+For a named omp profile, prefix every omp command with `omp --profile <name>`. If Aleph
+was the reason you removed `claude-plugins` from `disabledProviders`, add it back to the
+same list after confirming no remaining plugin needs that provider.
 
 Then, in order:
 
