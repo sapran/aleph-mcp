@@ -45,11 +45,11 @@ omp config get disabledProviders
 ```
 
 If it contains `claude-plugins`, remove only that entry from the list that supplied it.
-Check the current project's `.omp/config.yml` first, then `config.yml` inside the
-directory printed by `omp config path`. For a named profile, run both commands with
-`omp --profile <name>`. Preserve every other entry, and remember which file you changed
-so uninstall can restore it. This provider loads all installed Claude marketplace
-plugins, not only Aleph.
+Check the current project's `.omp/config.yml` first. Then check the active agent directory
+printed by `omp config path`: edit its existing `config.yaml` when present, otherwise
+`config.yml`. For a named profile, run the checks with `omp --profile <name>`. Preserve
+every other entry, and remember which file you changed so uninstall can restore it. This
+provider loads all installed Claude marketplace plugins, not only Aleph.
 
 Then install Aleph:
 
@@ -57,6 +57,8 @@ Then install Aleph:
 omp plugin marketplace add sapran/aleph-mcp
 omp plugin install aleph@aleph-mcp --scope user
 ```
+
+For a named profile, prefix both install commands with `omp --profile <name>`.
 
 Configure the credentials as described under [Configure](#configure), then restart omp.
 Run `/mcp list`: the server must appear as `aleph:mcp`, with tools named
@@ -258,12 +260,17 @@ A hand-written `mcp.json` pins a SHA, so it never updates by itself: edit the SH
 caches the built environment per spec, so a changed SHA is a new environment and an
 unchanged one is never rebuilt.
 
-Restart the client afterwards. A running server keeps the old code. For user scope, read
-`plugins/installed_plugins.json` beside the `agent` directory printed by `omp config
-path`; for project scope, read `<project>/.omp/plugins/installed_plugins.json`. Follow
-that scope's `installPath`, then compare its `.mcp.json` SHA with the target release's
-`plugins/aleph/.mcp.json`. The refreshed catalog and `omp plugin list` are not payload
-proof. Finally check `/mcp list` and make one real Aleph call.
+Restart the client afterwards. A running server keeps the old code:
+
+```bash
+omp plugin list --json
+```
+
+Use the same `--profile`, if any. Select each installed scope's `installPath`, then compare
+that directory's `.mcp.json` SHA with the target release's `plugins/aleph/.mcp.json`. This
+follows omp's actual data root even when XDG relocates it; the refreshed catalog and
+displayed version alone are not payload proof. Finally check `/mcp list` and make one real
+Aleph call.
 
 ## Remove
 

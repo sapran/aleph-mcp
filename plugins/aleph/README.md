@@ -33,10 +33,11 @@ omp config get disabledProviders
 ```
 
 If it contains `claude-plugins`, remove only that entry from the list that supplied it.
-Check the current project's `.omp/config.yml` first, then `config.yml` inside the
-directory printed by `omp config path`. Preserve every other entry, and remember which
-file you changed so uninstall can restore it. Enabling this provider loads all installed
-Claude marketplace plugins, not only Aleph.
+Check the current project's `.omp/config.yml` first. Then check the active agent directory
+printed by `omp config path`: edit its existing `config.yaml` when present, otherwise
+`config.yml`. Preserve every other entry, and remember which file you changed so
+uninstall can restore it. Enabling this provider loads all installed Claude marketplace
+plugins, not only Aleph.
 
 ```bash
 omp plugin marketplace add sapran/aleph-mcp
@@ -149,12 +150,17 @@ is handed your Aleph API key, and an unpinned `git+` spec would run whatever the
 branch happened to contain. Each release bumps the SHA, so updating the plugin moves the
 server forward.
 
-Restart the client after an update. For user scope, read
-`plugins/installed_plugins.json` beside the `agent` directory printed by `omp config
-path`; for project scope, read `<project>/.omp/plugins/installed_plugins.json`. Follow
-that scope's `installPath`, then compare its `.mcp.json` SHA with the target release's
-`plugins/aleph/.mcp.json`. The refreshed catalog and `omp plugin list` are not payload
-proof. Finally check `/mcp list` and make one real Aleph call.
+Restart the client after an update:
+
+```bash
+omp plugin list --json
+```
+
+Use the same `--profile`, if any. Select each installed scope's `installPath`, then compare
+that directory's `.mcp.json` SHA with the target release's `plugins/aleph/.mcp.json`. This
+follows omp's actual data root even when XDG relocates it; the refreshed catalog and
+displayed version alone are not payload proof. Finally check `/mcp list` and make one real
+Aleph call.
 
 ## Remove from omp
 
