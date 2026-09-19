@@ -1,0 +1,21 @@
+{
+  "name": "@sapran/aleph-mcp-plugin",
+  "version": "0.5.2",
+  "description": "Read-only Aleph MCP server and entity-graph method skill for omp.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sapran/aleph-mcp.git",
+    "directory": "plugins/aleph-omp"
+  },
+  "files": [
+    ".mcp.json",
+    "LICENSE",
+    "README.md",
+    "skills"
+  ],
+  "omp": {},
+  "publishConfig": {
+    "access": "public"
+  }
+}
