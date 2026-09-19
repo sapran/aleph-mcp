@@ -13,7 +13,7 @@ discovery.
 ## Install
 
 ```bash
-omp plugin install @sapran/aleph-mcp-plugin@0.5.1
+omp plugin install @sapran/aleph-mcp-plugin@0.5.2
 ```
 
 Restart omp after installation. The package inherits `ALEPHCLIENT_HOST` and
