@@ -477,3 +477,39 @@ def test_a_supplied_wait_is_ignored_when_the_status_is_not_retryable() -> None:
     message = str(exc.value)
     assert "this server retries" not in message, message
     assert "9s wait" not in message, message
+
+
+def test_a_single_attempt_refusal_agrees_its_verb_with_its_count() -> None:
+    """Error text is the published contract, so "1 attempt were made" is a contract
+    defect. This is the budget-exhausted shape and every ALEPH_MCP_MAX_RETRIES=1
+    deployment."""
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(
+            _resp(503),
+            context="get_entity",
+            attempts=1,
+            retryable=True,
+            advertised_wait=parse_retry_after(_resp(503)),
+        )
+    message = str(exc.value)
+    assert "1 attempt was made" in message, message
+    assert "attempt were" not in message, message
+
+
+def test_the_attempt_count_is_stated_once_when_the_budget_clause_also_runs() -> None:
+    """Both clauses know the count. Stating it twice reads as two different facts about
+    one call, so the retry clause yields the count to the sentence that explains what
+    ended the loop."""
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(
+            _resp(503),
+            context="get_entity",
+            attempts=3,
+            retryable=True,
+            budget_spent=True,
+            advertised_wait=parse_retry_after(_resp(503)),
+        )
+    message = str(exc.value)
+    assert message.count("3 attempt") == 1, message
+    assert "one this server retries." in message, message
+    assert "wall-clock budget" in message, message

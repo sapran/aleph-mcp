@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import NoReturn, Protocol
+from typing import Literal, NoReturn, Protocol
 
 import httpx
 from fastmcp.exceptions import ResourceError, ToolError
@@ -82,13 +82,13 @@ class AdvertisedWaitLike(Protocol):
     """
 
     @property
-    def state(self) -> str: ...
+    def state(self) -> Literal["absent", "invalid", "seconds"]: ...
 
     @property
     def seconds(self) -> float | None: ...
 
 
-def _retry_clause(attempts: int, wait: AdvertisedWaitLike) -> str:
+def _retry_clause(attempts: int, wait: AdvertisedWaitLike, *, budget_spent: bool) -> str:
     """What this server can say about a retryable status without inventing anything.
 
     Three facts and no judgement: that the status is one this server retries, how many
@@ -116,10 +116,13 @@ def _retry_clause(attempts: int, wait: AdvertisedWaitLike) -> str:
         )
     else:
         advertised = " Its final response advertised no next wait."
-    return (
-        f" This status is one this server retries; {attempts} attempt"
-        f"{'' if attempts == 1 else 's'} were made.{advertised}"
-    )
+    # The budget clause states the same count in its own sentence. Saying it twice reads
+    # as two different facts about one call, so when that clause runs this one names only
+    # the retryability and leaves the count to the sentence that explains what ended it.
+    if budget_spent:
+        return f" This status is one this server retries.{advertised}"
+    counted = "1 attempt was" if attempts == 1 else f"{attempts} attempts were"
+    return f" This status is one this server retries; {counted} made.{advertised}"
 
 
 def raise_for_status(
@@ -154,7 +157,11 @@ def raise_for_status(
     err_cls = ResourceError if resource else ToolError
     detail = _upstream_detail(resp, body)
     budget = _budget_clause(attempts) if budget_spent else ""
-    retry = _retry_clause(attempts, advertised_wait) if retryable and advertised_wait else ""
+    retry = (
+        _retry_clause(attempts, advertised_wait, budget_spent=budget_spent)
+        if retryable and advertised_wait is not None
+        else ""
+    )
 
     if resp.status_code == 401:
         raise err_cls(

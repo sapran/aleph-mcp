@@ -1,17 +1,21 @@
+import inspect
 import re
 from collections.abc import Callable, Iterator
 from itertools import pairwise
+from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 import pytest
 import respx
+from fastmcp import Client as MCPClient
 from fastmcp.exceptions import ResourceError, ToolError
 from pydantic import TypeAdapter
 
 from aleph_mcp.client import (
     _FALLBACK_CAPTION_NOTE,
+    _ID_SOURCE,
     _MODEL_FAILURE_TTL,
     _SHAPED_ENDPOINTS,
     MAX_EXPAND,
@@ -31,8 +35,10 @@ from aleph_mcp.client import (
     derive_caption,
     slim_entity,
 )
+from aleph_mcp.config import Settings
 from aleph_mcp.echo import SCHEMA_NAME
 from aleph_mcp.errors import Refusal, ResponseTooLarge
+from aleph_mcp.server import build_server
 from aleph_mcp.transport import MAX_RESPONSE_BYTES, Transport
 from tests.conftest import assert_model_not_fetched
 from tests.shapes import (
@@ -2641,3 +2647,30 @@ def test_an_unmapped_field_loses_the_hint_rather_than_raising() -> None:
     message = str(exc.value)
     assert "invalid some_future_id" in message, message
     assert "Read it from a result" not in message, message
+
+
+def test_every_validated_field_has_a_source_entry() -> None:
+    """The published requirement is unconditional: a refused identifier names its source.
+    `.get` fails open, so a fourth field added with no `_ID_SOURCE` entry would violate
+    that with a green suite. This ties the entries to the call sites."""
+    source = Path(inspect.getsourcefile(_check_entity_id) or "").read_text()
+    used = set(re.findall(r'_check_entity_id\([^)]*field="([a-z_]+)"', source))
+    used.add("entity_id")  # the default, passed at the bare call sites
+    missing = used - set(_ID_SOURCE)
+    assert not missing, f"fields validated with no source clause: {sorted(missing)}"
+
+
+async def test_the_identifier_hint_reaches_a_caller_through_the_tool_seam() -> None:
+    """Asserted through the server, not the private validator: the seam translates
+    `Refusal` with `str(e)`, and a change there would drop the clause silently."""
+    settings = Settings(alephclient_host="https://aleph.test", alephclient_api_key="k")
+    server, aleph = build_server(settings)
+    try:
+        async with MCPClient(server) as mcp:
+            result = await mcp.call_tool_mcp("get_entity", {"entity_id": "Email 1.2"})
+    finally:
+        await aleph.aclose()
+    assert result.is_error
+    text = result.content[0].text
+    assert "must match [A-Za-z0-9._:-]+ (got 'Email 1.2')" in text, text
+    assert "`id` field of a `search_entities` or `expand_entity` result row" in text, text

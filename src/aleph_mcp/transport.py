@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json as jsonlib
+import re
 import ssl
 import time
 from collections.abc import Callable
@@ -159,24 +160,34 @@ ABSENT_WAIT = AdvertisedWait("absent")
 _INVALID_WAIT = AdvertisedWait("invalid")
 
 
+# RFC 9110's `delay-seconds` is `1*DIGIT` and nothing else. `float()` accepts far more --
+# `nan`, `inf`, `1e400`, `-3`, `5.5` -- and the clamp then turns each into a plausible
+# number the refusal would report as what the response asked for. Measured before this was
+# tightened: `nan` produced "advertised a 0s wait" and `inf` "advertised a 30s wait", both
+# false and both indistinguishable from an honest `0` or `30`. The `nan` bound was not even
+# designed: it held only because `max(0.0, nan)` is `0.0`, `nan > 0.0` being False.
+_DELAY_SECONDS = re.compile(r"[0-9]+")
+
+
 def parse_retry_after(resp: httpx.Response) -> AdvertisedWait:
     """Read `Retry-After` off one response, bounded and classified.
 
     The single reader of this header. The retry loop uses it to decide how long to sleep
     and the refusal path uses it to say what the final response asked for; two readers
     would be how the number slept and the number reported drift apart.
+
+    Anything that is not `delay-seconds` is `invalid`, not a number: the HTTP-date form
+    RFC 9110 also allows, and every shape `float()` would have accepted. `invalid` says
+    this server saw a header and could not use it, which is the only honest report.
     """
     retry_after = resp.headers.get("Retry-After")
     if not retry_after:
         return ABSENT_WAIT
-    try:
-        parsed = float(retry_after)
-    except ValueError:
-        # The HTTP-date form is valid per RFC 9110 and not parsed here; it reaches the
-        # caller as `invalid` rather than as absent, which is the honest report of a
-        # header this server saw and could not use.
+    if not _DELAY_SECONDS.fullmatch(retry_after.strip()):
         return _INVALID_WAIT
-    return AdvertisedWait("seconds", min(MAX_RETRY_SLEEP_SECS, max(0.0, parsed)))
+    # Bounded after parsing, never before: the ceiling is what this server is willing to
+    # sleep, and it is also what keeps an upstream-chosen number out of the message.
+    return AdvertisedWait("seconds", min(MAX_RETRY_SLEEP_SECS, float(retry_after.strip())))
 
 
 def _retry_delay(resp: httpx.Response, attempt: int) -> float:
