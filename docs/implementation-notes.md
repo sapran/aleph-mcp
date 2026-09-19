@@ -202,7 +202,7 @@ The publication this was to be decided before has happened — 0.3.0 shipped fro
 the dead `../aleph-coldbackup` / `../datashare-mcp` links from `README.md`, but the same tool is
 still named in `src/aleph_mcp/server.py:69` (server instructions, so a model sees it),
 `src/aleph_mcp/config.py:19` (comment) and
-`plugins/aleph/skills/aleph-entity-graph/SKILL.md:64`. `tests/test_tools.py` asserts on the
+`plugins/aleph/skills/aleph-mcp-entity-graph/SKILL.md`. `tests/test_tools.py` asserts on the
 instructions string, so changing it is not free.
 
 **`openspec/config.yaml` declares a private remote.** The `acordia` reference

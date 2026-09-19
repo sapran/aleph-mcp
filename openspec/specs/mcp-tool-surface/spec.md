@@ -10,7 +10,9 @@ Defines the MCP surface this server publishes — which tools and resources exis
 
 The server SHALL register exactly these seventeen tools: `list_collections`, `get_collection`, `search_entities`, `get_entity`, `expand_entity`, `entity_tags`, `similar_entities`, `match_entity`, `get_profile`, `profile_tags`, `profile_similar`, `expand_profile`, `list_entitysets`, `get_entityset`, `entityset_items`, `xref_results`, `get_entity_text`.
 
-These names are an external contract, not an implementation detail. The `aleph-entity-graph` skill distributed in the `acordia-analysts` plugin selects tools by name and, when it cannot find them, falls back to issuing raw HTTP requests under which the caller — not this server — becomes responsible for bounding results. Renaming or removing a tool therefore degrades a consumer this repository cannot edit, silently and without error, and SHALL be treated as a breaking change.
+These names are an external contract, not an implementation detail. Installed consumers select tools by name, both inside and outside this repository: the `aleph-mcp-entity-graph` skill shipped with this plugin, and the `aleph-entity-graph` skill distributed in the `acordia-analysts` plugin, which this repository cannot edit. Renaming or removing a tool degrades such a consumer silently and without error — an already-installed copy keeps naming the old tool whether or not its source can be updated — and SHALL therefore be treated as a breaking change.
+
+No consumer is entitled to reach Aleph by another transport when a tool it expects is absent, and this requirement SHALL NOT be justified on the basis that one would: the skill distributed with this plugin requires the analyst to report the unavailability and stop, under the `analyst-skill` capability. A caller that issued its own HTTP requests instead would take on the bounding this server performs, which is why the behaviour is forbidden rather than accommodated.
 
 The four `profile_*`/`*_profile` tools and `get_profile` are named for the profile subsystem rather than the entity one because a profile is a distinct Aleph object — an EntitySet with a party, holding a recorded identity decision — and not a view of a single entity. `profile_similar` SHALL NOT be named `similar_profiles`: the endpoint returns entities similar to the profile, not similar profiles, and the plural form would assert the wrong return type.
 
@@ -28,7 +30,7 @@ The four `profile_*`/`*_profile` tools and `get_profile` are named for the profi
 
 The server SHALL register tool names without a namespace prefix. Any prefix a caller observes — such as the `aleph_` prefix in `aleph_search_entities` — is applied by the host that mounts this server and is outside this server's control.
 
-This is recorded because the `aleph-entity-graph` consumer hardcodes the prefixed form. This server SHALL NOT be held to guarantee that prefix, and SHALL NOT add one to compensate; the mount configuration is where that expectation is satisfied.
+This is recorded because consumers outside this repository hardcode a prefixed form: the `aleph-entity-graph` skill in the `acordia-analysts` plugin does so, and the mount this plugin ships is observed as `mcp__aleph_mcp_<tool>`. This server SHALL NOT be held to guarantee any prefix, and SHALL NOT add one to compensate; the mount configuration is where that expectation is satisfied, and the skill distributed with this plugin SHALL state that the prefix belongs to the host rather than to the tool.
 
 #### Scenario: Registered names carry no prefix
 

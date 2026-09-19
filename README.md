@@ -74,7 +74,7 @@ Never commit the key: `.gitignore` already lists `.env`.
 ### omp and Claude Code (plugin)
 
 This repository is itself a plugin marketplace, so one install delivers the server and the
-`aleph-entity-graph` method skill together:
+`aleph-mcp-entity-graph` method skill together:
 
 ```bash
 omp plugin marketplace add sapran/aleph-mcp

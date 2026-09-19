@@ -8,7 +8,7 @@ rather than a document pile.
 
 - **One MCP server**, `aleph:mcp` — 17 read tools and 3 resources (`aleph://collections`,
   `aleph://schemata`, `aleph://schema/{name}`).
-- **One skill**, `aleph-entity-graph` — inventory → facet → filter → pivot → read-bounded,
+- **One skill**, `aleph-mcp-entity-graph` — inventory → facet → filter → pivot → read-bounded,
   plus the Aleph limits that change the method (the 9999 window, the 200-entity expansion
   cap, the 10,000 total cap, read-only bulk-export refusal).
 
