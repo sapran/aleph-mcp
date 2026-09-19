@@ -1,0 +1,68 @@
+window                          : [2026-09-11, 2026-09-18) UTC
+session logs scanned            : 121
+aleph calls found               : 2040 (2040 timestamped)
+attempts in window              : 1356
+  interrupted, never executed   : 0
+executed calls in window        : 1356
+sessions in window              : 41
+errors in window                : 127 (9.4%)
+
+-- tool mix (window) --
+     42  err=  7 ( 16.7%)  list_collections
+     51  err= 14 ( 27.5%)  get_collection
+    926  err= 39 (  4.2%)  search_entities
+    131  err= 11 (  8.4%)  get_entity_text
+    175  err= 51 ( 29.1%)  get_entity
+     13  err=  5 ( 38.5%)  expand_entity
+      3  err=  0 (  0.0%)  entity_tags
+      5  err=  0 (  0.0%)  match_entity
+      8  err=  0 (  0.0%)  list_entitysets
+      2  err=  0 (  0.0%)  xref_results
+  never called: similar_entities, get_profile, profile_tags, profile_similar, expand_profile, get_entityset, entityset_items
+  search+text 1057 (77.9%)  graph pivots 23 (1.7%)
+
+-- query shape (denominator: 887 searches with a parsed body) --
+  carrying facets               : 649
+  limit=0 survey                : 520
+  carrying filters              : 7
+  unquoted multi-term q         : 78
+  sessions that ever faceted    : 29 of 35
+  scope concentration (top 3)   : scope-1 x511; scope-2 x107; scope-3 x83
+
+-- absence (denominator: 887 searches with a retained result) --
+  returned zero rows            : 65
+
+-- identifier-handling failures --
+     12  wrong argument name
+     10  caption passed as id
+      7  not found (404)
+     29  union across the three classes, in 8 sessions
+
+-- infrastructure failures (not caller-preventable) --
+     54  in 9 sessions
+          21 of  32 calls  session-01
+           9 of  20 calls  session-02
+           9 of  49 calls  session-03
+
+-- profile subsystem reachability --
+  replies with a populated profile_id : 0
+  replies with an explicit null       : 0
+  spilled result logs (ALL corpus, not window-bounded): 809
+    of those carrying entity fields   : 809
+    with a populated profile_id       : 0
+    with an explicit null             : 0
+
+-- skill propagation --
+  documents served under skill://aleph-entity-graph, by line count:
+      84 lines : 15 read(s)
+     101 lines : 3 read(s)
+  sessions issuing >=5 aleph calls    : 37
+    calls from sessions that read an aleph skill : 609
+    calls from sessions that read none          : 740 (55%)
+  busiest session with no skill read  : 109 calls
+
+-- dispatches carrying hand-written Aleph rules --
+     30  dispatches mentioning Aleph
+    168  rule-bearing lines, 52,843 chars (~13,210 tokens)
+  NOTE: rule-bearing lines only. Whole dispatch contexts are far larger;
+        do not quote total context size as duplicated rule text.

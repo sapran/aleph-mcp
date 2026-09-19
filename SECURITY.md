@@ -44,8 +44,9 @@ full in that release's notes:
   the limit was consulted, and the error path was not bounded at all. The bundled skill
   also documented a raw-`curl` fallback that stepped around the read-only guard.
 
-If you pinned a SHA at or before any of those points, move to the latest release. For the
-pre-0.1.5 case also re-store your Keychain entry under the host-scoped name.
+If you pinned a SHA at or before any of those points, move to the latest release. Current
+releases use separate `aleph-mcp-host` and `aleph-mcp-api-key` Keychain services, so the
+old `aleph-mcp` API-key entry is not read as configuration.
 
 ## What this project treats as a security boundary
 
@@ -75,8 +76,8 @@ per-response nonce fence and labelled as data rather than instruction.
   otherwise reaching the model in a form that presents as server-authored instruction
   rather than as quoted data.
 - A response able to exhaust memory despite the streamed size ceiling.
-- The plugin credential lookup in `plugins/aleph/.mcp.json` yielding a key for a host it
-  was not minted for, or falling back to an ambient `ALEPHCLIENT_API_KEY`.
+- Credentials from different precedence sources being combined, allowing a host from a
+  project `.env` to be paired with a Keychain API key.
 
 ## Out of scope
 
@@ -88,6 +89,6 @@ per-response nonce fence and labelled as data rather than instruction.
 - Vulnerabilities in Aleph itself — report those to
   [alephdata/aleph](https://github.com/alephdata/aleph). Findings in how *this* server
   calls Aleph are in scope.
-- The server trusting the operator's own environment. `ALEPHCLIENT_HOST` and
-  `ALEPHCLIENT_API_KEY` are configuration; anyone who can set them can already run
-  arbitrary code as you.
+- The server trusting a complete credential pair deliberately supplied by its parent
+  process. `ALEPHCLIENT_HOST` and `ALEPHCLIENT_API_KEY` are configuration; anyone who
+  can set both can already run arbitrary code as you.

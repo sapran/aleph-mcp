@@ -3,66 +3,357 @@
 Findings recorded during other work, kept out of the change that surfaced them. An entry leaves
 this file when it becomes a spec requirement or is fixed — not when someone remembers to tidy up.
 
-- **`httpx.ProxyError` reaches the model unsanitised, and its text is attacker-authored.**
-  Found by security review of `fix/retry-connection-failures`; pre-existing, so parked rather
-  than fixed there. `ProxyError` is a sibling of `ConnectError` under `TransportError`, not a
-  subclass, so `transport._CONNECT_ERRORS` does not catch it and it never reaches
-  `errors.py`'s sanitiser. httpcore builds its message from the proxy's `CONNECT` reason
-  phrase (`httpcore/_async/http_proxy.py`), which h11 admits as `([ \t]|[^\x00\s])*` — every
-  C0 control except NUL, `ESC` included — decoded with `errors="ignore"`. FastMCP then renders
-  it verbatim, because `mask_error_details` defaults false. So a hostile or MITM'd forward
-  proxy can write multi-kilobyte ASCII with ANSI escapes into a model-visible tool error,
-  bypassing both the 200-char cap and the non-printable stripping of `echo.UPSTREAM_ERROR`. A
-  forward proxy is a live deployment shape here, so this is worth a change of its own: catch
-  `httpx.TransportError` at the top of `Transport.request` and route the non-retryable members through
-  `raise_unreachable`. Do **not** simply add `ProxyError` to `_CONNECT_ERRORS` — a `CONNECT`
-  that reached the proxy is not obviously undelivered, which is the argument that correctly
-  keeps `ReadError` out.
+Triaged 2026-09-10 against `develop @ b46b52d`: all 35 open claims were re-checked in the live
+tree, close relatives merged into the change that would close them, and two retired. Thirty-three
+survived, as fourteen entries. Entries are ordered by the work plan below; the numbering is the
+priority order, not an id. Item 1 of that plan — the metadata path — was closed by
+`harden-metadata-path` on 2026-09-10, and item 1 of the renumbered plan — transport failure
+classification — by `classify-transport-failures` the same day. Item 1 again — the ontology echo
+— was closed by `bound-ontology-echo` on 2026-09-11, which parked two new claims in passing: one
+under echo.py's enforcement gaps, and one as its own entry. Item 1 once more — the response path —
+was closed by `charge-and-account-response-path` on 2026-09-11, parking two new claims in passing:
+one under the stale-prose entry and one as its own entry, both found by review of that change. Item
+1 again — the scope resolver's upstream shapes — was closed by `guard-scope-resolver-shapes` on
+2026-09-11, parking four new claims in passing as one new entry — the conclusions the scope path
+still draws without earning them — all found by review of that change. Item 1 once more — the
+refusal channel — was closed by `type-the-refusal-channel` on 2026-09-11, parking three new claims
+in passing — two as a new entry for the decode failures its guard deliberately does not cover, one
+under the ontology-shape entry — and consuming one bullet of the stale-prose entry whose sentences
+that change made false. All three were found by review of it. Item 1 for the last time — the scope
+path's row shape — was closed by `finish-scope-row-shape` on 2026-09-11, which took all four of its
+claims together because they are one question about whether a row has earned the conclusions drawn
+from it; it parked one new claim in passing, as its own entry, found while giving `match_entity`
+its scope report. The plan and the sections below are renumbered after each, so twenty-five claims
+across twelve entries remain.
 
-- **A TLS verification failure is retried four times with the wrong advice.** Found by review
-  of the same branch. httpcore maps `ssl.SSLError` from the handshake to `ConnectError`, so
-  `CERTIFICATE_VERIFY_FAILED` — the misconfiguration the README anticipates for a self-signed
-  instance with `ALEPH_MCP_VERIFY_TLS` left true — now costs three backoffs before failing,
-  and the message speaks about network reachability. The real cause is visible only inside the
-  quoted transport text. Retrying is harmless but pointless, since the failure is
-  deterministic. Fixing it means classifying the cause (walk `e.__cause__` for an
-  `ssl.SSLError`) and branching the message to name the setting, which is error classification
-  rather than retry, so it was left out. A DNS failure also arrives as `ConnectError` and
-  should keep being retried: a resolver hiccup is plausibly transient.
+## Work plan
 
-- **Only the connect path charges its elapsed time to the retry budget.** A slow 429/5xx round
-  trip is still uncharged, so `max_retries` slow responses can exceed `timeout_secs` in total.
-  That is pre-existing behaviour, not introduced by the connect retry, so the same one-line
-  charge was not extended to the response path in that change. The connect path had to be
-  charged because a connect can burn the whole connect phase without ever sleeping.
+1. Make the licence gate able to fail — it passes with the project's own LICENSE deleted.
+2. Answer the entity-shaped spec question — four copy-through slots, one decision, five xfails.
+3. Extend the tool path's guarantees to resources — a `resource()` factory and a wider walk.
+4. Close echo.py's enforcement gaps — an inline policy escapes both guards.
+5. Give `get_entity_text` a derived caption.
+6. Close the tests that cannot fail — four checks that certify nothing.
+7. Decide the private-sibling references — the publication deadline has already passed.
+8. Guard the ontology's shape — a non-dict raises AttributeError, a non-object body reads as empty.
+9. Name the dropped error body — a real complaint reads as no complaint at all.
+10. Classify the decode's two uncaught failures — both reach the caller as a server fault.
+11. Bound the match reply — `match_entity` has no response-size ceiling.
+12. Correct three pieces of stale prose (Tier 0).
+---
 
-- **The shipped plugin `.mcp.json` runs a shell at every server start.** Both `env` values
-  are `!`-prefixed commands: the host is `$ALEPHCLIENT_HOST`, and the key is read from the
-  macOS login Keychain under a service name that includes the host. That behaviour is
-  documented in `plugins/aleph/README.md` rather than only implied, because installing the
-  plugin makes a Keychain read happen per session. A miss deliberately prints the marker
-  `aleph-mcp:keychain-miss` instead of an empty string: the harness *omits* an `env` entry
-  whose command prints only whitespace, and an omitted entry lets the server inherit an
-  ambient `ALEPHCLIENT_API_KEY`. Non-macOS users are directed to declare their own server
-  entry instead.
+## 1. The licence gate cannot fail
 
-- **References to non-public siblings survive outside the README.** The open-source
-  readiness branch removed the dead `../aleph-coldbackup` / `../datashare-mcp` links from
-  `README.md`, but the same tool is still named in `src/aleph_mcp/server.py:50` (server
-  instructions, so a model sees it), `src/aleph_mcp/config.py:19` (comment) and
-  `plugins/aleph/skills/aleph-entity-graph/SKILL.md:62`. Parked because that branch was
-  scoped to licensing, docs and CI with no `src/` changes, and `tests/test_tools.py`
-  asserts on the instructions string. Decide before publication whether a public reader
-  being pointed at a private tool is acceptable.
+Both in `.github/workflows/ci.yml`, the `build` job's licence step; one change. (The SIGPIPE race
+in the same step is fixed — see Retired.)
 
-- **`openspec/config.yaml` declares a private remote.** The `acordia` reference points at
-  `https://github.com/sapran/acordia-agents.git`, which is private; `acordia` is also
-  named across the specs, the archived changes, `plugins/aleph/README.md` and this file.
-  On publication `openspec doctor` or a register attempt hits a 404 on a repo the
-  contributor cannot see. Parked: the declaration is deliberate and documented above, so
-  removing it is a design decision, not a cleanup.
+**The assertions are unanchored, so a vendored LICENSE keeps them green while the project's own is
+gone.** `grep -q 'licenses/LICENSE'` is a bare substring against the whole `unzip -l` listing, so
+`aleph_mcp/vendor/licenses/LICENSE` satisfies it; `grep -q '/LICENSE$'` matches a member at any
+depth, so `<pkg>/src/aleph_mcp/vendor/somedep/LICENSE` satisfies it. What the step means to assert
+is `<name>-<ver>.dist-info/licenses/LICENSE` for the wheel and a root-level `LICENSE` for the sdist.
+Verified by rebuilding both artefacts with the real licence deleted and a third-party one planted
+deeper: **both the old and the new step exit 0** and print "licence expression, header and file all
+present". That is precisely the case the step exists to catch — hatchling silently drops the licence
+file and a bundled dependency's licence hides it. The fix is to anchor them:
+`'\.dist-info/licenses/LICENSE'` for the wheel and `-E '^[^/]+/LICENSE$'` for the sdist. Today the
+repo has exactly one LICENSE, so nothing would go red.
 
-Retired since the last prune:
+**It names the wrong cause when the check cannot run, and prints no listing when it fails.** A
+here-string redirection that fails (unwritable `$TMPDIR`) or a `grep` exiting >1 lands in the same
+`|| { ... }` arm as a genuine miss, so the log says "the sdist ships no LICENSE" and sends the
+reader to rebuild an archive that is fine; and neither arm prints the listing it already holds,
+which is the first thing anyone debugging a packaging regression wants. Also, two artefacts in
+`dist/` fail cryptically (`tar: <second>: Not found in archive`, or a two-line `$wheel` that breaks
+`unzip -p`) — unreachable in CI, where the checkout is fresh and `uv build` is the only writer, but
+it bites anyone running the step locally against a dirty `dist/`.
+
+## 2. Four aggregation slots are copied rather than rebuilt — one spec question
+
+`get_profile.entities`, `_slim_entityset.entities`, a tag row's `value`, and
+`_slim_collection(full=True).statistics` are one decision about what counts as entity-shaped, not
+four refactors. Since T1-FIX-2 each is pinned by a `strict` xfail row in `NOT_SHAPING_CASES`
+(`tests/test_client.py:1790-1822`), so the behaviour cannot change without the suite saying so, and
+fixing any of them forces this note to be closed.
+
+- **`get_profile` passes its `entities` field through unshaped** (`client.py:1252`). It holds id
+  strings in every fixture and on the live instance, so nothing leaks today, but the "binds every
+  entity-shaped value in a response" requirement in `openspec/specs/mcp-tool-surface` would be
+  violated by an instance that serialised objects there. Since T1 this fails *closed*: `_shape`
+  refuses an unmarked entity-shaped dict. **Decided 2026-09-10: accepted as-is, and shipped as a
+  documented behaviour change in 0.3.0.** The failure only occurs on an instance that serialises
+  `entities` as objects, which no fixture and no tested instance does; the leak it prevents would be
+  silent and unbounded. The note stays open because the *availability* half is unaddressed: on such
+  an instance the tool does not degrade, it stops answering, and the message blames this server for
+  an upstream shape. Marking the field so the seam skips it would restore the leak; shaping the
+  objects properly is the fix that makes the question disappear.
+- **`_slim_entityset` copies upstream `entities` verbatim, and nothing fails closed there.**
+  `get_entityset` and `list_entitysets` pass that field straight through exactly as `get_profile`
+  does — but both sit outside T1's shaping seam, so the `_shape` guard never runs and the protection
+  above does not extend to them.
+- **`_slim_tags` copies a tag row's non-string values through.** `entity_tags` and `profile_tags`
+  truncate a row's *string* values and pass every other value on unchanged, so an entity object as a
+  row's `value` arrives with all five blob properties intact. Aleph returns `{field, value, count}`
+  rows there, so this needs the same upstream contract change and leaks nothing today.
+- **`_slim_collection(full=True)` copies `statistics` verbatim.** `get_collection` returns whatever
+  that block holds, unread and unbounded; `list_collections` does not, because it slims with
+  `full=False`.
+- **An upstream `_note` key makes `get_entityset` return the whole unslimmed payload.**
+  `client.py:1367` short-circuits the slimmer on `if payload.get("_note")`, a branch written for
+  the server-authored profile-redirect reply — but the test is on the *decoded upstream body*, so
+  an instance or an on-path proxy that adds one `_note` key to a 200 gets the entire payload back
+  verbatim, bypassing `_slim_entityset`'s fixed key set, the `bodyText` strip and the 500-char
+  property cap. Executed during review of `harden-metadata-path`: with the key present a hostile
+  note, an unknown upstream key and a 400-character `bodyText` all reached the caller; without it
+  the reply was slimmed and the `bodyText` dropped. A different mechanism from the `entities`
+  copy-through above, and unexercised by the suite — no test sends a 200 carrying `_note`. It also
+  becomes sharper if `get_entityset` is ever `@_shaped`, which is the natural fix for the slot
+  above: upstream text would then land in `_reply`'s existing-note composition. Fix is to key the
+  short-circuit on something upstream cannot set. Pre-existing and outside that change's scope.
+
+## 3. The resource path lacks the tool path's guarantees
+
+Three findings, closed by a ~4-line local `resource(uri, **kw)` factory mirroring `tool`, plus a
+wider walk in `find_marker`.
+
+**Resources have no counterpart to the fused `tool` helper.** `@mcp.resource` is still reachable raw
+(`server.py:418`, `:423`), and `schema_resource`'s translation is a hand-applied decorator
+(`server.py:435`) nothing enforces. A future *parameterised* resource would silently regress to
+FastMCP's `Error reading resource '<uri>': ` wrapping, and the decorator order is load-bearing but
+fails silently (`@_as_resource_error` above `@mcp.resource` imports, registers and serves the
+untranslated message). `collections_resource` and `schemata_resource` cannot raise `ValueError` at
+all, so decorating them now would be dead code.
+
+**The marker guard covers every tool but only one of three resources.** `find_marker` runs inside
+`_refusing`, so `collections_resource` and `schemata_resource` return without it. Inert today: both
+call unshaped client methods that build no markers. It becomes real only if a resource is ever
+pointed at a `@_shaped` method.
+
+**`find_marker` does not traverse tuples, sets or dict keys.** `client.py:524-531` walks dicts by
+value and lists by item only. No client method builds a tuple, a set or a non-string key into a
+reply, so nothing reaches those branches today, and the markers' own serialisation refusal still
+fires there — the outcome degrades to the pre-T1-FIX-2 message rather than leaking.
+
+## 4. echo.py's three enforcement gaps
+
+**A policy built inline at a call site escapes both guards.** `test_every_policy_has_a_cap_row`
+(`tests/test_echo.py:59`) enumerates `vars(echo)`, so it sees only module-level policies declared in
+`echo.py`. `render(v, replace(PROPERTY_VALUE, max_chars=77))` at a call site is invisible to it and
+to every cap row, which defeats the "each site asks for the treatment by name" property the module
+exists to establish. All nine call sites today name one of the five policies, so this is a missing
+enforcement, not a live defect. Closing it means either forbidding non-module policies at runtime or
+asserting the nine call sites against the five names.
+
+**`echo.COLLECTION_ECHO` leaves control characters to its call site's `!r`.** The behaviour the four
+helpers had, preserved deliberately rather than a new gap. `scope.py:92` is the only caller and
+formats the result with `!r`, which escapes controls — so the policy does not strip them itself. A
+second caller that interpolated the rendering plainly would put upstream control characters into a
+model-visible message. Recorded because the coupling is now between two files rather than inside one
+function. Closing it means either stripping in the policy (a behaviour change to the existing
+message) or asserting the `!r` at the call site.
+
+**`get_schema`'s successful payload echoes upstream ontology prose unbounded.** Found while
+implementing `bound-ontology-echo` on 2026-09-11 and deliberately parked: that change bounds the
+schema *names*, in the refusal and in the `aleph://schemata` listing, and stops there. The success
+path still copies `label`, `plural`, `description`, `caption` and every property's `label` and
+`description` straight out of `/api/2/metadata`, under no policy and no cap, into
+`aleph://schema/{name}`. Wider and less clear-cut than the name echo: the caller named that schema
+and asked for its record, which makes the text closer to a property value — where the cap is 500
+and the content is what was asked for — than to a refusal. Closing it means deciding whether the
+whole record is `PROPERTY_VALUE`-shaped data with a `_provenance` label, or whether a schema
+description deserves its own bound. A behaviour change to a resource's output either way.
+
+## 5. `get_entity_text` derives no caption
+
+`client.py:1460` reads `entity.get("caption")` straight off the payload, where every slimmed path
+calls `derive_caption`. Live Aleph sends a null caption, so this is the one tool that can return
+`caption: null` for an entity the other tools would have captioned. Found during T1; fixing it
+changes a tool's output and so is a behaviour change, not a refactor.
+
+## 6. Four checks that certify nothing
+
+One purely-test change closes all four.
+
+- **`test_search_derives_captions_from_the_instance_model` cannot fail**
+  (`tests/test_client.py:1257`). Its mocked model declares the caption order `["name"]`, which is
+  also the first entry of `_CAPTION_FALLBACK`, so it passes whether or not the instance model
+  reaches the slimmer. Superseded, not load-bearing: T1's
+  `test_every_entity_returning_method_shapes_its_reply` covers the same path with a discriminating
+  model. Delete or strengthen.
+- **The `MAX_SCOPE_COLLECTIONS` boundary is unpinned.** Only `MAX + 1` is tested
+  (`tests/test_scope.py:97`); changing `>` to `>=` at `scope.py:248` — which would refuse a
+  legitimate ten-collection scope — passes the whole suite. Related and also unpinned: the dedup runs
+  *before* the bound, so eleven spellings collapsing to ten are accepted. One row in the existing
+  parametrised table.
+- **`AlephClient.aclose` delegation is untested.** Making it a no-op leaves the whole suite green, on
+  `develop` (where it closed `_http` directly) as well as after T4 (where it delegates to
+  `Transport.aclose`).
+- **`verify_tls` has no test anywhere.** Zero hits across `tests/`, so nothing pins that
+  `ALEPH_MCP_VERIFY_TLS` reaches the httpx client at all. Sharpened rather than closed by
+  `classify-transport-failures`: a TLS refusal now names that setting to the operator, so the
+  message is wrong in a new way if the setting never reaches the client.
+
+## 7. A public repo still points at private siblings
+
+The publication this was to be decided before has happened — 0.3.0 shipped from a public repo on
+2026-09-10 — so this is now a live defect rather than a pending decision.
+
+**Non-public sibling tools are named outside the README.** The open-source readiness branch removed
+the dead `../aleph-coldbackup` / `../datashare-mcp` links from `README.md`, but the same tool is
+still named in `src/aleph_mcp/server.py:69` (server instructions, so a model sees it),
+`src/aleph_mcp/config.py:19` (comment) and
+`plugins/aleph/skills/aleph-mcp-entity-graph/SKILL.md`. `tests/test_tools.py` asserts on the
+instructions string, so changing it is not free.
+
+**`openspec/config.yaml` declares a private remote.** The `acordia` reference
+(`openspec/config.yaml:13`) points at `https://github.com/sapran/acordia-agents.git`, which is
+private; `acordia` is also named across the specs, the archived changes and
+`plugins/aleph/README.md`. `openspec doctor` or a register attempt hits a 404 on a repo a
+contributor cannot see. The declaration is deliberate and documented, so removing it is a design
+decision, not a cleanup.
+
+## 8. The ontology tools trust `model["schemata"]`'s shape
+
+**A non-dict `schemata` inside a valid `model` reaches the caller as an AttributeError.**
+`client.py`'s `list_schemata` does `model.get("schemata") or {}` and then `.items()` on it, and
+`get_schema` does `.get(name)` on the same value, neither guarded. Measured on both `develop` and
+the `bound-ontology-echo` branch: `{"model": {"schemata": ["Person"]}}` raises
+`AttributeError: 'list' object has no attribute 'items'` from `list_schemata` and
+`'list' object has no attribute 'get'` from `get_schema`, reported to the model as a defect in
+this server. `_schemata` already guards the same value for the caption path
+(`return schemata if isinstance(schemata, dict) else None`); the two ontology tools do not.
+
+**A *falsy* non-dict `schemata` is served as an ontology declaring nothing.** The same
+`or {}` swallows `[]`, `""` and `0`, so `list_schemata` answers `{"count": 0, "all": [], ...}`
+— now stamped `_provenance: untrusted` as if it were a real reading — and `get_schema` reports
+every real schema as unknown. No error anywhere. This is the more dangerous half: the
+AttributeError above at least fails loudly, where this states something false about the instance
+and is indistinguishable from a legitimately minimal ontology.
+
+Both are the defect `harden-metadata-path` closed for `model`, one level down — that change
+refuses a truthy non-dict `model` via `raise_unusable_model`, and the spec requirement it added
+is about the model, not its `schemata` member. The existing requirement "An unusable instance
+model is refused, never cached as an empty ontology" already states the right rule; it just does
+not reach this value. Found while implementing `bound-ontology-echo` on 2026-09-11 and parked:
+pre-existing on `develop`, unrelated to that change's scope, and the fix is a refusal-shape
+decision (reuse `raise_unusable_model`, or degrade) rather than a one-liner.
+
+**A metadata body that is valid JSON but not an object is served as an ontology declaring
+nothing, silently.** A third branch of the same defect, one level further out: the transport wraps
+a non-dict body as `{"results": <body>}` (`transport.py:416`), so a `200` whose body is the JSON
+string `"<html>down</html>"`, or the array `[1,2,3]`, reaches `get_model` as a payload with no
+`model` key at all. `raise_unusable_model`'s guard is `model and not isinstance(model, dict)` and
+cannot fire on a value that is *absent* rather than wrong-typed, so the model caches as `{}`.
+Measured on this branch: `list_schemata` answers `{'count': 0, 'all': [], ...}` with the untrusted
+provenance stamp, and `get_entity` answers with a fallback caption and **no `_note`** — because
+`_schemata` returns `{}` and `_reply` announces a degradation only on `None`. An instance serving
+garbage metadata is indistinguishable from a legitimately minimal one on every tool at once.
+
+That defeats the scenario "it does not return a schema count of zero" under the existing *An
+unusable instance model is refused, never cached as an empty ontology* requirement. Pre-existing on
+`develop` — both the wrapper and `get_model` are untouched by `type-the-refusal-channel` — and
+found by review of it, which noted that the change sharpens the asymmetry: a metadata body of
+`<html>` is now loudly refused, while `"<html>"` is still silently read as an empty ontology.
+Closing it means either requiring a real envelope before the wrapper is applied, or having
+`get_model` distinguish "no `model` key in an object body" from "no object body at all".
+
+## 9. An oversized error body is dropped without saying so
+
+**`_upstream_detail` discards a JSON error body over 64 KiB and the refusal reads as if none
+arrived.** `errors.py`. For a `400` the quoted `message` is the only actionable content the refusal
+carries, so an instance that answers with a real complaint plus a large trace is reported
+identically to one that sent nothing at all — and the model, told only "bad request", re-guesses
+its arguments. Measured during review of `charge-and-account-response-path`: `empty`, `small` and
+`big` bodies produced `bad request (400).`, the same with the message quoted, and `bad request
+(400).` again.
+
+Pre-existing and unchanged by that change — it read the whole body and then dropped it, the same
+message either way — so it was recorded rather than fixed. Closing it means returning the fact
+alongside the bytes (a `(body, dropped)` pair, or a sentinel distinct from `b""`, since `b""` from
+an oversized body and `b""` from an empty one are the same value today) and appending one clause to
+the refusal naming the drop. Parsing a truncated prefix is not the fix; the reasoning against that
+is written at `Transport._read_error_body`.
+
+## 10. Two decode failures the guard deliberately does not cover
+
+Both at `transport.py`'s `jsonlib.loads(body)`, which `type-the-refusal-channel` guards for
+`json.JSONDecodeError` and `UnicodeDecodeError` only. Both reach the caller as a server fault
+carrying no call context — the shape that entry closed for the two it does cover. Neither is
+fixed here for the same reason: the refusal beside them says "the body is not JSON" and "it is an
+upstream fault", and neither sentence is true of either of these, so catching them without their
+own arm and their own wording would trade a missing diagnosis for a confident wrong one.
+
+**A deeply nested body raises `RecursionError`, which is not a `ValueError` at all.** Measured with
+plain CPython 3.12: `json.loads(b"[" * 200000 + b"]" * 200000)` raises `RecursionError: Stack
+overflow (used 16352 kB) while decoding a JSON array from a unicode string`, and
+`isinstance(e, ValueError)` is `False`. Bounded in size by `MAX_RESPONSE_BYTES` (25 MiB), which is
+far more than the nesting depth needs, and not a crash — CPython raises rather than segfaulting.
+
+**A valid JSON body carrying a huge integer raises a bare `ValueError` from a limit in this
+process.** `{"total": <5000 digits>}` is well-formed JSON; CPython refuses it with `Exceeds the
+limit (4300 digits) for integer string conversion: value has 5000 digits; use
+sys.set_int_max_str_digits() to increase the limit` — neither `JSONDecodeError` nor
+`UnicodeDecodeError`. Found by review of `type-the-refusal-channel`, where the guard's first draft
+caught the base class and answered it with "the body is not JSON" and "It is an upstream fault",
+both false: the body is JSON and the limit is ours, liftable with one call at startup. The guard
+was narrowed to the two leaves in response, which is what parks this rather than mis-reporting it.
+Closing it properly means deciding whether to raise the limit or to refuse with a message that
+names it.
+
+## 11. `match_entity` has no response-size ceiling
+
+Found while giving that tool its `searched` report in `finish-scope-row-shape`, and recorded
+rather than fixed because that change is about which scope a reply names, not about how large the
+reply is.
+
+**The shrink loop is `search_entities`-only.** `client.py` enforces `MAX_RESPONSE_BYTES` by
+measuring the built reply and retrying with a smaller page (`_shrunk_page`), and only
+`search_entities` runs it. `match_entity` builds its reply with the same `_slim_result` over rows
+from the same index, caps `limit` at 100, and then returns whatever that came to. Nothing measures
+it and nothing announces a truncation, so the ceiling the spec states for search is simply absent
+next door. Not reached in any fixture — matched entities are slimmed, and 100 of them stay well
+under the ceiling — which is why this is a gap rather than a defect today. Closing it means either
+running the same loop for the match path or stating in the spec that the ceiling is a
+`search_entities` guarantee; the two tools currently disagree without saying so anywhere.
+
+## 12. Three pieces of stale prose (Tier 0)
+
+- **`openspec/config.yaml`'s layout paragraph is three modules stale**
+  (`openspec/config.yaml:23-26`). It lists `server.py`, `client.py`, `readonly.py`, `config.py` and
+  `errors.py` and names none of `echo.py` (T2), `scope.py` (T5) or `transport.py` (T4). No spec
+  assertion depends on it.
+- **`transport.py:89` names a `_classify` function that does not exist, and counts the wrong
+  family.** The comment above `_CONNECT_ERRORS` calls it "one bucket of the classification in
+  `_classify`"; the classification is an inline dispatch in `Transport.request` and there is no
+  such function, so a reader greps for it and finds nothing. The same sentence then says "the other
+  thirteen `httpx.TransportError` subclasses", which described the seam before
+  `charge-and-account-response-path` widened it to `httpx.RequestError` — eighteen subclasses, of
+  which two are dispatched by name. Found while widening that dispatch, and left alone because the
+  seam's own comments were in scope and this one is not about the seam.
+
+- **`pyproject.toml` sets `line-length = 100` while `[tool.ruff.lint]` ignores `E501`**
+  (`pyproject.toml:64`, `:69`), so line length is enforced only by `ruff format`, never by
+  `ruff check`. Harmless; noted because the contributor-facing constraint reads as if `ruff check`
+  enforces it.
+
+---
+
+## Retired
+
+- The response path being neither charged nor accounted — all four claims (a slow round trip
+  uncharged to the retry budget, an oversized non-2xx reported as a ceiling refusal, a redirect
+  loop costing 21 requests, and a malformed compressed body reaching the model as a raw zlib
+  sentence). **Fixed** by `charge-and-account-response-path`, which is now four requirements in
+  `openspec/specs/mcp-tool-surface`. Re-measured through the same harness: 4 requests / 47s of a
+  25s budget became 3 / 33s; the oversized 502 became `unexpected HTTP 502` and cost 4 requests
+  through `search_entities` rather than 16; the loop became 6 requests and a labelled refusal; the
+  zlib sentence became a labelled refusal naming the call.
+
+- Transport failures being classified by the wrong axis — both claims (attacker-authored
+  `ProxyError` text reaching the model unsanitised, and a TLS verification failure retried four
+  times with reachability advice) are now three requirements in
+  `openspec/specs/mcp-tool-surface`, and the partition is verified by a test that walks
+  `httpx.TransportError`'s subclasses from the live module rather than listing them.
 
 - The version being written in three places with nothing checking they agree — which shipped
   0.1.4 to every marketplace user as 0.1.2, because the *catalog* version is what drives
@@ -86,253 +377,48 @@ Retired since the last prune:
   drift check (`dist/core/references.js`: "root resolution is never affected") — and the store is
   intentionally left unregistered so nothing is written into acordia. The tool-name expectation is
   therefore visible, not enforced; asserting it would invert the dependency.
+- The client-method partition being declared and never verified — `test_every_client_method_is_classified`
+  forced every public attribute onto one of two lists, but nothing checked that a method listed in
+  `NOT_ENTITY_RETURNING` really returned no entities. **Closed** by T1-FIX-2's `NOT_SHAPING_CASES`,
+  which feeds every such method a payload carrying an entity probe at that method's own copy-through
+  depth, so listing a method there is no longer the cheap way to go green.
+- The `build` job's licence assertion failing intermittently with `tar: stdout: write error` under
+  `set -o pipefail`, because `grep -q` exits on the match while `tar` still has a chunk to flush.
+  **Fixed** by PR #18 (`e394ed9`): both listings are captured into a variable and matched from a
+  here-string, as the step already did for `meta`. Measured 0/30 false failures, from 19/30. The
+  patterns were deliberately kept byte-identical, which is why note 5 above is still open.
+- The shipped plugin `.mcp.json` running a shell at every server start, and the deliberate
+  `aleph-mcp:keychain-miss` marker that keeps an omitted `env` entry from letting the server inherit
+  an ambient `ALEPHCLIENT_API_KEY`. **Documented** in `plugins/aleph/README.md` (the setup section
+  and "Why the Keychain entry is host-scoped"), which is where a plugin installer reads it. Never a
+  defect — recorded here only until the README caught up.
+- The metadata path failing permanently and degrading silently — a truthy non-dict `model` cached
+  unchecked and then read with `.get` outside `_schemata`'s try, so `{"model": "https://..."}`
+  raised `AttributeError` as a server defect and, being cached, kept doing so for the process
+  lifetime; and only a success being memoised, so a broken `/api/2/metadata` was refetched by every
+  entity-returning call. Both measured before the fix: two `get_entity` calls both raised
+  `AttributeError: 'str' object has no attribute 'get'` with the route called once, and three calls
+  against a 503 route cost twelve upstream requests. **Fixed and specified** by
+  `harden-metadata-path`: a non-object `model` is refused by JSON type where it would have been
+  cached — degrading the shaped tools through the existing arm, surfacing on the ontology tools
+  where an empty answer would be a lie about the instance — the failure is negatively cached for a
+  bounded 60s window on the shared clock, and a reply whose captions came from `_CAPTION_FALLBACK`
+  *because the ontology could not be read* now says so, composing with the endpoint's own note. The
+  three requirements are in `openspec/specs/mcp-tool-surface`. `_schemata`'s comment naming this as
+  its own live counterexample is corrected in the same change.
+## `Settings` silently drops a mistyped keyword argument
 
-- `.github/workflows/ci.yml`, the `build` job's licence assertion: `tar tzf dist/*.tar.gz |
-  grep -q '/LICENSE$'` runs under `set -o pipefail`, so it fails intermittently with `tar:
-  stdout: write error` (exit 2). The sdist listing is 6373 bytes across 100 entries with
-  `LICENSE` third from last, so `grep -q` exits on the match while `tar` may still have its
-  final chunk to flush, and the EPIPE fails the pipeline. Observed twice on PR #12 while the
-  same job re-run on `main @ 1952232` passed; PR #12 changes no path in the sdist, so the
-  piped bytes are identical on both sides. It then went green on the same branch once the
-  test commits changed the archive's size — timing, not content, decides it, which is what
-  makes it a latent bug rather than a fixed one. Parked: outside T3's scope. One-line fix is to
-  capture first, as the step already does for `meta` — `listing=$(tar tzf dist/*.tar.gz)`
-  then `grep -q '/LICENSE$' <<<"$listing"`.
-- `Transport.request` (`transport.py`, was `client.py:496`) decodes the body with an unguarded
-  `jsonlib.loads`. `json.JSONDecodeError` and `UnicodeDecodeError` are both `ValueError`
-  subclasses, so a 2xx whose body is not JSON — an HTML maintenance page, a proxy
-  interstitial, a truncated body — reaches the model as a
-  refusal reading `Expecting value: line 1 column 1 (char 0)`, indistinguishable from "you
-  passed a bad id". The rational reply to a refusal is to change arguments and retry, against
-  an upstream that is down. Run-verified identical on `main @ 1952232`, so the T3 seam
-  relocates this and does not widen it; `errors.py:74` already guards the analogous connect
-  case. The fix that also closes the note below: a dedicated `Refusal(ValueError)` raised at
-  `client.py`'s own refusal sites, caught in place of bare `ValueError` — the pattern
-  `errors.py:97` already sets for `ResponseTooLarge`. Parked: `client.py` is out of T3's
-  scope; belongs with T2, which is already about error text.
-- The T3 seam wraps the whole tool body, where the arms it replaced wrapped only the
-  `await client.X(...)` call. Equivalent today — every body is one forwarding call — but a
-  future in-body `int()`, `datetime.fromisoformat()` or nested `json.loads` would be
-  relabelled as a client refusal with nothing to catch it. Same `Refusal` type fixes it.
-  Parked: needs `client.py`.
-- Resources have no counterpart to the fused `tool` helper: `@mcp.resource` is still reachable
-  raw, and `schema_resource`'s translation is a hand-applied decorator nothing enforces. Two
-  consequences, neither live today — a future *parameterised* resource would silently regress
-  to FastMCP's `Error reading resource '<uri>': ` wrapping, and the decorator order is
-  load-bearing but fails silently (`@_as_resource_error` above `@mcp.resource` imports,
-  registers and serves the untranslated message). `collections_resource` and
-  `schemata_resource` cannot raise `ValueError` at all, so decorating them now would be dead
-  code. Fix is a ~4-line local `resource(uri, **kw)` factory mirroring `tool`. Parked: beyond
-  T3's stated files and criteria.
-- Comment drift naming the structure T3 deleted: `client.py:619` and
-  `tests/test_collection_scope.py:334` and `:446` still say "each tool's `except ValueError`"
-  or "no tool's `except ValueError` translates". The claims stay true of the single seam, but
-  send a reader looking for per-tool arms that no longer exist. Parked: both files are outside
-  T3's scope.
-- `pyproject.toml` sets `line-length = 100` while `[tool.ruff.lint]` ignores `E501`, so line
-  length is enforced only by `ruff format`, never by `ruff check`. Harmless today; noted
-  because the contributor-facing constraint reads as if `ruff check` enforces it.
+`config.py` sets `extra="ignore"`, which is what lets an unrelated `ALEPH_MCP_*` variable or a
+shared `.env` entry pass without breaking startup. The cost is that a *keyword* argument is
+dropped just as quietly: `Settings(aleph_mcp_max_retries=2)` — the env-variable spelling rather
+than the field name `max_retries` — constructs successfully and leaves the default of 4 in place.
+Measured while probing the retry-facts change on 2026-09-19: a verification script appeared to
+prove a two-attempt refusal while actually exercising four, and nothing anywhere reported the
+mistake.
 
-- **`test_search_derives_captions_from_the_instance_model` cannot fail.** Found while building
-  the shaping seam (T1). Its mocked model declares the caption order `["name"]`, which is also
-  the first entry of `_CAPTION_FALLBACK`, so the test passes whether or not the instance model
-  reaches the slimmer -- it was the only integration test claiming to pin that plumbing. Left
-  alone rather than rewritten: T1's `test_every_entity_returning_method_shapes_its_reply` now
-  covers the same path with a discriminating model, so this one is superseded, not load-bearing.
-  Deleting or strengthening it is a separate, purely-test change.
-
-- **`get_entity_text` derives no caption.** `client.py` reads `entity.get("caption")` straight
-  off the payload, where every slimmed path calls `derive_caption`. Live Aleph sends a null
-  caption, so this is the one tool that can return `caption: null` for an entity the other tools
-  would have captioned. Found during T1; fixing it changes a tool's output and so is a behaviour
-  change, not a refactor.
-
-- **A non-dict `model` from `/api/2/metadata` is a permanent hard failure.** `get_model` caches
-  `payload.get("model") or {}` with no type check, and `_schemata` reads `model.get("schemata")`
-  outside its own try, so a metadata body like `{"model": "https://..."}`, `{"model": [..]}`,
-  `{"model": 3}` or `{"model": NaN}` (Python's json accepts bare NaN) raises `AttributeError`
-  there. It reaches the caller as `Error calling tool '<name>': 'str' object has no attribute
-  'get'` — prefixed, erased under masking — and because the bad value *is* cached it never
-  refetches, so all ten shaped tools plus `list_schemata`, `get_schema` and the `aleph://schemata`
-  resource stay broken for the process lifetime. Pre-existing and unchanged by T1-FIX-2, verified
-  identical at `1e8e74c`; parked because fixing it is a behaviour change outside that brief. It is
-  also the one live counterexample to the "an AttributeError here means a defect in this module"
-  reading that `_schemata`'s comment states. One line in `get_model` closes it:
-  `model = payload.get("model"); self._model = model if isinstance(model, dict) else {}`.
-
-- **The marker guard covers every tool but only one of three resources.** `find_marker` runs inside
-  `_refusing`, so `collections_resource` and `schemata_resource` — which are not decorated with
-  `@_as_resource_error` — return without it. Inert today: both call unshaped client methods that
-  build no markers. It becomes real only if a resource is ever pointed at a `@_shaped` method.
-
-- **`find_marker` does not traverse tuples, sets or dict keys.** A marker in one of those positions
-  is not found. No client method builds a tuple, a set or a non-string key into a reply, so nothing
-  reaches those branches today, and the markers' own serialisation refusal still fires there — the
-  outcome degrades to the pre-T1-FIX-2 message rather than leaking.
-
-- **`_schemata()` does not cache its failures.** `get_model` memoises only a success, and
-  `_schemata` swallows every exception, so a persistently broken `/api/2/metadata` costs the full
-  retry budget on *every* entity-returning call while still returning `None`. Found during T1 and
-  left alone: negative caching is a behaviour change. Note the test-suite side effect -- because
-  respx raises on an unmocked route and that raise is swallowed, almost every test in the suite
-  exercises the `schemata=None` path by accident. The sharper half: the degradation carries no
-  signal at all. Every other degradation in `client.py` announces itself -- `search_entities` emits
-  `TRUNCATED PAGE` / `EMPTY SLICE` / `EVERY COLLECTION` notes, `_slim_tags` attaches `_provenance`
-  -- but a caption derived from the fallback order is indistinguishable from one the instance's own
-  ontology produced. A `_note` when `schemata is None` would meet the standard the rest of the file
-  already sets.
-
-- **`get_profile` passes its `entities` field through unshaped.** It holds id strings in every
-  fixture and on the live instance, so nothing leaks today, but the "binds every entity-shaped
-  value in a response" requirement in `openspec/specs/mcp-tool-surface` would be violated by an
-  instance that serialised objects there. Since T1 this fails closed rather than leaking: `_shape`
-  refuses an unmarked entity-shaped dict. Read both halves of that trade -- on such an instance
-  `get_profile` does not degrade, it stops answering entirely, and the refusal is not something
-  the caller can act on. That is the right way round for unbounded document text reaching a model,
-  but it is a real availability cost on a version bump rather than a free win.
-
-  **Decided 2026-09-10: accepted as-is, and shipped as a documented behaviour change in 0.3.0.**
-  The failure only occurs on an instance that serialises `entities` as objects, which no fixture and
-  no tested instance does; the leak it prevents would be silent and unbounded. The note stays open
-  because the *availability* half is unaddressed: on such an instance the tool does not degrade, it
-  stops answering, and the message blames this server for an upstream shape. Marking the field so
-  the seam skips it would restore the leak; shaping the objects properly is the fix that makes the
-  question disappear, and it belongs in its own change.
-
-- **`_slim_entityset` copies upstream `entities` verbatim, and nothing fails closed there.**
-  `get_entityset` and `list_entitysets` pass that field straight through, exactly as `get_profile`
-  does -- but both sit outside T1's shaping seam, so the `_shape` guard never runs on their replies
-  and the protection recorded in the note above does not extend to them. Found by review of the T1
-  branch; parked because T1's scope is the ten entity-returning methods and netting these two means
-  deciding whether an entityset's `entities` is entity-shaped at all, which is a spec question.
-
-- **`_slim_tags` copies a tag row's non-string values through.** `entity_tags` and `profile_tags`
-  truncate a row's *string* values and pass every other value on unchanged, so an entity object as a
-  row's `value` arrives with all five blob properties intact. Aleph returns `{field, value, count}`
-  rows there, so this needs the same upstream contract change as the notes above and leaks nothing
-  today.
-
-- **`_slim_collection(full=True)` copies `statistics` verbatim.** `get_collection` returns whatever
-  that block holds, unread and unbounded; `list_collections` does not, because it slims with
-  `full=False`. Same class as the three notes above: an aggregation slot that is copied rather than
-  rebuilt.
-
-  All four of these -- `get_profile.entities`, `_slim_entityset.entities`, a tag row's `value`, and
-  `statistics` -- are one spec question about what counts as entity-shaped, not four refactors.
-  Since T1-FIX-2 each is pinned by a `strict` xfail row in `NOT_SHAPING_CASES`, so the behaviour
-  cannot change without the suite saying so, and fixing any of them forces this note to be closed.
-
-- **`get_schema` echoes upstream schema names into a refusal, unbounded and un-neutralised.**
-  `client.py:657` builds `f"Did you mean one of: {', '.join(close[:10])}?"` from the keys of
-  `model["schemata"]`, which is upstream text from `/api/2/metadata` — no cap, no `!r`, and no
-  `echo` policy, while `name!r` beside it is caller input and *is* escaped. Found by security
-  review during T2 and reproduced against pristine `develop @ 01a48c4`, so it predates that
-  change and is not introduced by it: a schema key carrying `ESC`, `NUL`, `U+202E` and a raw `"`
-  arrives in the message with all four intact, and one 20,000-character key produced a
-  20,104-character refusal. It reaches the model through `aleph://schema/{name}`, which
-  `server.py`'s `_as_resource_error` seam forwards with `str(e)` — so unprefixed and surviving
-  `mask_error_details`, the shape this repo reserves for caller-actionable refusals. Needs its
-  own policy (a plain strip, since the names are interpolated without `!r`) plus a bound on the
-  joined list rather than only on each name. Kept out of T2 because it is a behaviour change to
-  a tool's output, not a move. Related and lower: `list_schemata` (`client.py:646`) returns
-  `sorted(schemata)` — every upstream key, unbounded in count and length — into
-  `aleph://schemata`, bounded only by `MAX_RESPONSE_BYTES` and carrying no `_provenance` label.
-
-- **A policy built inline at a call site escapes both of `echo.py`'s guards.**
-  `test_every_policy_has_a_cap_row` enumerates `vars(echo)`, so it sees only module-level
-  policies declared in `echo.py`. `render(v, replace(PROPERTY_VALUE, max_chars=77))` at a call
-  site is invisible to it and to every cap row, which defeats the "each site asks for the
-  treatment by name" property the module exists to establish. Found by test review during T2.
-  No such call site exists today — all seven name one of the four — so this is a missing
-  enforcement, not a live defect. Closing it means either forbidding non-module policies at
-  runtime or asserting the seven call sites against the four names.
-
-- **`echo.COLLECTION_ECHO` leaves control characters to its call site's `!r`.** Found while
-  building the policy module (T2); it is the behaviour the four helpers had, preserved deliberately
-  rather than a new gap. `scope.check_collection_id` is the only caller and formats the result with
-  `!r`, which escapes controls -- so the policy does not strip them itself. A second caller that
-  interpolates the rendering plainly would put upstream control characters into a model-visible
-  message. Recorded because the coupling is now between two files rather than inside one function.
-  Closing it means either stripping in the policy (a behaviour change to the existing message, so
-  its own change) or asserting the `!r` at the call site.
-
-- **A non-list `results` from the collection listing escapes the `except ValueError` seam.**
-  `scope.py:312-313` (was `client.py:879-880`, character-identical). The `isinstance(results[0],
-  dict)` guard covers a body that arrives as a list or a scalar, because `Transport.request` wraps a
-  non-dict body as `{"results": <body>}` -- but an Aleph *dict* body whose own `results` key is
-  not a list reaches `results[0]` on a truthy non-list. Measured on both `develop` and the T5
-  branch, byte-identical: `{"results": {"a": 1}}` raises `KeyError`, `{"results": 5}` and
-  `{"results": true}` raise `TypeError`. `server.py` translates `ValueError` only, so these reach
-  the model untranslated rather than as a legible refusal. Found by review during T5 and
-  reproduced against pristine `develop`, so it predates that change. Fires only against an
-  upstream or proxy answering 200 with an unexpected body shape.
-
-- **"no collection with foreign_id X" absorbs an upstream malfunction.** `scope.py:321-325`,
-  unchanged from `develop`. Any lookup payload without a usable `results[0]` -- including
-  `{"status": "error"}` with no `results` key at all, and `{"results": [null]}` -- is reported to
-  the model as an authorisation-or-existence problem naming `list_collections`. A proxy, an SSO
-  interstitial or an unfamiliar Aleph version therefore produces a confident wrong diagnosis and a
-  dead-end next step. Fail-closed, so no wrong rows are returned. Found by review during T5.
-
-- **The `MAX_SCOPE_COLLECTIONS` boundary is unpinned.** Only `MAX + 1` is tested
-  (`tests/test_scope.py`, `tests/test_collection_scope.py:371`); changing `>` to `>=` at
-  `scope.py:161` -- which would refuse a legitimate ten-collection scope -- passes the whole
-  suite. Pre-existing gap inherited from `test_collection_scope.py`, not introduced by T5. Related
-  and also unpinned: the dedup runs *before* the bound, so eleven spellings collapsing to ten are
-  accepted. Closing it is one row in the existing parametrised table.
-
-- **A single-element `["*"]` is refused with the wrong reason.** `scope.py:150` fires the mixed-
-  scope message -- "cannot be combined with named collections" -- for a list that names no other
-  collection. Unchanged from `develop`, untested anywhere. Correcting it changes a refusal
-  message, so it is a behaviour change rather than a move.
-
-- **`openspec/config.yaml`'s layout paragraph is three modules stale.** It lists `server.py`,
-  `client.py`, `readonly.py`, `config.py` and `errors.py` and names none of `echo.py` (T2),
-  `scope.py` (T5) or `transport.py` (T4). Documentation only -- no spec assertion depends on it --
-  so it is parked rather than corrected inside a behaviour-preserving refactor. One paragraph to
-  fix, and cheapest to do once rather than once per task.
-
-- **A non-2xx whose body is over the ceiling is reported as a ceiling refusal, never as the
-  status.** `transport.py`: `_read_bounded` runs before `raise_for_status` and does not look at
-  `resp.status_code`, so a 502 with a >25 MiB body raises `TooLargeToolError` and the 502 is
-  discarded. Measured identical on `develop` and the T4 branch: a 502 with a plain body costs 4
-  requests and says "unexpected HTTP 502"; a 502 with an oversized body costs **16** requests --
-  the shrink loop re-asks four times, each paying four transport retries because 502 is in
-  `_RETRY_STATUS` -- and tells the model to narrow its query, never that the instance is failing.
-  Only `search_entities`' deadline bounds it. Related inaccuracy: `errors.py`'s comment claims the
-  error path "has its own, much smaller bound"; the 64 KiB limit in `_upstream_detail` bounds only
-  what is *quoted*, and above the ceiling the error path is never reached at all. Found by review
-  during T4; pre-existing, and fixing it changes a refusal message, so it is a behaviour change.
-
-- **`AlephClient.aclose` delegation is untested.** Making it a no-op leaves the whole suite green,
-  on `develop` (where it closed `_http` directly) as well as on the T4 branch (where it delegates
-  to `Transport.aclose`). Found by review during T4; pre-existing.
-
-- **`verify_tls` has no test anywhere.** Zero hits across `tests/`, so nothing pins that
-  `ALEPH_MCP_VERIFY_TLS` reaches the httpx client at all. Found by review during T4;
-  pre-existing. Related to the parked TLS-failure-retry note above.
-
-- **The licence assertions are unanchored, so a vendored LICENSE keeps them green while the
-  project's own is gone.** `.github/workflows/ci.yml`, the `build` job's licence step.
-  `grep -q 'licenses/LICENSE'` is a bare substring against the whole `unzip -l` listing, so
-  `aleph_mcp/vendor/licenses/LICENSE` satisfies it; `grep -q '/LICENSE$'` matches a member at any
-  depth, so `<pkg>/src/aleph_mcp/vendor/somedep/LICENSE` satisfies it. What the step means to
-  assert is `<name>-<ver>.dist-info/licenses/LICENSE` for the wheel and a root-level `LICENSE` for
-  the sdist. Verified by rebuilding both artefacts with the real licence deleted and a third-party
-  one planted deeper: **both the old and the new step exit 0** and print "licence expression,
-  header and file all present". That is precisely the case the step exists to catch — hatchling
-  silently drops the licence file and a bundled dependency's licence hides it. Pre-existing and
-  unchanged by the SIGPIPE fix, which deliberately kept both patterns byte-identical. The fix is to
-  anchor them: `'\.dist-info/licenses/LICENSE'` for the wheel and `-E '^[^/]+/LICENSE$'` for the
-  sdist. Found by review during the SIGPIPE fix; worth doing on its own because it changes what
-  the gate accepts, and today the repo has exactly one LICENSE so nothing would go red.
-
-- **The licence step names the wrong cause when the check cannot run, and prints no listing when it
-  fails.** Same step. A here-string redirection that fails (unwritable `$TMPDIR`) or a `grep` exiting
-  >1 lands in the same `|| { ... }` arm as a genuine miss, so the log says "the sdist ships no
-  LICENSE" and sends the reader to rebuild an archive that is fine; and neither arm prints the
-  listing it already holds, which is the first thing anyone debugging a packaging regression wants.
-  Also, two artefacts in `dist/` fail cryptically (`tar: <second>: Not found in archive`, or a
-  two-line `$wheel` that breaks `unzip -p` before the changed code) — unreachable in CI, where the
-  checkout is fresh and `uv build` is the only writer, but it bites anyone running the step locally
-  against a dirty `dist/`. All pre-existing; found by review during the SIGPIPE fix.
+Parked rather than fixed because the tolerance is deliberate for environment input and the fix is
+not obviously free — `extra="forbid"` would reject the env and `.env` cases this is there to
+absorb, so the real options are a validator that distinguishes init kwargs from environment
+sources, or leaving init-time typos to the type checker. Neither is in scope for an error-message
+change. Anything constructing `Settings` directly in a test or probe should use the field names
+and read the value back before trusting it.

@@ -5,13 +5,9 @@
       "command": "uvx",
       "args": [
         "--from",
-        "git+https://github.com/sapran/aleph-mcp.git@cb2d699e4e2bceceafe7500af8e4b94ef2e41e34",
+        "git+https://github.com/sapran/aleph-mcp.git@351b5b08c6134e508e3d0227c37a9629a7e0f1d3",
         "aleph-mcp"
-      ],
-      "env": {
-        "ALEPHCLIENT_HOST": "!printf %s \"$ALEPHCLIENT_HOST\"",
-        "ALEPHCLIENT_API_KEY": "!k=$(security find-generic-password -s \"aleph-mcp:$ALEPHCLIENT_HOST\" -a \"$USER\" -w 2>/dev/null); printf %s \"${k:-aleph-mcp:keychain-miss}\""
-      }
+      ]
     }
   }
 }

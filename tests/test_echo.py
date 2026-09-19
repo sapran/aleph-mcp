@@ -6,7 +6,7 @@ both of which survive widening the cap they guard. So a policy's cap and its tre
 asserted here literally — the expected strings are written out rather than derived from the
 policy under test, so a change to the module cannot move the expectation with it.
 
-The four policies differ deliberately; see `aleph_mcp.echo` for why each context needs its
+The five policies differ deliberately; see `aleph_mcp.echo` for why each context needs its
 own number. What must not vary is that each one keeps the number it has.
 """
 
@@ -19,6 +19,7 @@ from aleph_mcp.echo import (
     COLLECTION_ECHO,
     PROPERTY_VALUE,
     REQUEST_TARGET,
+    SCHEMA_NAME,
     UPSTREAM_ERROR,
     Policy,
     render,
@@ -31,6 +32,7 @@ CAP_ROWS = [
     (PROPERTY_VALUE, 500, "… [+1 chars]"),
     (COLLECTION_ECHO, 120, "… [+1 chars]"),
     (REQUEST_TARGET, 120, "…"),
+    (SCHEMA_NAME, 64, "…"),
     (UPSTREAM_ERROR, 200, "…"),
 ]
 
@@ -83,6 +85,22 @@ def test_request_target_replaces_unprintable_characters_and_nothing_else() -> No
     # Quotes and repeated spaces are left alone: this policy neutralises neither, because
     # its call site does not embed the result between quotes.
     assert render('a  b"c', REQUEST_TARGET) == 'a  b"c'
+
+
+def test_schema_name_substitutes_visibly_and_leaves_a_real_name_alone() -> None:
+    """The ontology listing serves these names as JSON string values the model reads directly,
+    with no `repr` between them and the reader — so the substitution is what neutralises them.
+
+    It doubles as the line flattening: `\\n`, `\\r` and `\\t` are not printable, so a multi-line
+    name cannot present as separate lines of server-authored text and no separate whitespace
+    collapse is needed. Quotes stay because neutralising them would not help on the other call
+    site either: a name quoted into a refusal forges structure with a comma or a question mark,
+    not a quote, which is why `_suggestion_clause` adds `repr` rather than asking for more here.
+    """
+    assert render("Pers\x1b[31mon\x00‮B\ty", SCHEMA_NAME) == "Pers�[31mon��B�y"
+    assert render('Person"s', SCHEMA_NAME) == 'Person"s'
+    # The longest name in the stock ontology, three and a half times under the cap.
+    assert render("ProjectParticipant", SCHEMA_NAME) == "ProjectParticipant"
 
 
 def test_upstream_error_strips_controls_collapses_lines_and_neutralises_quotes() -> None:

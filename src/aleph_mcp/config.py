@@ -1,15 +1,71 @@
 from __future__ import annotations
 
+import os
+import subprocess
+from typing import Any
+
 import httpx
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
-# What the shipped plugin manifest emits when the login Keychain holds no entry for the
-# host it was told to talk to. It is a literal rather than an empty string on purpose: the
-# harness drops an `env` entry whose command prints nothing, which would let the child
-# inherit an ambient ALEPHCLIENT_API_KEY and attach the operator's real credential to a
-# host that some `.env` in the working directory chose. Failing closed is the whole point.
+# Older plugin manifests emitted this marker when their Keychain lookup failed. Keep
+# refusing it so a stale launcher cannot turn it into a real credential.
 KEYCHAIN_MISS = "aleph-mcp:keychain-miss"
+
+
+def _read_keychain_value(service: str) -> str:
+    """Return a non-empty login-Keychain value, or an empty string on an unavailable lookup."""
+    account = os.environ.get("USER")
+    if not account:
+        return ""
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+class _CredentialSource(PydanticBaseSettingsSource):
+    """Select one complete credential pair without mixing sources."""
+
+    def __init__(
+        self,
+        settings_cls: type[BaseSettings],
+        environment: PydanticBaseSettingsSource,
+        dotenv: PydanticBaseSettingsSource,
+    ) -> None:
+        super().__init__(settings_cls)
+        self._environment = environment
+        self._dotenv = dotenv
+
+    def get_field_value(self, field: Any, field_name: str) -> tuple[Any, str, bool]:
+        return None, field_name, False
+
+    def __call__(self) -> dict[str, Any]:
+        environment = self._environment()
+        dotenv = self._dotenv()
+        values = {**dotenv, **environment}
+        values.pop("ALEPHCLIENT_HOST", None)
+        values.pop("ALEPHCLIENT_API_KEY", None)
+
+        for source in (environment, dotenv):
+            if "ALEPHCLIENT_HOST" in source and "ALEPHCLIENT_API_KEY" in source:
+                values.update(
+                    ALEPHCLIENT_HOST=source["ALEPHCLIENT_HOST"],
+                    ALEPHCLIENT_API_KEY=source["ALEPHCLIENT_API_KEY"],
+                )
+                return values
+
+        host = _read_keychain_value("aleph-mcp-host")
+        api_key = _read_keychain_value("aleph-mcp-api-key")
+        if host and api_key:
+            values.update(ALEPHCLIENT_HOST=host, ALEPHCLIENT_API_KEY=api_key)
+        return values
 
 
 class Settings(BaseSettings):
@@ -24,6 +80,7 @@ class Settings(BaseSettings):
         env_prefix="ALEPH_MCP_",
         case_sensitive=False,
         extra="ignore",
+        env_file=".env",
         # Keep the assembled settings dict — which holds the API key — out of the
         # string form of any validation error.
         hide_input_in_errors=True,
@@ -58,6 +115,21 @@ class Settings(BaseSettings):
     )
     verify_tls: bool = Field(True, description="Verify TLS certs (set false for self-signed).")
 
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (
+            init_settings,
+            _CredentialSource(settings_cls, env_settings, dotenv_settings),
+            file_secret_settings,
+        )
+
     @field_validator("host")
     @classmethod
     def _normalise_host(cls, v: str) -> str:
@@ -80,15 +152,15 @@ class Settings(BaseSettings):
     @field_validator("api_key")
     @classmethod
     def _require_a_key(cls, v: SecretStr) -> SecretStr:
-        # An empty string is what a failed Keychain lookup yields, and pydantic would
-        # accept it as a present str. Refusing here turns a silent 401 on the first tool
-        # call into a startup error that names the cause.
+        # An empty configured value must fail at startup rather than become a 401 on the
+        # first tool call.
         if not v.get_secret_value().strip():
             raise ValueError(
-                "api_key is empty. If the plugin reads it from the macOS Keychain, the "
-                "entry is keyed on the host: store it with "
-                '`security add-generic-password -s "aleph-mcp:$ALEPHCLIENT_HOST" '
-                "-a \"$USER\" -w '<api-key>' -U`."
+                "api_key is empty. Set both ALEPHCLIENT_HOST and ALEPHCLIENT_API_KEY, "
+                "or store both Keychain entries: "
+                '`security add-generic-password -s "aleph-mcp-host" -a "$USER" '
+                '-w "<host>" -U` and `security add-generic-password -s '
+                '"aleph-mcp-api-key" -a "$USER" -w "<api-key>" -U`.'
             )
         return v
 

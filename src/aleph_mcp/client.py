@@ -4,15 +4,17 @@ import functools
 import re
 import secrets
 import time
+import traceback
 from collections.abc import Awaitable, Callable
+from types import TracebackType
 from typing import Any, Concatenate, cast
 
 import httpx
 from fastmcp.exceptions import ResourceError, ToolError
 
 from .config import Settings
-from .echo import PROPERTY_VALUE, render
-from .errors import ResponseTooLarge
+from .echo import PROPERTY_VALUE, SCHEMA_NAME, render
+from .errors import Refusal, ResponseTooLarge, raise_unusable_model
 from .readonly import ReadOnlyViolation
 from .scope import ALL_COLLECTIONS, CollectionResolver
 from .transport import MAX_RESPONSE_BYTES, Query, Transport
@@ -52,6 +54,33 @@ MAX_FACET_SIZE = 200
 # deadline in search_entities is what bounds that case, not this count.
 MAX_SEARCH_SHRINKS = 3
 
+# The three bounds on ontology text. FtM schema names are upstream text -- whoever runs or
+# proxies the instance chooses them -- so `echo.SCHEMA_NAME` bounds each name and these bound
+# how many of them are put together. Measured against followthemoney 4.11.0: 71 schemata,
+# longest name `ProjectParticipant` at 18 characters, and the worst three-character prefix
+# cluster (`con` -> Contract, ContractAward, Control) joining to 32 characters.
+#
+# MAX_SUGGESTION_CHARS is the one that does the work. A per-name cap alone leaves ten names at
+# the cap, which is the same unbounded echo one order of magnitude smaller, so the joined list
+# is bounded too. At 7.5x the worst real cluster it never clips a legitimate suggestion set,
+# and when it does clip nothing is lost that the caller cannot recover: the refusal already
+# ends by naming `aleph://schemata` as the full list.
+MAX_SUGGESTIONS = 10
+MAX_SUGGESTION_CHARS = 240
+
+# Roughly 7x the stock ontology, applied to each of the three lists `list_schemata` returns.
+# `matchable` and `edges` are subsets of `all`, so bounding only `all` would leave a shorter
+# but still unbounded path through either subset.
+#
+# The character budget is the one that bounds the response, for the same reason
+# MAX_SUGGESTION_CHARS does above: a count cap beside a per-name cap is not a bound, it is a
+# ceiling of count x cap. Without it, 500 names each at the 64-character cap is ~32,500
+# characters per list and ~97,000 across the three. 8,000 is 10x the stock ontology's `all`
+# list (71 names, ~800 characters joined), so it never clips a real instance, and a cut list
+# says what it dropped either way.
+MAX_SCHEMA_NAMES = 500
+MAX_SCHEMA_LIST_CHARS = 8000
+
 # Properties that carry whole documents. Never worth spending context on inside a
 # search hit; get_entity_text exists to read them deliberately and in bounded slices.
 _TEXT_BLOB_PROPS = frozenset({"bodyText", "bodyHtml", "safeHtml", "indexText", "translatedText"})
@@ -73,15 +102,35 @@ def _fence(text: str) -> str:
 _ENTITY_ID = re.compile(r"[A-Za-z0-9._:-]+")
 
 
+# Where a real identifier is read from, per field. A constant of the field and not an
+# inference from the rejected value: a "looks like a rendered label" test would be a second
+# classifier that misses every label shape it was not written for, while changing nothing
+# about what is accepted. Measured over a week of one consumer's traffic, nine calls passed
+# a rendered property label here, and the message named only the charset.
+_ID_SOURCE = {
+    "entity_id": "an entity id is the `id` field of a `search_entities` or `expand_entity` result row",
+    "profile_id": "a profile id is the `profile_id` field of an entity reply, present only where the instance has curated one",
+    "entityset_id": "an entityset id is the `id` field of a `list_entitysets` row",
+}
+
+
 def _check_entity_id(value: str, *, field: str = "entity_id") -> str:
     if not isinstance(value, str) or not _ENTITY_ID.fullmatch(value):
-        raise ValueError(f"invalid {field}: must match [A-Za-z0-9._:-]+ (got {value!r})")
+        # `.get`, not `[...]`: a field added later without an entry must lose the hint, not
+        # turn a refusal into a `KeyError` that the seam would refuse to dress as one.
+        source = _ID_SOURCE.get(field)
+        hint = (
+            f" Read it from a result rather than from a rendered display string: {source}."
+            if source
+            else ""
+        )
+        raise Refusal(f"invalid {field}: must match [A-Za-z0-9._:-]+ (got {value!r}).{hint}")
     # The charset permits `.`, so an id of only dot segments passes the pattern and is then
     # normalised away at URL construction — `/api/2/entitysets/../entities` becomes
     # `/api/2/entities`, answering a different question than the caller asked. Refuse on
     # content rather than by banning `.`, which legitimate Aleph ids contain.
     if not value.strip("."):
-        raise ValueError(f"invalid {field}: addresses nothing (got {value!r})")
+        raise Refusal(f"invalid {field}: addresses nothing (got {value!r})")
     return value
 
 
@@ -99,6 +148,129 @@ _CAPTION_FALLBACK = (
     "registrationNumber",
     "full",
 )
+
+# How long a failure to obtain a usable instance model is remembered. Only a *success* was
+# memoised before, so a persistently broken /api/2/metadata was refetched by every
+# entity-returning call: measured at three `get_entity` calls costing twelve upstream
+# requests, a full transport retry budget each. Bounded rather than permanent on purpose --
+# permanent negative caching turns one unlucky 503 into process-long degraded captions,
+# which is a worse failure than the requests it saves. Read through `_monotonic`, so the one
+# patched clock that governs the retry budget, the scope resolver and the shrink loop governs
+# this window too, and a test moves it without sleeping.
+_MODEL_FAILURE_TTL = 60.0
+
+# The signal this degradation lacked. Every other one in this file announces itself --
+# TRUNCATED PAGE, EMPTY SLICE, EVERY COLLECTION, `_provenance` -- while a caption derived
+# from `_CAPTION_FALLBACK` was indistinguishable from one the instance's own ontology
+# produced. Emitted only when the ontology could not be *read*: an ontology that was read and
+# declares no caption fields makes the fallback order the correct answer, not a degradation,
+# and noting it would state something false on every reply from a minimal instance.
+_FALLBACK_CAPTION_NOTE = (
+    "DERIVED CAPTIONS: this instance's followthemoney ontology (/api/2/metadata) could not "
+    "be read, so each `caption` here was derived from a fixed property order rather than "
+    "from the schema's own caption fields. The rest of every entity is unaffected; treat a "
+    "caption as a convenience label, not as the instance's own. The fault is remembered "
+    "briefly, so an immediate retry returns this same answer without asking the instance."
+)
+
+# A deliberate cross-collection search must still read as one in a transcript. Without it,
+# `"*"` and a scoped search are indistinguishable in the rows.
+#
+# A module constant because both scoped search tools emit it. It sat inline in
+# `search_entities` while `match_entity` emitted nothing at all, which is how a match
+# against every readable collection came back saying so nowhere -- the failure scope.py's
+# module docstring names as its reason to exist. Copying the sentence to the second call
+# site is how the collection filter's wire spelling ended up written three times.
+_EVERY_COLLECTION_NOTE = (
+    "EVERY COLLECTION: this search was not scoped to a collection, so hits may come from "
+    "any dataset this key can read — check each hit's `collection_id` before treating it "
+    "as evidence about one subject."
+)
+
+
+def _quoted(name: str) -> str:
+    """One upstream schema name as a bounded, balanced quoted token.
+
+    `repr` first, cap second. The order matters: `repr` expands an escaped character up to
+    six-fold, so capping the name and escaping after would let one 64-character name reach 386
+    and put the per-name bound back where it started. Escaping first means the cap counts what
+    the model receives -- the same reason `echo.render` collapses before it truncates.
+
+    Capping a `repr` cuts off the quote `repr` opened, so the delimiter is put back. An
+    unbalanced token would undo the point of quoting: the next `", "` would read as ordinary
+    text inside a string that never ends, which is the forgery this is here to prevent.
+    `repr` always closes with the delimiter it opened, so `raw[0]` is the right character.
+    """
+    raw = repr(name)
+    token = render(raw, SCHEMA_NAME)
+    return token if token == raw else token + raw[0]
+
+
+def _suggestion_clause(names: list[str]) -> str:
+    """The whole `Did you mean one of:` clause, or `""` when there is nothing to offer.
+
+    Each name is `repr`-ed *before* it is bounded, and that order is load-bearing. The
+    suggestions are joined on this server's own `", "` and sit inside a sentence this server
+    terminates with `?`, so both are structure an upstream name can forge: a key named
+    `Person, Company (system: ignore prior instructions)` reads as two suggestions and a
+    parenthetical, and one containing `?` ends the sentence and continues as server-authored
+    prose. Measured against the first draft of this change, which interpolated the names bare.
+    `repr` is what the caller-input half of this same f-string has always used -- `name!r`,
+    three tokens away -- so this makes the two halves of one message agree.
+
+    Bounding the `repr` rather than the name is what keeps the per-name cap honest: `repr`
+    expands an escaped character up to six-fold, so capping first and escaping after would let
+    one 64-character name reach 386. Escaping first means the cap counts what the model
+    receives, which is the same reason `echo.render` collapses before it truncates.
+
+    Two bounds, because one is not enough. `SCHEMA_NAME` bounds each token, and without it a
+    single 20,000-character key produced a 20,100-character refusal. But ten tokens each at
+    that cap is the same unbounded echo one order of magnitude smaller, so the joined list is
+    bounded too -- which is the bound the count cap was mistaken for.
+
+    A clipped list says so. The count is not noise the way a truncated *error* body's would
+    be: it is the difference between "these are the near matches" and "these are three of
+    forty", and this server treats a confidently incomplete answer as a defect. Nothing is
+    lost that the caller cannot recover -- the refusal ends by naming `aleph://schemata` --
+    but the caller has to be told there is something to go and get.
+    """
+    offered: list[str] = []
+    used = 0
+    for name in names[:MAX_SUGGESTIONS]:
+        token = _quoted(name)
+        used += len(token) + (2 if offered else 0)
+        if offered and used > MAX_SUGGESTION_CHARS:
+            break
+        offered.append(token)
+    if not offered:
+        return ""
+    clause = f"Did you mean one of: {', '.join(offered)}?"
+    if len(offered) < len(names):
+        clause += f" ({len(offered)} of {len(names)} near matches shown.)"
+    return clause
+
+
+def _bounded_names(names: list[str]) -> tuple[list[str], int]:
+    """Render and bound one list of schema names; returns what is served and what was dropped.
+
+    Both bounds live here so the caller cannot apply one and forget the other. The count cap
+    alone is the pattern `_suggestion_clause` above rejects -- 500 names each at the per-name
+    cap is ~32,500 characters of upstream text per list, three times over, which is bounded
+    only in the sense that 25 MiB is. The character budget is what makes it a bound.
+
+    `len(names) - len(kept)` covers both reasons for dropping in one number, and is computed
+    from the pre-slice list, so a list cut for either reason reports the same truthful count
+    and a list that fits reports zero.
+    """
+    kept: list[str] = []
+    used = 0
+    for name in names[:MAX_SCHEMA_NAMES]:
+        rendered = render(name, SCHEMA_NAME)
+        used += len(rendered)
+        if kept and used > MAX_SCHEMA_LIST_CHARS:
+            break
+        kept.append(rendered)
+    return kept, len(names) - len(kept)
 
 
 def derive_caption(entity: dict[str, Any], schemata: dict[str, Any] | None = None) -> str | None:
@@ -483,6 +655,10 @@ class AlephClient:
             monotonic=lambda: _monotonic(),
         )
         self._model: dict[str, Any] | None = None
+        # When the model last failed to load, and with what. Paired with
+        # `_MODEL_FAILURE_TTL` above; see `get_model` for why the exception itself is what
+        # gets kept.
+        self._model_failure: tuple[float, Exception, TracebackType | None] | None = None
         # Retries, budgets, the streaming ceiling and the read-only hook live in
         # transport.py; this class only ever asks it for a decoded body. `_monotonic` is
         # passed through the same late-bound way as above, so one patched clock governs the
@@ -499,12 +675,60 @@ class AlephClient:
 
         Sourced from GET /api/2/metadata so the ontology always matches the schema
         version the server actually indexes with, instead of a pinned client copy.
+
+        A failure is cached too, for `_MODEL_FAILURE_TTL`. What is kept is the exception
+        instance, re-raised with its traceback cleared: `_schemata` classifies by class and
+        by `__cause__` -- that is how a read-only refusal stays a read-only refusal rather
+        than becoming a degraded caption -- and both survive a re-raise, so the suppressed
+        calls are indistinguishable from the one that paid for the request. Clearing the
+        traceback stops it growing a frame per suppressed call across the window.
+
+        A truthy non-dict `model` is refused here rather than cached. It used to be cached
+        unchecked and read with `.get` outside any handler, so a `model` arriving as a string
+        raised `AttributeError` from `_schemata` -- reported to the caller as a defect in this
+        server, and permanent, because the bad value was in the cache. A missing, null or
+        empty `model` keeps its own meaning: an instance entitled to declare no ontology.
         """
-        if self._model is None:
+        if self._model is not None:
+            return self._model
+        if self._model_failure is not None:
+            failed_at, exc, tb = self._model_failure
+            if _monotonic() - failed_at < _MODEL_FAILURE_TTL:
+                # The *original* traceback, restored rather than dropped or extended. Dropping
+                # it names this line as the origin, and a module defect is then diagnosable
+                # only on its first occurrence -- there is no logging in this package, so the
+                # traceback is the only diagnostic there is. Extending it (a plain re-raise)
+                # appends a frame per suppressed call for the whole window. Restoring the same
+                # object each time does neither.
+                raise exc.with_traceback(tb)
+            self._model_failure = None
+        try:
             payload = await self._transport.request(
                 "GET", "/api/2/metadata", context="aleph://schema", resource=True
             )
-            self._model = payload.get("model") or {}
+            model = payload.get("model")
+            if model and not isinstance(model, dict):
+                raise_unusable_model(model, context="aleph://schema", resource=True)
+        except (ResourceError, httpx.HTTPError) as e:
+            # Exactly the families `_schemata` classifies as upstream faults, which is what
+            # this cache is for. A defect in this module is deliberately *not* memoised: it
+            # must keep reaching the caller with its own traceback on every call, which is the
+            # property `_schemata`'s named except arms exist to preserve.
+            #
+            # `ValueError` was a third member here, absorbing a metadata body that is not
+            # JSON. The transport guards its own decode now and refuses that as a
+            # `ResourceError` -- this call passes `resource=True` -- so the fault still
+            # arrives, through the first arm. What would be left under `ValueError` is a
+            # defect in this module, which is the one thing this tuple exists not to memoise.
+            #
+            # The frames are cleared before the instance is stored. It now outlives its call
+            # by the whole window, and `Transport.request`'s frame holds the response body --
+            # up to MAX_RESPONSE_BYTES, since the give-up body is read in full. The line chain
+            # a traceback shows survives; only the locals go.
+            traceback.clear_frames(e.__traceback__)
+            self._model_failure = (_monotonic(), e, e.__traceback__)
+            raise
+        self._model = model or {}
         return self._model
 
     async def _reply(self, built: Any, endpoint: str) -> dict[str, Any]:
@@ -512,8 +736,29 @@ class AlephClient:
 
         The instance model is fetched once here, after the endpoint has made its own
         request, so a call refused before that point still costs no upstream request.
+
+        `None` from `_schemata` means the ontology could not be *read*, and every caption in
+        this reply therefore came from `_CAPTION_FALLBACK`. That is announced, the way every
+        other degradation in this file is. It composes with a note the endpoint already set
+        rather than replacing it -- a truncated page from an instance whose ontology is down
+        is both, and a caller needs to be told both.
+
+        The server's own statement goes first. Nothing upstream-authored can reach `existing`
+        today -- every shaped endpoint builds its top-level keys itself, and the two that set
+        `_note`, `search_entities` and `match_entity`, both set it from this module's own
+        constants -- but this is the ordering that would not hurt if that ever changed:
+        upstream text prefixed to a server sentence reads as its opening clause.
         """
-        return cast(dict[str, Any], _shape(built, await self._schemata(), endpoint))
+        schemata = await self._schemata()
+        shaped = cast(dict[str, Any], _shape(built, schemata, endpoint))
+        if schemata is None:
+            existing = shaped.get("_note")
+            shaped["_note"] = (
+                " ".join([_FALLBACK_CAPTION_NOTE, existing])
+                if isinstance(existing, str) and existing
+                else _FALLBACK_CAPTION_NOTE
+            )
+        return shaped
 
     async def _schemata(self) -> dict[str, Any] | None:
         """Cached FtM schemata, used only to derive captions. An upstream fault is not fatal.
@@ -540,53 +785,96 @@ class AlephClient:
         except ResourceError as e:
             if isinstance(e.__cause__, ReadOnlyViolation):
                 raise ToolError(str(e)) from e
-            # Everything else this covers -- a non-2xx, an exhausted connect, a body over
-            # the ceiling -- is an upstream fault the caller cannot act on.
+            # This is the live arm, and it covers every upstream fault the caller cannot act
+            # on: a non-2xx, an exhausted connect, a body over the ceiling, a read-side fault
+            # the transport does not retry -- ReadTimeout, ReadError, RemoteProtocolError, a
+            # slow model being literally the ReadTimeout in that set -- and, since this
+            # change, a body that is not JSON. `Transport.request` catches
+            # `(httpx.RequestError, ssl.SSLError)` around all of its I/O and every arm of that
+            # dispatch ends in a `raise_*`, so they arrive here already flavoured.
             return None
-        except (httpx.HTTPError, ValueError):
-            # Two families, both upstream's fault and neither the caller's.
+        except httpx.HTTPError:
+            # A backstop, and honestly labelled as one: no path produces it today. Review
+            # measured a `ReadTimeout` on the metadata route arriving at the arm above as a
+            # `ResourceError`, and making this arm unraisable left the suite green -- because
+            # the transport lets no `httpx` exception out, and `HTTPStatusError`, the other
+            # `HTTPError` member, is never raised here at all.
             #
-            # httpx.HTTPError covers the read-side faults `Transport.request` deliberately does
-            # not retry -- ReadTimeout, ReadError, RemoteProtocolError. A slow model is
-            # literally the ReadTimeout in that set, so this is the arm the first paragraph
-            # describes.
+            # It is kept rather than deleted because an `httpx` error that did escape should
+            # degrade a caption, not hard-fail ten tools; what is corrected is the comment,
+            # which claimed this arm handled faults that in fact reach the one above. A wrong
+            # map is worse than a dead branch: the next fault gets routed by it.
             #
-            # ValueError covers the body not parsing, and it has to be the base class rather than
-            # JSONDecodeError. `Transport.request` ends at `jsonlib.loads(body)` where body is
-            # *bytes*: json.loads runs detect_encoding and decodes first, so a body that is not
-            # valid UTF-8 raises UnicodeDecodeError -- a sibling of JSONDecodeError under
-            # ValueError, not a subclass. Measured with JSONDecodeError here: a metadata route
-            # answering 200 with a PNG, a raw gzip or a latin-1 error page hard-failed all ten
-            # shaped tools, permanently (only a success is cached, so every later call refetched and
-            # failed the same way), and UnicodeDecodeError being a ValueError meant `server.py`'s
-            # seam handed the model "'utf-8' codec can't decode byte 0x89..." unprefixed and
-            # surviving masking -- the shape of a deliberate, caller-actionable refusal, naming
-            # nothing the caller can act on.
+            # `ValueError` was the second member here, absorbing a metadata body that is not
+            # JSON: `Transport.request` used to end at an unguarded `jsonlib.loads(body)` on
+            # *bytes*, so a route answering 200 with a PNG, a raw gzip or a latin-1 error page
+            # raised `UnicodeDecodeError` -- a sibling of `JSONDecodeError` under `ValueError`
+            # rather than a subclass, which is why the base class was named. Measured with
+            # only `JSONDecodeError` caught, those three hard-failed all ten shaped tools
+            # permanently, since only a success is cached. The transport guards that decode
+            # now and refuses it as a `ResourceError`, which the arm above already degrades
+            # on, so the four bodies still degrade and the test that parametrises them is
+            # unchanged.
             #
             # Still named rather than a bare except: a defect in this module -- an
-            # AttributeError, a TypeError -- reaches the caller instead of silently degrading
-            # every caption on the instance. That property is pinned by a test, because
-            # deleting this arm entirely, or appending `except Exception` after it, both left
-            # the suite green at 380 passed.
+            # AttributeError, a TypeError, and now a ValueError too -- reaches the caller
+            # instead of silently degrading every caption on the instance. That property is
+            # pinned by a test, because deleting this arm entirely, or appending
+            # `except Exception` after it, both left the suite green at 380 passed.
             #
-            # One live counterexample to that reading, pre-existing and recorded in
-            # docs/implementation-notes.md rather than fixed here: `model.get("schemata")`
-            # below is outside this try, so an upstream `model` that is truthy but not a dict
-            # raises AttributeError there and means "upstream sent nonsense", not "this module
-            # has a bug".
+            # The one live counterexample to that reading is gone: an upstream `model` that
+            # is truthy but not a dict used to reach `model.get("schemata")` below -- outside
+            # this try -- and raise AttributeError there, meaning "upstream sent nonsense"
+            # rather than "this module has a bug". `get_model` now refuses that shape as a
+            # ResourceError, so it arrives through the arm above and degrades like any other
+            # upstream fault, and `model` here is a dict by construction.
             return None
         schemata = model.get("schemata")
+        if not schemata:
+            # Read, and declares nothing. `{}` rather than `None` because `None` is what
+            # `_reply` reads as *could not be read*, and announcing a degradation here would
+            # state something false on every reply from a legitimately minimal instance --
+            # including `{"model": {}}` and a missing `model`, which `get_model` caches as `{}`.
+            # Caption-neutral: `derive_caption` guards with `if schemata:`, so an empty dict
+            # and `None` already select the same fallback order.
+            return {}
         return schemata if isinstance(schemata, dict) else None
 
     async def list_schemata(self) -> dict[str, Any]:
+        """Every schema name this instance declares, bounded, rendered and labelled.
+
+        `count` is the instance's own total, not the length of the list served. The resource
+        answers *what this instance declares*, so reporting a clipped count alongside a clipped
+        list would state something false about the instance -- the same reading the refusal of
+        an unusable model already establishes, where an ontology that could not be read must
+        not be served as one declaring nothing.
+
+        All three lists are bounded, not just `all`. `matchable` and `edges` are subsets of it,
+        so bounding only `all` would leave a shorter but equally unbounded path out through
+        either subset.
+        """
         model = await self.get_model()
         schemata = model.get("schemata") or {}
-        return {
-            "count": len(schemata),
+        lists = {
             "matchable": sorted(n for n, s in schemata.items() if s.get("matchable")),
             "edges": sorted(n for n, s in schemata.items() if s.get("edge")),
             "all": sorted(schemata),
         }
+        out: dict[str, Any] = {"count": len(schemata)}
+        omitted = {}
+        for key, names in lists.items():
+            out[key], dropped = _bounded_names(names)
+            if dropped:
+                omitted[key] = dropped
+        if omitted:
+            # Announced rather than served short. A confidently incomplete answer is the one
+            # shape this server treats as a defect, so a cut list says what it cut.
+            out["_omitted_schemata"] = omitted
+        out["_provenance"] = {
+            "trust": "untrusted",
+            "origin": "schema names declared by the Aleph instance, not this server's vocabulary",
+        }
+        return out
 
     async def get_schema(self, *, name: str) -> dict[str, Any]:
         model = await self.get_model()
@@ -594,10 +882,11 @@ class AlephClient:
         schema = schemata.get(name)
         if schema is None:
             close = sorted(n for n in schemata if n.lower().startswith(name[:3].lower()))
-            raise ValueError(
+            clause = _suggestion_clause(close)
+            raise Refusal(
                 f"unknown followthemoney schema {name!r}. "
-                + (f"Did you mean one of: {', '.join(close[:10])}?" if close else "")
-                + " Read aleph://schemata for the full list."
+                + (f"{clause} " if clause else "")
+                + "Read aleph://schemata for the full list."
             )
         return {
             "name": name,
@@ -712,7 +1001,7 @@ class AlephClient:
         # second one is refused rather than merged. Checked before resolution: the caller
         # needs to be told which argument to use, not which id won.
         if filters and "collection_id" in filters:
-            raise ValueError(
+            raise Refusal(
                 "collection scope belongs in the `collection` argument, not in `filters`: "
                 f"pass collection={filters['collection_id']!r} and remove "
                 "filters['collection_id']. `collection` also accepts a foreign_id or a list, "
@@ -720,17 +1009,17 @@ class AlephClient:
             )
 
         if limit < 0:
-            raise ValueError("limit must be >= 0")
+            raise Refusal("limit must be >= 0")
         if offset < 0:
-            raise ValueError("offset must be >= 0")
+            raise Refusal("offset must be >= 0")
         if facet_size < 1 or facet_size > MAX_FACET_SIZE:
-            raise ValueError(
+            raise Refusal(
                 f"facet_size must be between 1 and {MAX_FACET_SIZE}. A facet is a summary; "
                 "if you need more buckets than that, filter to a narrower slice and facet "
                 "again rather than asking for the whole aggregation."
             )
         if limit + offset > MAX_PAGE:
-            raise ValueError(
+            raise Refusal(
                 f"limit + offset must be <= {MAX_PAGE}: Aleph cannot page past result "
                 f"{MAX_PAGE} (Elasticsearch result-window limit), so deep pagination is not a "
                 "way to read a whole collection. Narrow the query instead — add filters, or "
@@ -818,13 +1107,7 @@ class AlephClient:
         # window is both truncated and unenumerated, and a caller needs to be told both.
         notes: list[str] = []
         if scope.is_every_collection:
-            # A deliberate cross-collection search must still read as one in a transcript.
-            # Without this, `"*"` and a scoped search are indistinguishable in the rows.
-            notes.append(
-                "EVERY COLLECTION: this search was not scoped to a collection, so hits may "
-                "come from any dataset this key can read — check each hit's `collection_id` "
-                "before treating it as evidence about one subject."
-            )
+            notes.append(_EVERY_COLLECTION_NOTE)
         returned = len(result["results"])
         if page != limit and returned:
             resume = offset + returned
@@ -882,7 +1165,7 @@ class AlephClient:
     ) -> dict[str, Any]:
         _check_entity_id(entity_id)
         if limit < 1 or limit > MAX_EXPAND:
-            raise ValueError(
+            raise Refusal(
                 f"limit must be between 1 and {MAX_EXPAND}: graph expansion has its own, much "
                 f"lower ceiling than search (ALEPH_MAX_EXPAND_ENTITIES, default {MAX_EXPAND})."
             )
@@ -944,7 +1227,7 @@ class AlephClient:
         limit: int = 10,
     ) -> dict[str, Any]:
         if "schema" not in sample:
-            raise ValueError(
+            raise Refusal(
                 "sample must include a followthemoney 'schema' key, e.g. "
                 '{"schema": "Person", "properties": {"name": ["Jane Doe"]}}'
             )
@@ -956,7 +1239,16 @@ class AlephClient:
         payload = await self._transport.request(
             "POST", "/api/2/match", context="match_entity", params=params, json=sample
         )
-        return _slim_result(payload)
+        result = _slim_result(payload)
+        # The same report `search_entities` makes, for the same reason: requiring the
+        # argument makes the scope chosen, and reporting it is what makes the choice
+        # visible in the reply. `collection` alone -- the schema is stated by the caller
+        # inside `sample`, so there is no schema scope for this server to report back, and
+        # inventing one would describe a decision nobody made.
+        result["searched"] = {"collection": scope.reported()}
+        if scope.is_every_collection:
+            result["_note"] = _EVERY_COLLECTION_NOTE
+        return result
 
     # -- profiles --------------------------------------------------------------
 
@@ -1017,7 +1309,7 @@ class AlephClient:
         # Aleph clamps here rather than erroring (QueryParser max_limit); refusing is
         # deliberately stricter, so a truncated expansion is never mistaken for a whole one.
         if limit < 1 or limit > MAX_EXPAND:
-            raise ValueError(
+            raise Refusal(
                 f"limit must be between 1 and {MAX_EXPAND}: graph expansion has its own, much "
                 f"lower ceiling than search (ALEPH_MAX_EXPAND_ENTITIES, default {MAX_EXPAND})."
             )
@@ -1151,9 +1443,9 @@ class AlephClient:
         """
         _check_entity_id(entity_id)
         if offset < 0:
-            raise ValueError("offset must be >= 0")
+            raise Refusal("offset must be >= 0")
         if limit < 1 or limit > 200_000:
-            raise ValueError("limit must be between 1 and 200000 characters")
+            raise Refusal("limit must be between 1 and 200000 characters")
 
         entity = await self._transport.request(
             "GET", f"/api/2/entities/{entity_id}", context="get_entity_text"
@@ -1267,7 +1559,7 @@ def _shrunk_page(page: int) -> int:
 
 def _page_params(limit: int, offset: int, *, cap: int) -> Query:
     if limit < 0 or limit > cap:
-        raise ValueError(f"limit must be between 0 and {cap}")
+        raise Refusal(f"limit must be between 0 and {cap}")
     if offset < 0:
-        raise ValueError("offset must be >= 0")
+        raise Refusal("offset must be >= 0")
     return [("limit", str(limit)), ("offset", str(offset))]

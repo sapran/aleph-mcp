@@ -1,0 +1,141 @@
+## 1. Reproduce, red first
+
+- [x] 1.1 Assert each untranslated shape raises the translated refusal instead: `{"results": {"a": 1}}`, `{"results": 5}`, `{"results": true}`. Each must fail today with `KeyError`/`TypeError`, which is the symptom the entry records.
+- [x] 1.2 Assert each malfunction shape is refused *without* the `list_collections` next step: no `results` key, `{"results": null}`, `{"results": [null]}`, `{"results": "html page"}`.
+- [x] 1.3 Assert `{"results": []}` still raises the authorisation-or-existence refusal naming `list_collections` — the one shape that keeps the old message.
+- [x] 1.4 Assert nothing is cached after every refusal above (`resolver.cached` stays empty), and that a later successful lookup for the same foreign_id still resolves.
+- [x] 1.5 Assert `parse_scope(["*"])` returns `None`, and that `["*", "*"]` does too.
+- [x] 1.6 Assert `["*", "acme"]` and `["acme", "*"]` still raise the mixed-scope refusal, and `[]` still raises the names-nothing refusal.
+- [x] 1.7 Assert the end-to-end tool behaviour for `["*"]`: `search_entities` applies no collection filter, sends no lookup, and reports `"*"` under `searched.collection`.
+- [x] 1.8 Run the new tests and record that each fails with the symptom the entry names.
+
+## 2. Guard the listing shape
+
+- [x] 2.1 In `CollectionResolver.resolve_one`, branch on the listing shape before indexing: absent-or-null `results`, non-list `results`, empty list, non-record first row.
+- [x] 2.2 Give the malfunction branches one refusal that names the shape received by type only, never by value, and that does not mention `list_collections` or the API key.
+- [x] 2.3 Leave the empty-list branch on the existing message, and the verified-`foreign_id` check that follows unchanged.
+- [x] 2.4 Keep every branch fail-closed: no `ResolvedCollection` returned, no cache write.
+- [x] 2.5 Update the comment above the check to describe the branches, replacing the one that explains the single `isinstance` guard.
+
+## 3. Accept the all-collections literal in either spelling
+
+- [x] 3.1 In `parse_scope`, return `None` for a list whose every element is the literal, before the mixed-scope refusal.
+- [x] 3.2 Keep the mixed-scope refusal for a list holding the literal alongside anything else, with its message unchanged.
+- [x] 3.3 Note in the docstring that both spellings of the literal mean the same scope.
+
+## 4. Verify
+
+- [x] 4.1 Re-run the tests from group 1; all green.
+- [x] 4.2 Mutation-test every new assertion: reintroduce each defect one at a time, confirm the matching test goes red with the recorded symptom, restore. A test that survives its own mutation certifies nothing.
+- [x] 4.3 Update any existing test that asserted the old `["*"]` refusal or the old not-found text for a malfunction shape.
+- [x] 4.4 Full suite, `ruff check`, `ruff format --check`, `mypy` — all clean.
+
+## 5. Land
+
+- [x] 5.1 `openspec validate guard-scope-resolver-shapes --strict`.
+- [ ] 5.2 Sync the delta into `openspec/specs/mcp-tool-surface/spec.md` and archive the change.
+- [ ] 5.3 Close entry 1 in `docs/implementation-notes.md`, renumber the work plan, and park anything found in passing.
+- [ ] 5.4 Open the PR; run `code-reviewer`, `silent-failure-hunter` and `pr-test-analyzer` on the diff; fix or dismiss each finding; merge on green CI.
+
+## Verification record
+
+**Red first.** The 13 new assertions failed before the fix, each with the symptom the entry
+records: `KeyError: 0` for `{"results": {"a": 1}}`, `TypeError: 'int'/'bool' object is not
+subscriptable` for the number and boolean bodies, the `list_collections` diagnosis for every other
+unusable shape, and the mixed-scope refusal for `["*"]` and `["*", "*"]`.
+
+**Mutation-tested, 15 of 15 caught.** Each defect reintroduced alone, with bytecode writing
+disabled so a same-size edit cannot be served from a stale `.pyc`:
+
+| mutation | caught by |
+|---|---|
+| restore the original `or []` read | shape tests |
+| drop the non-list guard | shape tests + e2e |
+| drop the non-record first-row guard | shape tests + e2e |
+| report an empty listing as a malfunction | the no-such-collection test |
+| report a malfunction as a missing collection | the no-`list_collections` assertions |
+| send a malfunction to `list_collections` anyway | the no-`list_collections` assertions |
+| claim the API key is at fault | the no-`API key` assertion |
+| echo the body value instead of its type, on either branch | the no-echo test |
+| hard-code the type name, on either branch | the per-type test |
+| cache the foreign_id before the shape is verified | the `cached == {}` assertions |
+| drop the verified-`foreign_id` check | the unconfirmed-resolution test |
+| refuse `["*"]` again | the either-spelling tests |
+| `all` → `any` in `parse_scope` | the mixed-scope refusal tests |
+
+The first pass found two survivors — nothing pinned the type name on the first-row branch, and
+nothing pinned that the type name is read rather than hard-coded. Both closed by parametrising
+across distinct types on both branches.
+
+**Gate.** 541 passed, 31 skipped, 5 xfailed (518 before). `ruff check`, `ruff format --check` and
+`mypy` clean on the package CI checks.
+
+**Tool-path check.** The claim "reaches the model as a legible refusal rather than a server fault"
+is about the MCP seam, so it was read off the seam and not off the client underneath it. All six
+shapes arrive through `mcp.call_tool("search_entities", ...)` as an unprefixed `ToolError`: the
+five malfunction shapes with the new diagnosis, the empty listing with the `list_collections` one.
+
+## Review round
+
+Three reviewers on the diff. The code reviewer independently rebuilt the pre-change tree and
+confirmed 20 of the 21 new parametrised cases fail on `develop` with the recorded symptoms; the
+21st is the empty-listing companion pin, unchanged by design.
+
+Fixed in this change:
+
+- **The spec contradicted the code on `["*", "*"]`.** The prose said a list pairing `"*"` with "at
+  least one other element" is refused; the code accepts a list of only literals. Reworded to "at
+  least one *named collection*", with the repeated spelling added to the scenario.
+- **The spec asserted `match_entity` reports `"*"` under `searched.collection`.** It reports no
+  `searched` key at all, in either spelling — measured. The scenario now says so, and
+  `test_match_entity_reads_the_literal_the_same_way_in_either_spelling` pins the real behaviour.
+- **"Exactly one shape means no such collection" was an overstatement.** A bare `[]` body arrives
+  as `{"results": []}` once the transport has wrapped it, so two bodies reach that branch. Reading
+  both as a miss is deliberate — an empty array is an empty result set — and the spec now says
+  that instead of claiming the shape is unique to Aleph's envelope.
+- **The `str` branch's comment named a body that cannot reach it.** An HTML interstitial raises
+  inside the transport's `jsonlib.loads` and never enters this module — measured. The comment,
+  the test fixture and the refusal text no longer claim otherwise.
+- **Two docstrings contradicted their own code.** `_no_such_collection` claimed both its callers
+  are "the upstream working correctly"; the mismatch branch's own comment lists malfunctions.
+  `_unusable_listing` claimed it "names no next step"; it names one, for the operator.
+- **The refusal ruled out only some retries.** "retrying with a different collection will not
+  help" reads as licence to retry the same call. Now says plainly that retrying will not help.
+
+Recorded and not fixed, as entry 2 of `docs/implementation-notes.md`: a confirmed row carrying an
+unusable `id` still blames the caller (raised independently by both reviewers, one rating it
+critical); a row with no `foreign_id` key takes the mismatch branch; a bare array of records
+resolves with no envelope; `match_entity` never announces an all-collections scope. None is among
+the shapes this change's spec enumerates, and all four fail closed.
+
+**Re-verified after the fixes.** 541 passed; 16 of 16 mutations caught, including a new one for
+the `match_entity` spelling; `ruff` and `mypy` clean; `openspec validate` clean.
+
+### Second review round: eight surviving mutations
+
+The test analyzer ran its own mutation pass and found **eight mutations the suite did not catch**.
+The sharpest was self-inflicted: the reworded refusal from the first round added the words
+"up**str**eam" and "end**point**", so `assert "str" in message` and `assert "int" in message`
+became true of every message regardless of what the branch emitted. The verification record above
+claimed that mutation was caught, and it had been — the rewording silently disarmed it. This is
+the "assertions that cannot fail" failure mode arriving through prose, not through code.
+
+| survivor | why it survived | closed by |
+|---|---|---|
+| emptiness checked before type | every fixture row was a *truthy* non-list, so `{}`, `""`, `0`, `False` were untested | four falsy rows in `UNUSABLE_LISTINGS` |
+| hard-coded type name, first-row branch | two of its three rows were tautologies after the rewording | assert the whole clause, not the token |
+| hard-coded type name, non-list branch | same | same |
+| absent-`results` shape string emptied | nothing asserted `"carried no results at all"` | `SHAPE_CLAUSES` covers all three branches |
+| absent-`results` reports another branch's text | same | same |
+| absent-`results` branch deleted | same | same |
+| six-character body echo, non-list branch | the sentinel sat at offset 6, behind `"<html>"` | sentinel at offset 0, asserted absent |
+| six-character body echo, first-row branch | same | same |
+| `["*", "*", "874"]` accepted | no fixture repeated the literal beside a name | two rows in `SCOPE_REFUSALS` |
+
+Also added, for coverage the analyzer showed was absent rather than wrong: end-to-end respx tests
+for the absent-`results` and non-list-`results` branches, which had only been exercised through
+the in-process lookup — and the reachability argument for those shapes is transport-dependent.
+The existing bare-array e2e test now also asserts nothing was searched and nothing cached.
+
+**Re-verified again.** 553 passed, 31 skipped, 5 xfailed. **25 of 25 mutations caught**, the
+original 16 plus all nine the analyzer demonstrated surviving. `ruff` and `mypy` clean.

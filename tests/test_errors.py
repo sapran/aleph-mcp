@@ -1,8 +1,19 @@
+import ast
+import json
+from pathlib import Path
+
 import httpx
 import pytest
 from fastmcp.exceptions import ResourceError, ToolError
 
-from aleph_mcp.errors import raise_for_status, raise_unreachable
+import aleph_mcp
+from aleph_mcp.errors import (
+    Refusal,
+    raise_for_status,
+    raise_unparsable_body,
+    raise_unreachable,
+)
+from aleph_mcp.transport import parse_retry_after
 
 
 def _resp(status: int, text: str = "") -> httpx.Response:
@@ -126,3 +137,379 @@ def test_the_transport_echo_is_capped_at_the_length_this_path_chose() -> None:
         raise_unreachable(RuntimeError("z" * 201), context="ctx", attempts=1)
     quoted = str(exc.value).split('untrusted transport text: "', 1)[1].split('"', 1)[0]
     assert quoted == "z" * 200 + "\u2026"
+
+
+# -- the refusal channel -------------------------------------------------------
+
+
+def test_a_refusal_is_still_a_value_error() -> None:
+    """`AlephClient` is importable as a library and its refusals have always been
+    `ValueError`. A caller with `except ValueError` around a client call must keep catching
+    them -- that break would show up as a crash in someone else's process rather than as a
+    red test in this one."""
+    assert issubclass(Refusal, ValueError)
+
+
+def test_a_decoder_value_error_is_not_a_refusal() -> None:
+    """The whole point of the type, stated as the property that failed before it existed.
+
+    `json.JSONDecodeError` and `UnicodeDecodeError` are `ValueError` subclasses, so a seam
+    selecting on `ValueError` could not tell either from a refusal this server chose to
+    make.
+    """
+    assert not isinstance(json.JSONDecodeError("Expecting value", "<html>", 0), Refusal)
+    assert not isinstance(UnicodeDecodeError("utf-8", b"\x89", 0, 1, "invalid"), Refusal)
+    assert not isinstance(ValueError("invalid literal for int()"), Refusal)
+
+
+def _is_bare_value_error(node: ast.AST) -> bool:
+    """True for a `ValueError` this package builds or raises itself.
+
+    Two shapes, because one is how the evasion works. A construction counts wherever it
+    appears -- `err = ValueError(...)` assigned and raised a line later is the spelling that
+    walked past the line-matching check, and a `ValueError` built in these modules has no
+    other purpose. A bare `raise ValueError` with no call counts too. An `except ValueError`
+    handler is neither and is left alone.
+    """
+    if isinstance(node, ast.Call):
+        return isinstance(node.func, ast.Name) and node.func.id == "ValueError"
+    if isinstance(node, ast.Raise):
+        return isinstance(node.exc, ast.Name) and node.exc.id == "ValueError"
+    return False
+
+
+# Every module except the two that are deliberately allowed a bare `ValueError`. Derived
+# rather than listed, so a module added later is scanned without anyone remembering to add it
+# -- which is the same failure this check exists to catch, one level up.
+#
+# `config.py` raises inside pydantic validators at `Settings()` construction, before any tool
+# exists, and the process fails to start; `echo.py` guards a malformed `EchoPolicy` literal in
+# this repo, which is a defect and must keep reading as one. Neither is on the seam.
+_BARE_VALUE_ERROR_ALLOWED = {"config.py", "echo.py"}
+
+# The per-site opt-out, spelled once. A whole-module exclusion is too blunt for `scope.py`,
+# which holds ten genuine refusals and one defect guard; requiring the marker on the line
+# makes the exception explicit, greppable, and impossible to acquire by accident.
+_NOT_A_REFUSAL = "# not a refusal:"
+_REFUSING_MODULES = sorted(
+    p.name
+    for p in Path(aleph_mcp.__file__).parent.glob("*.py")
+    if p.name not in _BARE_VALUE_ERROR_ALLOWED
+)
+
+
+@pytest.mark.parametrize("module", _REFUSING_MODULES)
+def test_no_refusal_site_still_raises_a_bare_value_error(module: str) -> None:
+    """A refusal site added later copies its spelling from the ones beside it.
+
+    Nothing about `raise ValueError(...)` fails loudly once the seam stops translating it:
+    the refusal still reaches the caller, just prefixed by FastMCP and deleted entirely
+    under `mask_error_details`. Reading the source is the cheap way to catch the copy before
+    it ships, because no behavioural test can cover a site nobody has written yet.
+
+    Read as a syntax tree rather than as lines, which review showed is the difference between
+    a check and the appearance of one. The line-matching version this replaces missed five
+    real spellings -- `err = ValueError(...)` then `raise err` (the two-step shape `scope.py`'s
+    own refusal factories already use), `raise ValueError` with no parentheses, a doubled
+    space, a space before the parenthesis, and any aliased name -- while *matching* the string
+    inside a comment. Both directions were measured: the analyzer rewrote two refusal sites in
+    the assign-then-raise spelling and the full suite stayed green at 605 passed.
+
+    A construction is flagged wherever it appears, not only in a `raise`: a `ValueError` built
+    here has no other purpose, and catching it at the constructor is what closes the two-step
+    spelling. `except ValueError` is untouched -- it is a handler, and `transport.py` and
+    `errors.py` both need theirs.
+
+    A site inside these modules can still opt out, with `_NOT_A_REFUSAL` on its own line and a
+    reason after it. That is for a guard which fires on this repo building its own types
+    wrongly -- a defect, which must keep reading as one rather than reaching the model as this
+    server's considered answer. There is exactly one, and review is what found it: it had been
+    retyped along with the genuine refusals beside it.
+    """
+    source = (Path(aleph_mcp.__file__).parent / module).read_text()
+    lines = source.splitlines()
+    bare = [
+        f"line {node.lineno}: {lines[node.lineno - 1].strip()}"
+        for node in ast.walk(ast.parse(source))
+        if _is_bare_value_error(node) and _NOT_A_REFUSAL not in lines[node.lineno - 1]
+    ]
+    assert bare == [], f"{module}: refusals are raised as `Refusal`, not `ValueError`: {bare}"
+
+
+def test_the_bare_value_error_check_sees_the_spellings_that_evaded_its_predecessor() -> None:
+    """The check above is only worth having if it cannot be spelled around, so the evasions
+    are pinned rather than asserted in prose.
+
+    Every string here was measured against the line-matching version this replaced: the first
+    five passed it, and the sixth -- a comment -- failed it. This branch's docstrings discuss
+    the old `ValueError` seam at length, so that last one was a live tripwire, not a
+    hypothetical.
+    """
+    evaded = [
+        'err = ValueError("x")\nraise err',
+        "raise ValueError",
+        'raise  ValueError("x")',
+        'raise ValueError ("x")',
+        'def f():\n    return ValueError("x")',
+    ]
+    for source in evaded:
+        found = [n for n in ast.walk(ast.parse(source)) if _is_bare_value_error(n)]
+        assert found, f"a bare ValueError spelled {source!r} would ship unnoticed"
+
+    ignored = [
+        '"""A docstring saying raise ValueError(...) about the old seam."""',
+        "# raise ValueError('old')",
+        "try:\n    pass\nexcept ValueError:\n    pass",
+    ]
+    for source in ignored:
+        found = [n for n in ast.walk(ast.parse(source)) if _is_bare_value_error(n)]
+        assert not found, f"prose or a handler is not a refusal site: {source!r}"
+
+
+def _unparsable(
+    exc: Exception, *, status: int = 200, size: int = 64, resource: bool = False
+) -> str:
+    with pytest.raises(ResourceError if resource else ToolError) as excinfo:
+        raise_unparsable_body(exc, context="ctx", status=status, size=size, resource=resource)
+    return str(excinfo.value)
+
+
+def test_an_empty_body_is_not_described_as_a_maintenance_page() -> None:
+    """The four-cause enumeration describes every shape but this one.
+
+    An empty body is not a maintenance page, an interstitial or a truncation, and for a `204`
+    it is the status's own definition rather than a fault in the body at all. Review measured
+    a `204` and a zero-length `200` producing prose byte-identical to the HTML case, differing
+    only in the status number -- under a green test that asserted only that number.
+    """
+    message = _unparsable(json.JSONDecodeError("Expecting value", "", 0), status=204, size=0)
+    assert "empty body" in message, message
+    assert "maintenance page" not in message, "that enumeration describes a body that exists"
+    assert "204" in message
+    # The claim that survives: the caller still cannot fix it by changing arguments.
+    assert "the arguments are not the cause" in message
+
+
+def test_a_body_that_exists_still_gets_the_enumeration() -> None:
+    """The empty-body branch must not swallow the case the enumeration is right about."""
+    message = _unparsable(json.JSONDecodeError("Expecting value", "<html>", 0), size=6)
+    assert "maintenance page" in message
+    assert "empty body" not in message
+
+
+@pytest.mark.parametrize("status", [200, 204, 206])
+def test_the_unparsable_body_refusal_names_the_context_and_the_status(status: int) -> None:
+    """A `200` that is not JSON used to reach the model as the decoder's bare string, which
+    names neither. The status is the first fact worth having and it is already in hand.
+
+    Parametrised over the success range rather than over `200` alone: a helper that pinned
+    one status could not tell a reported status from a hardcoded one, which review measured
+    -- hardcoding `200` at the transport's call site left the whole suite green.
+    """
+    message = _unparsable(json.JSONDecodeError("Expecting value", "<html>", 0), status=status)
+    assert message.startswith("ctx:")
+    assert str(status) in message
+
+
+def test_the_unparsable_body_refusal_labels_the_decoder_text() -> None:
+    """The decoder's message is foreign text quoted to a model. `json` builds it from a
+    fixed table and echoes no input, and `UnicodeDecodeError` adds one byte in hex -- so
+    the label is applied by convention rather than against a known injection surface, which
+    is the cheaper of the two mistakes. Every other quoted upstream string carries it."""
+    message = _unparsable(json.JSONDecodeError("Expecting value", "<html>", 0))
+    assert 'untrusted transport text: "Expecting value: line 1 column 1 (char 0)"' in message
+
+
+def test_the_unparsable_body_refusal_takes_the_resource_flag() -> None:
+    assert _unparsable(ValueError("x"), resource=True).startswith("ctx:")
+
+
+def test_the_unparsable_body_refusal_is_not_itself_a_refusal() -> None:
+    """It is raised for an upstream fault, so it must not be catchable as this server's own
+    refusal -- and must not be a `ValueError` at all, which is how it reached the seam."""
+    with pytest.raises(ToolError) as exc:
+        raise_unparsable_body(ValueError("x"), context="ctx", status=200, size=64)
+    assert not isinstance(exc.value, ValueError)
+
+
+def test_a_retryable_refusal_reports_retryability_and_attempt_count() -> None:
+    """The gap this closes: a 503 that spent its retries looked identical to one that
+    never retried, so a caller could not tell an incomplete sweep from a single miss."""
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(
+            _resp(503),
+            context="get_entity",
+            attempts=4,
+            retryable=True,
+            advertised_wait=parse_retry_after(_resp(503)),
+        )
+    message = str(exc.value)
+    assert "one this server retries" in message, message
+    assert "4 attempts were made" in message, message
+
+
+def test_an_absent_retry_after_is_reported_as_the_final_responses_silence() -> None:
+    """Scoped to the final response: an earlier attempt may have advertised a wait that
+    was honoured, so an unqualified "no wait was advertised" would be false."""
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(
+            _resp(503),
+            context="get_entity",
+            attempts=2,
+            retryable=True,
+            advertised_wait=parse_retry_after(_resp(503)),
+        )
+    message = str(exc.value)
+    assert "final response advertised no next wait" in message, message
+    assert "s wait" not in message, message
+
+
+def test_a_parsed_retry_after_is_reported_normalised_and_not_as_an_honoured_wait() -> None:
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(
+            _resp(503),
+            context="get_entity",
+            attempts=1,
+            retryable=True,
+            advertised_wait=parse_retry_after(
+                httpx.Response(
+                    503,
+                    headers={"Retry-After": "5"},
+                    request=httpx.Request("GET", "https://aleph.test/x"),
+                )
+            ),
+        )
+    message = str(exc.value)
+    assert "advertised a 5s wait" in message, message
+    assert "not necessarily what this call would have waited" in message, message
+
+
+def test_an_over_ceiling_retry_after_reports_the_ceiling_not_the_header() -> None:
+    """The header is untrusted upstream input: the reported number is this server's
+    bounded normalisation of it, never the raw value."""
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(
+            _resp(503),
+            context="get_entity",
+            attempts=1,
+            retryable=True,
+            advertised_wait=parse_retry_after(
+                httpx.Response(
+                    503,
+                    headers={"Retry-After": "900"},
+                    request=httpx.Request("GET", "https://aleph.test/x"),
+                )
+            ),
+        )
+    message = str(exc.value)
+    assert "advertised a 30s wait" in message, message
+    assert "900" not in message, message
+
+
+def test_an_unparseable_retry_after_is_distinguished_from_an_absent_one() -> None:
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(
+            _resp(503),
+            context="get_entity",
+            attempts=3,
+            retryable=True,
+            advertised_wait=parse_retry_after(
+                httpx.Response(
+                    503,
+                    headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"},
+                    request=httpx.Request("GET", "https://aleph.test/x"),
+                )
+            ),
+        )
+    message = str(exc.value)
+    assert "could not read" in message, message
+    assert "advertised no next wait" not in message, message
+
+
+def test_a_non_retryable_status_reports_no_retry_facts() -> None:
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(_resp(404), context="get_entity", attempts=1)
+    message = str(exc.value)
+    assert "this server retries" not in message, message
+    assert "attempts were made" not in message, message
+
+
+def test_the_upstream_body_does_not_decide_the_retryability_claim() -> None:
+    """The observed 503 bodies carry Elasticsearch's own words. They are echoed as
+    untrusted text and must not be restated as this server's classification."""
+    upstream = "blocked by: [SERVICE_UNAVAILABLE/1/state not recovered / initialized];"
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(
+            _json_resp(503, {"status": "error", "message": upstream}),
+            context="get_entity",
+            attempts=4,
+            retryable=True,
+            advertised_wait=parse_retry_after(_resp(503)),
+        )
+    message = str(exc.value)
+    assert "one this server retries" in message, message
+    assert "untrusted upstream text" in message, message
+    assert "not recovered" not in message.split("untrusted upstream text")[0], message
+
+
+def test_a_supplied_wait_is_ignored_when_the_status_is_not_retryable() -> None:
+    """`retryable` gates the clause, not the presence of a parsed wait: a caller that
+    supplies one for a status this server never retries must not be told it retried.
+
+    `418` rather than `404` deliberately: the `404` branch raises its own message and never
+    interpolates the retry clause, so it cannot observe the gate at all. Only a status
+    reaching the generic branch can.
+    """
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(
+            _resp(418),
+            context="get_entity",
+            attempts=3,
+            retryable=False,
+            advertised_wait=parse_retry_after(
+                httpx.Response(
+                    418,
+                    headers={"Retry-After": "9"},
+                    request=httpx.Request("GET", "https://aleph.test/x"),
+                )
+            ),
+        )
+    message = str(exc.value)
+    assert "this server retries" not in message, message
+    assert "9s wait" not in message, message
+
+
+def test_a_single_attempt_refusal_agrees_its_verb_with_its_count() -> None:
+    """Error text is the published contract, so "1 attempt were made" is a contract
+    defect. This is the budget-exhausted shape and every ALEPH_MCP_MAX_RETRIES=1
+    deployment."""
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(
+            _resp(503),
+            context="get_entity",
+            attempts=1,
+            retryable=True,
+            advertised_wait=parse_retry_after(_resp(503)),
+        )
+    message = str(exc.value)
+    assert "1 attempt was made" in message, message
+    assert "attempt were" not in message, message
+
+
+def test_the_attempt_count_is_stated_once_when_the_budget_clause_also_runs() -> None:
+    """Both clauses know the count. Stating it twice reads as two different facts about
+    one call, so the retry clause yields the count to the sentence that explains what
+    ended the loop."""
+    with pytest.raises(ToolError) as exc:
+        raise_for_status(
+            _resp(503),
+            context="get_entity",
+            attempts=3,
+            retryable=True,
+            budget_spent=True,
+            advertised_wait=parse_retry_after(_resp(503)),
+        )
+    message = str(exc.value)
+    assert message.count("3 attempt") == 1, message
+    assert "one this server retries." in message, message
+    assert "wall-clock budget" in message, message
